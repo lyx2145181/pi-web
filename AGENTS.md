@@ -10,6 +10,36 @@ Typecheck: `node_modules/.bin/tsc --noEmit`
 Lint: `npm run lint`  
 **Never run `next build` during dev** — pollutes `.next/` and breaks `npm run dev`.
 
+## Personal Fork Update Workflow
+
+This fork keeps upstream code and personal UI changes separated:
+
+- `upstream`: `https://github.com/agegr/pi-web.git`
+- `origin`: `https://github.com/lyx2145181/pi-web.git`
+- `main`: clean mirror of `upstream/main`; do not add personal changes here
+- `ui-custom`: working branch containing personal UI changes
+
+Run updates only from a clean worktree:
+
+```bash
+git fetch upstream
+git switch main
+git merge --ff-only upstream/main
+git push origin main
+
+git switch ui-custom
+git merge --no-commit main
+# Resolve conflicts, preserving UI customization while retaining upstream features.
+# Do not choose --ours or --theirs for an entire conflicted UI file.
+npm ci                         # when package-lock.json changed
+node_modules/.bin/tsc --noEmit
+npm run lint
+git commit -m "merge(upstream): 同步原作者最新版本"
+git push origin ui-custom
+```
+
+If conflict resolution is uncertain, stop with `git merge --abort` rather than discarding either side. Never push personal changes to `upstream`.
+
 ---
 
 ## Architecture
