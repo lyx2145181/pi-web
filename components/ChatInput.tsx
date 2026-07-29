@@ -1248,6 +1248,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
             );
           })()}
           <div
+            className="chat-composer"
             style={{
               display: "flex",
               gap: 8,
@@ -1255,14 +1256,15 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
               background: "var(--bg)",
               border: `1px solid ${isStreaming && (onSteer || onFollowUp)
                 ? "rgba(234,179,8,0.4)"
-                : "color-mix(in srgb, var(--border) 70%, transparent)"}`,
+                : "var(--border)"}`,
               borderRadius: 14,
               padding: "10px 10px 10px 14px",
-              boxShadow: "0 1px 2px rgba(15,23,42,0.04), 0 8px 24px -12px rgba(15,23,42,0.10)",
+              boxShadow: "var(--shadow-soft)",
               transition: "border-color 0.15s, background 0.15s, box-shadow 0.15s",
             } as React.CSSProperties}
           >
           <textarea
+            className="chat-composer-input"
             ref={textareaRef}
             value={value}
             onChange={(e) => {
@@ -1299,8 +1301,9 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
               outline: "none",
               resize: "none",
               color: "var(--text)",
-              fontSize: 14,
-              lineHeight: 1.6,
+              fontSize: 14.5,
+              fontWeight: 450,
+              lineHeight: 1.62,
               fontFamily: "inherit",
               minHeight: 24,
               maxHeight: 200,

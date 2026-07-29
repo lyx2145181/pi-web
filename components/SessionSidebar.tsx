@@ -310,7 +310,7 @@ function PiAgentTitle() {
         background: "none", border: "none", padding: 0, cursor: "default",
         fontWeight: 700, fontSize: 15, letterSpacing: "-0.01em",
         color: showVersion ? "var(--accent)" : "var(--text)",
-        fontFamily: "var(--font-mono)",
+        fontFamily: showVersion ? "var(--font-mono)" : "inherit",
         minWidth: "6ch",
       }}
     >
@@ -1938,8 +1938,8 @@ function SessionItem({
                 alignItems: "center",
                 gap: 5,
                 minWidth: 0,
-                fontSize: 12,
-                fontWeight: isSelected ? 500 : 400,
+                fontSize: 12.5,
+                fontWeight: isSelected ? 520 : 450,
                 lineHeight: 1.4,
                 color: "var(--text)",
               }}
@@ -1950,7 +1950,7 @@ function SessionItem({
                 {title}
               </span>
             </div>
-            <div style={{ marginTop: 2, display: "flex", gap: 8, color: "var(--text-dim)", fontSize: 11, minWidth: 0 }}>
+            <div style={{ marginTop: 2, display: "flex", gap: 8, color: "var(--text-dim)", fontSize: 11.25, minWidth: 0 }}>
               <span title={session.modified}>{formatRelativeTime(session.modified)}</span>
               <span>{session.messageCount} msgs</span>
               {session.worktreeBranch && (

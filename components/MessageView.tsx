@@ -182,11 +182,11 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
             flex: 1,
             minWidth: 0,
             background: "var(--user-bg)",
-            border: "1px solid rgba(59,130,246,0.2)",
+            border: "1px solid var(--user-border)",
             borderRadius: 12,
-            padding: "8px 12px",
-            fontSize: 14,
-            lineHeight: 1.6,
+            padding: "9px 13px",
+            fontSize: 15,
+            lineHeight: 1.64,
             color: "var(--text)",
             wordBreak: "break-word",
           }}
@@ -210,7 +210,7 @@ function UserMessageView({ message, cwd, onOpenFile, entryId, onFork, forking, o
                     key={i}
                     src={src}
                     alt=""
-                    style={{ maxWidth: 240, maxHeight: 240, borderRadius: 6, objectFit: "contain", display: "block", border: "1px solid rgba(59,130,246,0.15)" }}
+                    style={{ maxWidth: 240, maxHeight: 240, borderRadius: 6, objectFit: "contain", display: "block", border: "1px solid var(--user-border)" }}
                   />
                 );
               })}
