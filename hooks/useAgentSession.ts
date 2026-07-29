@@ -72,6 +72,7 @@ type AgentStateResponse = {
   thinkingLevel?: string;
   isStreaming?: boolean;
   isPromptRunning?: boolean;
+  isBashRunning?: boolean;
   isCompacting?: boolean;
   extensionStatuses?: ExtensionStatusItem[];
   extensionWidgets?: ExtensionWidgetItem[];
@@ -159,6 +160,7 @@ const PROMPT_SETTLE_INITIAL_DELAY_MS = 800;
 const PROMPT_SETTLE_POLL_MS = 600;
 const PROMPT_SETTLE_MAX_MS = 20_000;
 const AGENT_STATE_RECONCILE_MS = 15_000;
+const BASH_STATE_RECONCILE_MS = 1_000;
 const EVENT_STREAM_CONNECT_TIMEOUT_MS = 5_000;
 const MAX_NOTICES = 5;
 const NOTICE_VISIBLE_MS = 5000;
@@ -312,6 +314,7 @@ type ModelsResponse = {
   defaultModel?: SelectedModel | null;
   thinkingLevels?: Record<string, string[]>;
   thinkingLevelMaps?: Record<string, Record<string, string | null>>;
+  modelError?: string;
 };
 
 type SlashCommandsResponse = {
@@ -334,8 +337,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [entryIds, setEntryIds] = useState<string[]>([]);
   const [streamState, dispatch] = useReducer(streamReducer, { isStreaming: false, streamingMessage: null });
   const [agentRunning, setAgentRunning] = useState(false);
+  const [bashRunning, setBashRunning] = useState(false);
+  const [pendingBash, setPendingBash] = useState<{ command: string; excludeFromContext: boolean } | null>(null);
   const [modelNames, setModelNames] = useState<Record<string, string>>({});
   const [modelList, setModelList] = useState<ModelEntry[]>([]);
+  const [modelError, setModelError] = useState<string | null>(null);
   const [modelThinkingLevels, setModelThinkingLevels] = useState<Record<string, string[]>>({});
   const [modelThinkingLevelMaps, setModelThinkingLevelMaps] = useState<Record<string, Record<string, string | null>>>({});
   const [newSessionModel, setNewSessionModel] = useState<SelectedModel | null>(null);
@@ -365,11 +371,14 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const eventSourceRef = useRef<EventSource | null>(null);
   const sessionIdRef = useRef<string | null>(session?.id ?? null);
   const agentRunningRef = useRef(false);
+  const bashRunningRef = useRef(false);
+  const bashRecoveryIdRef = useRef(0);
   const handleAgentEventRef = useRef<((event: AgentEvent) => void) | null>(null);
   const initialScrollDoneRef = useRef(false);
   const lastUserMsgRef = useRef<HTMLDivElement | null>(null);
   const pendingScrollToUserRef = useRef(false);
   const completionScrollAllowedRef = useRef(true);
+  const executeBashRef = useRef<(command: string, excludeFromContext: boolean) => Promise<void> | undefined>(undefined);
   const userScrollIntentUntilRef = useRef(0);
   const ignoreProgrammaticScrollUntilRef = useRef(0);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
@@ -703,7 +712,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       case "setStatus":
         setExtensionStatuses((prev) => {
           const rest = prev.filter((item) => item.key !== request.statusKey);
-          return request.statusText ? [...rest, { key: request.statusKey, text: request.statusText }] : rest;
+          return request.statusText !== undefined
+            ? [...rest, { key: request.statusKey, text: request.statusText }]
+            : rest;
         });
         break;
       case "setWidget":
@@ -774,6 +785,34 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       await delay(PROMPT_SETTLE_POLL_MS);
     }
   }, [finishPromptWithoutStream]);
+
+  const waitForBashSettlement = useCallback(async (sid: string) => {
+    const recoveryId = bashRecoveryIdRef.current + 1;
+    bashRecoveryIdRef.current = recoveryId;
+
+    while (
+      bashRunningRef.current
+      && bashRecoveryIdRef.current === recoveryId
+      && sessionIdRef.current === sid
+    ) {
+      await delay(BASH_STATE_RECONCILE_MS);
+      try {
+        const res = await fetch(`/api/agent/${encodeURIComponent(sid)}`);
+        if (!res.ok) continue;
+        const data = await res.json() as { state?: AgentStateResponse };
+        if (data.state?.isBashRunning) continue;
+
+        await loadSession(sid);
+        if (bashRecoveryIdRef.current !== recoveryId || sessionIdRef.current !== sid) return;
+        bashRunningRef.current = false;
+        setBashRunning(false);
+        setPendingBash(null);
+        return;
+      } catch {
+        // Keep polling while the page is mounted; network recovery is transparent.
+      }
+    }
+  }, [loadSession]);
 
   // Reconcile client streaming state with the server. When SSE events are
   // missed (network drop, mobile tab backgrounded, half-open connection),
@@ -993,8 +1032,18 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const handleSend = useCallback(async (message: string, images?: AttachedImage[]) => {
     const trimmedMessage = message.trim();
     if (!trimmedMessage && !images?.length) return;
-    if (agentRunning) return;
+    if (agentRunningRef.current || bashRunningRef.current) return;
     const isSlashCommandPrompt = !images?.length && trimmedMessage.startsWith("/");
+
+    const isBashCommand = !images?.length && trimmedMessage.startsWith("!");
+    if (isBashCommand) {
+      const isExcluded = trimmedMessage.startsWith("!!");
+      const bashCmd = (isExcluded ? trimmedMessage.slice(2) : trimmedMessage.slice(1)).trim();
+      if (!bashCmd) return;
+      await executeBashRef.current?.(bashCmd, isExcluded);
+      return;
+    }
+
     const promptRunId = promptRunIdRef.current + 1;
 
     const imageBlocks = images?.map((img) => ({ type: "image" as const, source: { type: "base64" as const, media_type: img.mimeType, data: img.data } }));
@@ -1065,6 +1114,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           });
         }
         addNotice({ type: "error", message: e.message });
+        // The prompt never reached the agent, so restore the user's text into
+        // the input instead of losing it. Mirrors the shell-command recovery in
+        // executeBash; insertIfEmpty avoids clobbering anything typed since.
+        if (message) opts.chatInputRef?.current?.insertIfEmpty(message);
       }
       optimisticUserMessageKeyRef.current = null;
       agentRunningRef.current = false;
@@ -1072,11 +1125,47 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setAgentPhase(null);
       dispatch({ type: "end" });
     }
-  }, [isNew, newSessionCwd, newSessionModel, session, agentRunning, ensureNewSession, ensureEventsConnected, promoteNewSession, waitForPromptSettlement, addNotice]);
+  }, [isNew, newSessionCwd, newSessionModel, session, ensureNewSession, ensureEventsConnected, promoteNewSession, waitForPromptSettlement, addNotice, opts.chatInputRef]);
+
+  const executeBash = useCallback(async (command: string, excludeFromContext: boolean) => {
+    if (agentRunningRef.current || bashRunningRef.current) return;
+    const inputText = `${excludeFromContext ? "!!" : "!"}${command}`;
+    bashRunningRef.current = true;
+    setPendingBash({ command, excludeFromContext });
+    setBashRunning(true);
+    try {
+      const sid = sessionIdRef.current ?? session?.id ?? await ensureNewSession();
+      if (!sid) throw new Error("Unable to create a session for the shell command");
+      await sendAgentCommand(sid, {
+        type: "bash",
+        command,
+        excludeFromContext,
+      });
+      await loadSession(sid);
+      promoteNewSession(1, inputText);
+    } catch (e) {
+      console.error("Failed to execute shell command:", e);
+      addNotice({ type: "error", message: e instanceof Error ? e.message : String(e) });
+      opts.chatInputRef?.current?.insertIfEmpty(inputText);
+    } finally {
+      bashRunningRef.current = false;
+      setPendingBash(null);
+      setBashRunning(false);
+    }
+  }, [addNotice, ensureNewSession, loadSession, opts.chatInputRef, promoteNewSession, session]);
+  executeBashRef.current = executeBash;
 
   const handleAbort = useCallback(async () => {
     const sid = sessionIdRef.current;
     if (!sid) return;
+    if (bashRunningRef.current) {
+      try {
+        await sendAgentCommand(sid, { type: "abort_bash" });
+      } catch (e) {
+        console.error("Failed to abort bash:", e);
+      }
+      return;
+    }
     try {
       await sendAgentCommand(sid, { type: "abort" });
     } catch (e) {
@@ -1085,6 +1174,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, []);
 
   const handleFork = useCallback(async (entryId: string) => {
+    if (bashRunningRef.current) return;
     const sid = sessionIdRef.current;
     if (!sid) return;
     setForkingEntryId(entryId);
@@ -1105,6 +1195,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [onSessionForked]);
 
   const handleNavigate = useCallback(async (entryId: string) => {
+    if (bashRunningRef.current) return;
     const sid = sessionIdRef.current;
     if (!sid) return;
     sendAgentCommand(sid, { type: "navigate_tree", targetId: entryId }).catch(() => {});
@@ -1113,6 +1204,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [loadContext]);
 
   const handleLeafChange = useCallback(async (leafId: string | null) => {
+    if (bashRunningRef.current) return;
     setActiveLeafId(leafId);
     const sid = sessionIdRef.current;
     if (!sid) return;
@@ -1170,6 +1262,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const d = await res.json() as ModelsResponse;
     setModelNames(d.models);
+    setModelError(d.modelError ?? null);
     setModelThinkingLevels(d.thinkingLevels ?? {});
     setModelThinkingLevelMaps(d.thinkingLevelMaps ?? {});
     const nextModelList = d.modelList ?? [];
@@ -1418,6 +1511,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
               void waitForPromptSettlement(session.id);
             }
           }
+          if (agentState.state?.isBashRunning) {
+            bashRunningRef.current = true;
+            setBashRunning(true);
+            void waitForBashSettlement(session.id);
+          }
         }
         if (agentState?.state) {
           if (agentState.state.isCompacting !== undefined) setIsCompacting(agentState.state.isCompacting);
@@ -1431,6 +1529,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       });
     }
     return () => {
+      bashRecoveryIdRef.current += 1;
       eventSourceRef.current?.close();
       eventSourceRef.current = null;
     };
@@ -1492,13 +1591,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     return () => controller.abort();
   }, [loadModels, modelsRefreshKey]);
 
-  // Compact error auto-dismiss
-  useEffect(() => {
-    if (!compactError) return;
-    const t = setTimeout(() => setCompactError(null), 3000);
-    return () => clearTimeout(t);
-  }, [compactError]);
-
   useEffect(() => {
     if (!compactResult) return;
     const t = setTimeout(() => setCompactResult(null), 6000);
@@ -1529,7 +1621,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   return {
     // State
     data, loading, error, activeLeafId, messages, entryIds, streamState,
-    agentRunning, modelNames, modelList, modelThinkingLevels, modelThinkingLevelMaps, newSessionModel, toolPreset, thinkingLevel,
+    agentRunning, modelNames, modelList, modelError, modelThinkingLevels, modelThinkingLevelMaps, newSessionModel, toolPreset, thinkingLevel,
     retryInfo, contextUsage, systemPrompt, forkingEntryId,
     isCompacting, compactError, compactResult, currentModel, displayModel, sessionStats,
     slashCommands, slashCommandsLoading, queuedMessages,
@@ -1547,6 +1639,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     handleBuiltinSlashCommand,
     handleToolPresetChange, handleThinkingLevelChange, loadTools, loadSlashCommands, setActiveLeafId, setData, setMessages,
     dispatch, setAgentRunning, setForkingEntryId,
+    bashRunning, pendingBash,
     // Subscriptions
     handleAgentEventRef,
   };
