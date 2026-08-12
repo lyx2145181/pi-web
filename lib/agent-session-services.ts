@@ -47,12 +47,16 @@ export async function runAgentServiceLoad<T>(
       return await load();
     } finally {
       // Service-only model discovery evaluates extension factories without ever
-      // creating a session, so session_shutdown cannot release pi-chrome's
-      // process singleton. Restore the pre-discovery state so the real session
-      // can register /chrome and chrome_* tools normally.
-      if (hadPiChromeSingleton) {
-        globalState[PI_CHROME_SINGLETON_KEY] = previousPiChromeSingleton;
-      } else {
+      // creating a session, so it cannot emit session_shutdown for a singleton
+      // it acquired. Keep an unchanged active-session singleton, but never
+      // restore its snapshot: that session may have shut down while discovery
+      // was in flight. Any other value can only belong to this serialized,
+      // transient load and must be released for the next real session.
+      const existingSessionStillOwnsSingleton =
+        hadPiChromeSingleton
+        && Object.prototype.hasOwnProperty.call(globalState, PI_CHROME_SINGLETON_KEY)
+        && globalState[PI_CHROME_SINGLETON_KEY] === previousPiChromeSingleton;
+      if (!existingSessionStillOwnsSingleton) {
         delete globalState[PI_CHROME_SINGLETON_KEY];
       }
     }
