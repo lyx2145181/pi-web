@@ -100,6 +100,7 @@ app/api/
 
 lib/
   agent-client.ts      typed fetch helper for /api/agent commands
+  agent-event-wire.ts  filters/projects SDK events into SSE-safe client deltas
   draft-store.ts       local draft persistence helpers
   file-access.ts       allowed file roots for /api/files and worktrees
   file-paths.ts        client/server path encoding helpers
@@ -108,6 +109,7 @@ lib/
   pi-types.ts          local structural types for pi SDK objects
   rpc-manager.ts      AgentSessionWrapper + registry + startRpcSession
   session-reader.ts   SessionManager wrappers + path cache + buildSessionContext adapter
+  streaming-message.ts reconstructs streamed assistant blocks and tool-call arguments
   tool-presets.ts     PRESET_NONE/READ_ONLY/DEFAULT/FULL + getPresetFromTools()
   tool-preset-preference.ts  browser-persisted default for fresh sessions
   types.ts            shared TypeScript types
@@ -122,6 +124,8 @@ components/
   MessageView.tsx     renders one message (user/assistant/toolCall/toolResult)
   BranchNavigator.tsx in-session branch switcher
   ChatMinimap.tsx     scroll minimap alongside the message list
+  ExtensionStatusBar.tsx compact shelf for extension statuses and widgets
+  ExtensionWidgets.tsx renders extension-provided widget content
   MarkdownBody.tsx    markdown renderer
   ModelsConfig.tsx    modal for editing models.json (opened from sidebar bottom)
   PluginsConfig.tsx   modal for installed package plugins
@@ -161,8 +165,10 @@ hooks/
 ### Session files can be fully rewritten
 `parentSession` in the header is **display metadata only** — has zero effect on chat content. Safe to `writeFileSync` the entire file (pi does this itself during migrations). Used when cascade-reparenting children on delete.
 
-### ToolCall field normalization
-Pi stores toolCall blocks as `{type:"toolCall", id, name, arguments}` but `ToolCallContent` uses `{toolCallId, toolName, input}`. `normalizeToolCalls()` in `lib/normalize.ts` handles this — called in both `session-reader.ts` (file load) and `ChatWindow.handleAgentEvent()` (streaming).
+### ToolCall normalization and streaming
+Pi stores toolCall blocks as `{type:"toolCall", id, name, arguments}` but `ToolCallContent` uses `{toolCallId, toolName, input}`. `normalizeToolCalls()` in `lib/normalize.ts` handles persisted and completed messages in `session-reader.ts` and `useAgentSession.ts`.
+
+For in-flight assistant messages, `lib/agent-event-wire.ts` removes heavy partial snapshots while preserving streamed tool-call identity, and `lib/streaming-message.ts` immutably reconstructs text, thinking, and tool-call argument deltas. Reconnect snapshots use `normalizeStreamingToolCalls()` to preserve temporary raw tool input; the authoritative `toolcall_end` replaces that scratch data with parsed arguments.
 
 ### New session tool preset
 Tool names are passed at session creation (`POST /api/agent/new` → `toolNames[]`). For existing sessions, the active preset is inferred on mount via `get_tools` → `getPresetFromTools()`. When tools are fully disabled (`toolNames = []`), `rpc-manager.ts` passes an empty tool allow-list and forces `agent.state.systemPrompt = ""` after startup/reload/resource discovery.
@@ -174,6 +180,9 @@ The last preset explicitly selected by the user is stored in browser `localStora
 
 ### `enabledModels` scoping
 The `enabledModels` setting uses pi's `--models` syntax: minimatch globs against `provider/modelId` or a bare `modelId`, fuzzy matching for non-glob patterns, and an optional `:thinkingLevel` suffix. Never compare those patterns as literal strings — `lib/model-scope.ts` delegates to the SDK's `resolveModelScopeWithDiagnostics()` so pi-web and the TUI agree on the visible model list, and falls back to all available models when patterns resolve to nothing. `startRpcSession()` resolves that scope before creating an AgentSession and passes the selected initial model, thinking pin, and SDK-native `scopedModels` atomically; `GET /api/models` reuses the helper only for selector data, `thinkingLevelPins`, and `modelScopeWarnings` display.
+
+### Extension widgets and status bar
+`ChatWindow` renders extension statuses and widgets together through `ExtensionStatusBar`; do not restore separate above/below-editor widget bands. The compact shelf owns widget expansion, truncation, and status-line presentation.
 
 ### SSE reconnect on page refresh mid-stream
 On `ChatWindow` mount, `GET /api/agent/[id]` is called. If `state.isStreaming === true`, SSE is reconnected automatically. `thinkingLevel` and `isCompacting` are also synced from this response.
