@@ -41,10 +41,10 @@ test("includes project activity counts in accessible labels", () => {
   );
 });
 
-test("separates collapsed background running and completed activity counts", () => {
-  assert.match(source, /const otherWorkspaceActivity = useMemo\(\(\) => \{/);
-  assert.match(source, /if \(key === selectedProject\?\.key\) continue;/);
-  assert.match(source, /<WorkspaceActivitySummary activity=\{otherWorkspaceActivity\} \/>/);
+test("summarizes running and completed activity across every project", () => {
+  assert.match(source, /const workspaceActivity = useMemo\(\(\) => \{/);
+  assert.match(source, /for \(const activity of projectActivity\.values\(\)\)/);
+  assert.match(source, /<WorkspaceActivitySummary activity=\{workspaceActivity\} \/>/);
   assert.match(source, /sidebar\.backgroundSessionRunning/);
   assert.match(source, /sidebar\.backgroundSessionComplete/);
 });

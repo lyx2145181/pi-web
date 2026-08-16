@@ -910,18 +910,17 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     [allSessions, runningSessionIds, unreadSessionIds],
   );
 
-  // Aggregate activity outside the selected project for the collapsed selector.
-  // Keep running and completed-but-unread counts separate so users can tell when
-  // background work finishes without opening the project dropdown.
-  const otherWorkspaceActivity = useMemo(() => {
+  // Aggregate activity across every project for the collapsed selector. Keep
+  // running and completed-but-unread counts separate so the summary remains
+  // useful without opening the project dropdown.
+  const workspaceActivity = useMemo(() => {
     const total = { running: 0, unread: 0 };
-    for (const [key, activity] of projectActivity) {
-      if (key === selectedProject?.key) continue;
+    for (const activity of projectActivity.values()) {
       total.running += activity.running;
       total.unread += activity.unread;
     }
     return total;
-  }, [projectActivity, selectedProject]);
+  }, [projectActivity]);
 
   const filteredSessions = selectedProject
     ? sessionsForProject(allSessions, selectedProject.key)
@@ -1107,7 +1106,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
                  {initialSessionId && !restoredRef.current ? "" : t("sidebar.selectProject")}
               </span>
             )}
-            <WorkspaceActivitySummary activity={otherWorkspaceActivity} />
+            <WorkspaceActivitySummary activity={workspaceActivity} />
           </button>
 
           <AnimatedDropdown
