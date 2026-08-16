@@ -98,18 +98,26 @@ app/api/
   skills/search/route.ts          GET/POST skills.sh search
   worktrees/route.ts              GET/POST/DELETE git worktrees
 
+bin/
+  process-lifecycle.js forwards shutdown signals to the spawned Next.js child
+
 lib/
   agent-client.ts      typed fetch helper for /api/agent commands
   agent-event-wire.ts  filters/projects SDK events into SSE-safe client deltas
+  agent-session-services.ts serialized extension-aware SDK service creation
   draft-store.ts       local draft persistence helpers
   file-access.ts       allowed file roots for /api/files and worktrees
   file-paths.ts        client/server path encoding helpers
   markdown.ts          shared markdown helpers
   npx.ts               npx runner used by skill install
   pi-types.ts          local structural types for pi SDK objects
+  project-command-env.ts sanitized built-in project shell operations
+  project-groups.ts    stable-key project grouping and activity aggregation
+  project-identity.ts  platform-aware internal project identity
   rpc-manager.ts      AgentSessionWrapper + registry + startRpcSession
   session-reader.ts   SessionManager wrappers + path cache + buildSessionContext adapter
   streaming-message.ts reconstructs streamed assistant blocks and tool-call arguments
+  tool-execution-progress.ts extracts bounded progress text from partial tool results
   tool-presets.ts     PRESET_NONE/READ_ONLY/DEFAULT/FULL + getPresetFromTools()
   tool-preset-preference.ts  browser-persisted default for fresh sessions
   types.ts            shared TypeScript types
@@ -151,6 +159,7 @@ hooks/
 - One `AgentSessionWrapper` per session id, keyed in `globalThis.__piSessions`
 - `globalThis` survives Next.js hot-reload; plain module-level Map does not
 - Idle timeout: 10 minutes. Concurrent `startRpcSession()` calls share a single start Promise (`globalThis.__piStartLocks`)
+- The package launcher forwards `SIGINT`/`SIGTERM` to the spawned Next.js child, force-kills only after a 5-second grace period or a repeated signal, and propagates the child's final exit status (`bin/process-lifecycle.js`).
 - All Pi Web extension-factory evaluation goes through `lib/agent-session-services.ts`, which serializes extension loading so service discovery cannot race session startup. Service-only loads are marked transient: they preserve an unchanged active `pi-chrome` singleton, never revive one removed by concurrent session shutdown, and release any singleton they acquire because they never receive `session_shutdown`. Endpoints that do not need extensions must avoid evaluating them entirely: `lib/skills-service.ts` creates `DefaultResourceLoader` with `noExtensions: true` because static skill enumeration has no session lifecycle for `resources_discover` or `session_shutdown`. Otherwise `/chrome` and `chrome_*` tools can disappear from the next real session.
 
 ### Fork must destroy the wrapper immediately
@@ -168,7 +177,7 @@ hooks/
 ### ToolCall normalization and streaming
 Pi stores toolCall blocks as `{type:"toolCall", id, name, arguments}` but `ToolCallContent` uses `{toolCallId, toolName, input}`. `normalizeToolCalls()` in `lib/normalize.ts` handles persisted and completed messages in `session-reader.ts` and `useAgentSession.ts`.
 
-For in-flight assistant messages, `lib/agent-event-wire.ts` removes heavy partial snapshots while preserving streamed tool-call identity, and `lib/streaming-message.ts` immutably reconstructs text, thinking, and tool-call argument deltas. Reconnect snapshots use `normalizeStreamingToolCalls()` to preserve temporary raw tool input; the authoritative `toolcall_end` replaces that scratch data with parsed arguments.
+For in-flight assistant messages, `lib/agent-event-wire.ts` removes heavy partial snapshots while preserving streamed tool-call identity, and `lib/streaming-message.ts` immutably reconstructs text, thinking, and tool-call argument deltas. Reconnect snapshots use `normalizeStreamingToolCalls()` to preserve temporary raw tool input; the authoritative `toolcall_end` replaces that scratch data with parsed arguments. `tool_execution_update` events keep their partial result on the SSE wire; `lib/tool-execution-progress.ts` extracts the latest bounded text line so `ChatWindow` can show live tool progress.
 
 ### New session tool preset
 Tool names are passed at session creation (`POST /api/agent/new` → `toolNames[]`). For existing sessions, the active preset is inferred on mount via `get_tools` → `getPresetFromTools()`. When tools are fully disabled (`toolNames = []`), `rpc-manager.ts` passes an empty tool allow-list and forces `agent.state.systemPrompt = ""` after startup/reload/resource discovery.
@@ -179,7 +188,7 @@ The last preset explicitly selected by the user is stored in browser `localStora
 `GET /api/models` returns `defaultModel` read from `~/.pi/agent/settings.json`. `ChatWindow` pre-selects this on mount for new sessions. Explicit browser model/thinking selections are applied atomically during AgentSession construction, then `lib/startup-preferences.ts` persists their effective values without replaying `set_model`/`set_thinking_level`; implicit `enabledModels` fallbacks and thinking pins are not persisted.
 
 ### `enabledModels` scoping
-The `enabledModels` setting uses pi's `--models` syntax: minimatch globs against `provider/modelId` or a bare `modelId`, fuzzy matching for non-glob patterns, and an optional `:thinkingLevel` suffix. Never compare those patterns as literal strings — `lib/model-scope.ts` delegates to the SDK's `resolveModelScopeWithDiagnostics()` so pi-web and the TUI agree on the visible model list, and falls back to all available models when patterns resolve to nothing. `startRpcSession()` resolves that scope before creating an AgentSession and passes the selected initial model, thinking pin, and SDK-native `scopedModels` atomically; `GET /api/models` reuses the helper only for selector data, `thinkingLevelPins`, and `modelScopeWarnings` display.
+The `enabledModels` setting uses pi's `--models` syntax: minimatch globs against `provider/modelId` or a bare `modelId`, fuzzy matching for non-glob patterns, and an optional `:thinkingLevel` suffix. Never compare those patterns as literal strings — `lib/model-scope.ts` delegates to the SDK's `resolveModelScopeWithDiagnostics()` so pi-web and the TUI agree on the visible model list, and falls back to all available models when patterns resolve to nothing. A non-glob entry that exactly matches the same bare model id from multiple providers is rejected as ambiguous; use `provider/modelId`. `startRpcSession()` resolves that scope before creating an AgentSession and passes the selected initial model, thinking pin, and SDK-native `scopedModels` atomically; `GET /api/models` reuses the helper only for selector data, `thinkingLevelPins`, and `modelScopeWarnings` display.
 
 ### Extension widgets and status bar
 `ChatWindow` renders extension statuses and widgets together through `ExtensionStatusBar`; do not restore separate above/below-editor widget bands. The compact shelf owns widget expansion, truncation, and status-line presentation.
@@ -197,12 +206,18 @@ Newer pi emits `compaction_start` / `compaction_end`; older versions emitted `au
 - Prompt runs use a monotonic run id; late SSE or slow reconciliation responses from an old run must be ignored so they cannot resurrect stale streaming bubbles.
 
 ### Worktrees and project grouping
-- `lib/worktree.ts` resolves linked worktree top-levels back to the main repo `projectRoot`; `listAllSessions()` attaches that to each `SessionInfo` so all worktrees for one repo are grouped together in the sidebar.
+- `lib/worktree.ts` resolves linked worktree top-levels back to the main repo `projectRoot`; `listAllSessions()` attaches both that display/filesystem path and a stable server-computed `projectKey` to each `SessionInfo` so all worktrees for one repo are grouped together in the sidebar.
+- Grouping and equality use `projectKey` through `workspaceKeyOf()` / `lib/project-groups.ts`; keep `projectRoot` or `cwd` for display and filesystem operations. This is required on Windows, where project identity is case- and separator-insensitive.
 - Worktree operations are served by `/api/worktrees` and guarded by the same allowed-root rules as `/api/files`.
 - New worktrees are created under `<repoRoot>-worktrees/<sanitized-branch>`. Existing branches are reused; otherwise `git worktree add -b` creates the branch.
 - Removing a dirty worktree returns `409` with `{ dirty: true }` so the UI can ask before retrying with `force`.
 - Sessions whose cwd points at a removed worktree are inferred back into the main project instead of becoming a phantom project row.
 - git prints POSIX-style absolute paths even on Windows, so every path read out of git goes through `toNativePath()` (`lib/paths.ts`) before it is compared or returned. Compare paths with `samePath()`, never `===` — raw equality made `isTopLevel` permanently false on Windows and hid the worktree switcher entirely. Branch names are not paths and must keep their forward slashes. Browser code cannot apply Node path rules, so `/api/worktrees` resolves `currentWorktreePath` server-side; the sidebar must use that identity for highlighting and removal fallback.
+
+### Project command environment
+- Pi Web's built-in agent `bash` tool and direct shell commands use `lib/project-command-env.ts` to remove host-only `PORT`, `NODE_ENV`, and `NEXT_*` variables while preserving the SDK-managed PATH, Pi session metadata, and user/project variables. See `docs/adr/0001-isolate-project-command-environments.md`.
+- The host-provided bash extension is a fallback only: if a user extension already owns `bash`, `preferUserBashExtension()` removes the host fallback instead of intercepting the user tool.
+- `startRpcSession()` must combine this extension configuration with `createPiWebAgentSessionServices()`; bypassing the serialized service wrapper can reintroduce extension singleton races.
 
 ### File access allow-list
 - `/api/files` is intentionally not a general filesystem browser. Allowed roots come from session cwds, their resolved project roots, `~/pi-cwd-*`, and roots explicitly added with `allowFileRoot()`.

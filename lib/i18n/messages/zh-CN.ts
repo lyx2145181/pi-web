@@ -119,6 +119,8 @@ export const zhCNLocale: LocalePlugin = {
     "sidebar.loading": "加载中...",
     "sidebar.noSessions": "未找到会话",
     "sidebar.agentRunning": "Agent 运行中…",
+    "sidebar.backgroundSessionRunning": "后台会话运行中",
+    "sidebar.backgroundSessionComplete": "后台会话已完成",
     "sidebar.newActivity": "有新活动",
     "sidebar.newSessionActivity": "会话有新活动",
     "sidebar.deleteSession": "删除 {title}？",

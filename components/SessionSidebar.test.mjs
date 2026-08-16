@@ -41,6 +41,14 @@ test("includes project activity counts in accessible labels", () => {
   );
 });
 
+test("separates collapsed background running and completed activity counts", () => {
+  assert.match(source, /const otherWorkspaceActivity = useMemo\(\(\) => \{/);
+  assert.match(source, /if \(key === selectedProject\?\.key\) continue;/);
+  assert.match(source, /<WorkspaceActivitySummary activity=\{otherWorkspaceActivity\} \/>/);
+  assert.match(source, /sidebar\.backgroundSessionRunning/);
+  assert.match(source, /sidebar\.backgroundSessionComplete/);
+});
+
 test("does not persist an unchanged fallback title ending in whitespace", () => {
   assert.match(
     sessionItemSource,
