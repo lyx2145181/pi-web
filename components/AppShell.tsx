@@ -856,8 +856,14 @@ export function AppShell() {
       signal: controller.signal,
     })
       .then(async (response) => {
-        const data = await response.json() as ProjectTrustStatus & { error?: string };
-        if (!response.ok || data.error) throw new Error(data.error ?? `HTTP ${response.status}`);
+        const data = await response.json() as ProjectTrustStatus & { error?: string; code?: string };
+        if (!response.ok || data.error) {
+          if (data.code === "cwd_not_found") {
+            setProjectTrustError(data.error ?? "Directory does not exist");
+            return;
+          }
+          throw new Error(data.error ?? `HTTP ${response.status}`);
+        }
         setProjectTrust(data);
       })
       .catch((error) => {
