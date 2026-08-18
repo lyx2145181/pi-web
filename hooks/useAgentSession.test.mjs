@@ -214,6 +214,17 @@ test("streaming submissions cannot be stranded in an idle direct queue", () => {
   assert.doesNotMatch(queueSource, /type: "follow_up"/);
 });
 
+test("ordinary prompts retry atomically as steering when an extension wins the start race", () => {
+  const sendSource = source.slice(
+    source.indexOf("  const handleSend = useCallback"),
+    source.indexOf("  const executeBash = useCallback"),
+  );
+
+  assert.match(sendSource, /isPromptBusyError\(error\)/);
+  assert.match(sendSource, /streamingBehavior: "steer"/);
+  assert.ok(sendSource.indexOf("isPromptBusyError(error)") < sendSource.indexOf('console.error("Failed to send message:", failure)'));
+});
+
 test("post-accept prompt errors do not duplicate the user submission", () => {
   const promptErrorSource = source.slice(
     source.indexOf('case "prompt_error"'),

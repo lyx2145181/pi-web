@@ -158,7 +158,7 @@ hooks/
 ### AgentSession lifecycle (`lib/rpc-manager.ts`)
 - One `AgentSessionWrapper` per session id, keyed in `globalThis.__piSessions`
 - `globalThis` survives Next.js hot-reload; plain module-level Map does not
-- Idle timeout: 10 minutes. Concurrent `startRpcSession()` calls share a single start Promise (`globalThis.__piStartLocks`)
+- Idle timeout: 10 minutes. Before shutdown, Pi Web queries the public `pi-subagents` event-bus RPC status snapshot; a session that still owns queued/running background subagents is retained so its completion notifier remains alive. Missing extensions keep the normal timeout, while an advertised bridge failure is handled conservatively. Concurrent `startRpcSession()` calls share a single start Promise (`globalThis.__piStartLocks`).
 - The package launcher forwards `SIGINT`/`SIGTERM` to the spawned Next.js child, force-kills only after a 5-second grace period or a repeated signal, and propagates the child's final exit status (`bin/process-lifecycle.js`).
 - All Pi Web extension-factory evaluation goes through `lib/agent-session-services.ts`, which serializes extension loading so service discovery cannot race session startup. Service-only loads are marked transient: they preserve an unchanged active `pi-chrome` singleton, never revive one removed by concurrent session shutdown, and release any singleton they acquire because they never receive `session_shutdown`. Endpoints that do not need extensions must avoid evaluating them entirely: `lib/skills-service.ts` creates `DefaultResourceLoader` with `noExtensions: true` because static skill enumeration has no session lifecycle for `resources_discover` or `session_shutdown`. Otherwise `/chrome` and `chrome_*` tools can disappear from the next real session.
 

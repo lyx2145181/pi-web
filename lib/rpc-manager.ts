@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { createAgentSessionFromServices, getAgentDir, initTheme, SessionManager, SettingsManager, Theme } from "@earendil-works/pi-coding-agent";
+import { createAgentSessionFromServices, createEventBus, getAgentDir, initTheme, SessionManager, SettingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager as TuiKeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
 import { existsSync, realpathSync, writeFileSync } from "fs";
@@ -26,6 +26,7 @@ import type {
   SessionMessageEntry,
 } from "./types";
 import { createHeadlessCustomUiTui, DEFAULT_CUSTOM_UI_COLUMNS, type HeadlessCustomUiTui } from "./custom-ui-terminal";
+import { createSubagentBackgroundWorkProbe, type BackgroundWorkProbe } from "./subagent-background-work";
 
 // ============================================================================
 // Types
@@ -91,6 +92,13 @@ type ExtensionCommandContextActionsLike = {
 type ExtensionBindingOptions = {
   forceEmptySystemPrompt?: boolean;
 };
+
+type AgentSessionWrapperOptions = {
+  backgroundWorkProbe?: BackgroundWorkProbe;
+  idleTimeoutMs?: number;
+};
+
+const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
 
 const RUNNING_STATE_EVENT_TYPES = new Set([
   "agent_start",
@@ -180,11 +188,17 @@ export class AgentSessionWrapper {
   private forceEmptySystemPrompt = false;
   private unsubscribe: (() => void) | null = null;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
+  private idleGeneration = 0;
   private onDestroyCallback: (() => void) | null = null;
   private shutdownPromise: Promise<void> | null = null;
   private _alive = true;
+  private readonly backgroundWorkProbe?: BackgroundWorkProbe;
+  private readonly idleTimeoutMs: number;
 
-  constructor(public readonly inner: AgentSessionLike) {}
+  constructor(public readonly inner: AgentSessionLike, options: AgentSessionWrapperOptions = {}) {
+    this.backgroundWorkProbe = options.backgroundWorkProbe;
+    this.idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+  }
 
   get sessionId(): string {
     return this.inner.sessionId;
@@ -355,15 +369,39 @@ export class AgentSessionWrapper {
 
   private resetIdleTimer(): void {
     if (this.idleTimer) clearTimeout(this.idleTimer);
+    const generation = ++this.idleGeneration;
     this.idleTimer = setTimeout(() => {
-      if (this.isRunning()) {
-        this.resetIdleTimer();
-        return;
-      }
-      void this.shutdown().catch((error) => {
-        console.error("[pi-web] failed to shut down idle session:", error instanceof Error ? error.message : error);
-      });
-    }, 10 * 60 * 1000);
+      this.idleTimer = null;
+      void this.handleIdleTimeout(generation);
+    }, this.idleTimeoutMs);
+  }
+
+  private async handleIdleTimeout(generation: number): Promise<void> {
+    if (!this._alive) return;
+    if (this.isRunning()) {
+      this.resetIdleTimer();
+      return;
+    }
+
+    let hasActiveBackgroundWork = false;
+    try {
+      hasActiveBackgroundWork = await this.backgroundWorkProbe?.hasActiveWork() ?? false;
+    } catch (error) {
+      // A configured probe represents an extension that owns background work.
+      // Preserve the session on transient probe failures rather than losing its
+      // completion notifier.
+      hasActiveBackgroundWork = Boolean(this.backgroundWorkProbe);
+      console.error("[pi-web] failed to inspect session background work:", error instanceof Error ? error.message : error);
+    }
+
+    if (!this._alive || generation !== this.idleGeneration) return;
+    if (this.isRunning() || hasActiveBackgroundWork) {
+      this.resetIdleTimer();
+      return;
+    }
+    await this.shutdown().catch((error) => {
+      console.error("[pi-web] failed to shut down idle session:", error instanceof Error ? error.message : error);
+    });
   }
 
   private persistBashOnlySession(): void {
@@ -776,7 +814,9 @@ export class AgentSessionWrapper {
   destroy(): void {
     if (!this._alive) return;
     this._alive = false;
+    this.idleGeneration += 1;
     if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.backgroundWorkProbe?.dispose();
     if (this.inner.isBashRunning) this.inner.abortBash();
     this.unsubscribe?.();
     for (const pending of this.pendingUiResponses.values()) pending.cancel();
@@ -1612,11 +1652,14 @@ export async function startRpcSession(
     // its .pi/extensions code automatically (see lib/project-trust.ts, #236).
     const trustReloadOptions = projectTrustReloadOptions(sessionCwd, agentDir);
     const settingsManager = SettingsManager.create(sessionCwd, agentDir);
+    const extensionEventBus = createEventBus();
+    const backgroundWorkProbe = createSubagentBackgroundWorkProbe(extensionEventBus, sessionManager.getSessionId() ?? sessionId);
     const services = await createPiWebAgentSessionServices({
       cwd: sessionCwd,
       agentDir,
       settingsManager,
       resourceLoaderOptions: {
+        eventBus: extensionEventBus,
         extensionFactories: [
           createProjectCommandBashExtension({
             cwd: sessionCwd,
@@ -1675,7 +1718,7 @@ export async function startRpcSession(
       inner.setActiveToolsByName(withExtensionTools(inner, toolNames));
     }
 
-    const wrapper = new AgentSessionWrapper(inner);
+    const wrapper = new AgentSessionWrapper(inner, { backgroundWorkProbe });
     // When all tools are disabled, clear the system prompt entirely.
     // pi's buildSystemPrompt always produces a non-empty prompt even with no tools;
     // keep this forced after extension resource discovery and reloads as well.

@@ -13,7 +13,7 @@ import type {
 } from "@/lib/types";
 import { isBlockingExtensionUiRequest } from "@/lib/browser-notifications";
 import { normalizeToolCalls } from "@/lib/normalize";
-import { isPromptRejectedError, sendAgentCommand } from "@/lib/agent-client";
+import { isPromptBusyError, isPromptRejectedError, sendAgentCommand } from "@/lib/agent-client";
 import { clearDraft, rekeyDraft, restoreDraftSubmission } from "@/lib/draft-store";
 import { getPreferredToolPreset, setPreferredToolPreset } from "@/lib/tool-preset-preference";
 import { getToolNamesForPreset, type ToolEntry, type ToolPreset } from "@/lib/tool-presets";
@@ -1334,9 +1334,31 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (isSlashCommandPrompt && sentSessionId) {
         void waitForPromptSettlement(sentSessionId, promptRunId);
       }
-    } catch (e) {
-      console.error("Failed to send message:", e);
-      const definitivelyRejected = !promptRequestStarted || isPromptRejectedError(e);
+    } catch (error) {
+      let failure = error;
+
+      // An extension-triggered turn can start after the composer checked its
+      // local running state but before this prompt reaches the server. Preserve
+      // the user's intent by atomically resubmitting it as steering input.
+      if (sentSessionId && isPromptBusyError(error)) {
+        rpcPromptPendingRef.current = false;
+        try {
+          await sendAgentCommand(sentSessionId, {
+            type: "prompt",
+            message,
+            streamingBehavior: "steer",
+            ...(piImages?.length ? { images: piImages } : {}),
+          });
+          if (isNew) promoteNewSession(1, message);
+          void reconcileAgentState(sentSessionId);
+          return;
+        } catch (retryError) {
+          failure = retryError;
+        }
+      }
+
+      console.error("Failed to send message:", failure);
+      const definitivelyRejected = !promptRequestStarted || isPromptRejectedError(failure);
       // A transport/proxy failure after dispatch is ambiguous: the server may
       // have accepted the prompt before the response was lost. Keep SSE alive
       // until server state confirms the run is idle.
@@ -1351,7 +1373,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           ? prev
           : [...prev.slice(0, optimisticIndex), ...prev.slice(optimisticIndex + 1)];
       });
-      addNotice({ type: "error", message: e instanceof Error ? e.message : String(e) });
+      addNotice({ type: "error", message: failure instanceof Error ? failure.message : String(failure) });
       restoreSubmission(message, images, composerDraftKey);
       optimisticUserMessageKeyRef.current = null;
       // Rejection only describes this submission. Another tab or an event we
