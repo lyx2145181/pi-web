@@ -5,6 +5,11 @@ import type { SessionInfo } from "@/lib/types";
 import { loadExplorerOpen, saveExplorerOpen } from "@/lib/file-explorer-state";
 import { dispatchSessionRowContextMenu } from "@/lib/session-row-context-menu";
 import { skillExpansionToCommand } from "@/lib/slash-display";
+import {
+  loadCollapsedSessionIds,
+  saveCollapsedSessionIds,
+  setSessionTreeCollapsed,
+} from "@/lib/session-tree-collapse";
 import { getProjectActivity, getRecentProjects, sessionsForProject } from "@/lib/project-groups";
 import { workspaceKeyOf } from "@/lib/workspace-memory";
 import { useI18n } from "@/hooks/useI18n";
@@ -432,6 +437,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const [explorerRefreshDone, setExplorerRefreshDone] = useState(false);
   const [runningSessionIds, setRunningSessionIds] = useState<Set<string>>(() => new Set());
   const [unreadSessionIds, setUnreadSessionIds] = useState<Set<string>>(() => loadUnreadSessionIds());
+  const [collapsedSessionIds, setCollapsedSessionIds] = useState<Set<string>>(new Set());
   const previousRunningSessionIdsRef = useRef<Set<string>>(new Set());
   // Once polling has delivered a snapshot it is the source of truth for
   // running state; late /api/sessions responses must not overwrite it.
@@ -442,6 +448,18 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const fileExplorerRef = useRef<FileExplorerHandle>(null);
   const sessionListRequestRef = useRef(0);
   const sessionListControllerRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    setCollapsedSessionIds(loadCollapsedSessionIds());
+  }, []);
+
+  const handleSessionTreeCollapse = useCallback((sessionId: string, collapsed: boolean) => {
+    setCollapsedSessionIds((current) => {
+      const next = setSessionTreeCollapsed(current, sessionId, collapsed);
+      saveCollapsedSessionIds(next);
+      return next;
+    });
+  }, []);
 
   const loadSessions = useCallback(async (showLoading = false, force = false) => {
     const requestId = ++sessionListRequestRef.current;
@@ -1672,9 +1690,12 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
             selectedSessionId={selectedSessionId}
             runningSessionIds={runningSessionIds}
             unreadSessionIds={unreadSessionIds}
+            collapsedSessionIds={collapsedSessionIds}
+            onCollapseChange={handleSessionTreeCollapse}
             onSelectSession={handleSelectSessionFromList}
             onRenamed={loadSessions}
             onSessionDeleted={(id) => {
+              handleSessionTreeCollapse(id, false);
               onSessionDeleted?.(id);
               loadSessions();
             }}
@@ -1817,6 +1838,8 @@ function SessionTreeItem({
   selectedSessionId,
   runningSessionIds,
   unreadSessionIds,
+  collapsedSessionIds,
+  onCollapseChange,
   onSelectSession,
   onRenamed,
   onSessionDeleted,
@@ -1826,12 +1849,14 @@ function SessionTreeItem({
   selectedSessionId: string | null;
   runningSessionIds: Set<string>;
   unreadSessionIds: Set<string>;
+  collapsedSessionIds: Set<string>;
+  onCollapseChange: (sessionId: string, collapsed: boolean) => void;
   onSelectSession: (s: SessionInfo) => void;
   onRenamed?: () => void;
   onSessionDeleted?: (id: string) => void;
   depth: number;
 }) {
-  const [collapsed, setCollapsed] = useState(false);
+  const collapsed = collapsedSessionIds.has(node.session.id);
   const hasChildren = node.children.length > 0;
 
   return (
@@ -1859,7 +1884,7 @@ function SessionTreeItem({
           depth={depth}
           hasChildren={hasChildren}
           collapsed={collapsed}
-          onToggleCollapse={() => setCollapsed((v) => !v)}
+          onToggleCollapse={() => onCollapseChange(node.session.id, !collapsed)}
         />
       </div>
       {hasChildren && !collapsed && (
@@ -1871,6 +1896,8 @@ function SessionTreeItem({
               selectedSessionId={selectedSessionId}
               runningSessionIds={runningSessionIds}
               unreadSessionIds={unreadSessionIds}
+              collapsedSessionIds={collapsedSessionIds}
+              onCollapseChange={onCollapseChange}
               onSelectSession={onSelectSession}
               onRenamed={onRenamed}
               onSessionDeleted={onSessionDeleted}

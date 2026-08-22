@@ -12,6 +12,18 @@ test("only Shift+click bypasses session deletion confirmation", () => {
   );
 });
 
+test("persists recursive session-tree collapse state outside unmounted rows", () => {
+  const treeItemSource = source.slice(
+    source.indexOf("function SessionTreeItem("),
+    source.indexOf("function RunningSessionIndicator"),
+  );
+  assert.match(source, /setCollapsedSessionIds\(loadCollapsedSessionIds\(\)\)/);
+  assert.match(source, /saveCollapsedSessionIds\(next\)/);
+  assert.match(treeItemSource, /collapsedSessionIds\.has\(node\.session\.id\)/);
+  assert.match(treeItemSource, /onCollapseChange\(node\.session\.id, !collapsed\)/);
+  assert.doesNotMatch(treeItemSource, /useState\(false\)/);
+});
+
 test("does not register row-level session deletion shortcuts", () => {
   assert.doesNotMatch(sessionItemSource, /const handleKeyDown/);
   assert.doesNotMatch(sessionItemSource, /onKeyDown=\{handleKeyDown\}/);
