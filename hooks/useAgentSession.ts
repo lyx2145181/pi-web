@@ -18,6 +18,12 @@ import { clearDraft, rekeyDraft, restoreDraftSubmission } from "@/lib/draft-stor
 import { getPreferredToolPreset, setPreferredToolPreset } from "@/lib/tool-preset-preference";
 import { getToolNamesForPreset, type ToolEntry, type ToolPreset } from "@/lib/tool-presets";
 import type { SessionStatsInfo } from "@/lib/pi-types";
+import {
+  INITIAL_SESSION_CONTEXT_MESSAGES,
+  SESSION_CONTEXT_PAGE_MESSAGES,
+  type SessionContextPage,
+  type SessionContextStats,
+} from "@/lib/session-context-page";
 import { userMessageKey } from "@/lib/prompt-recovery";
 import { AgentEventConnection } from "@/lib/agent-event-connection";
 import { getToolExecutionProgress } from "@/lib/tool-execution-progress";
@@ -44,6 +50,9 @@ export interface SessionData {
     thinkingLevel: string;
     model: { provider: string; modelId: string } | null;
   };
+  contextPage?: SessionContextPage;
+  contextStats?: SessionContextStats;
+  inputHistory?: string[];
 }
 
 interface AgentEvent {
@@ -101,7 +110,8 @@ type NoticeState = {
 type NoticeAction =
   | { type: "add"; notice: NoticeItem }
   | { type: "mark_oldest_exiting" }
-  | { type: "remove"; id: string };
+  | { type: "remove"; id: string }
+  | { type: "reset" };
 
 export type AgentPhase =
   | { kind: "waiting_model" }
@@ -216,6 +226,8 @@ function noticeReducer(state: NoticeState, action: NoticeAction): NoticeState {
       const visible = state.visible.filter((notice) => notice.id !== action.id);
       return fillPendingNotices(visible, state.pending);
     }
+    case "reset":
+      return { visible: [], pending: [] };
     default:
       return state;
   }
@@ -275,6 +287,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [activeLeafId, setActiveLeafId] = useState<string | null>(null);
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [entryIds, setEntryIds] = useState<string[]>([]);
+  const [contextPage, setContextPage] = useState<SessionContextPage | null>(null);
+  const [contextStats, setContextStats] = useState<SessionContextStats | null>(null);
+  const [serverInputHistory, setServerInputHistory] = useState<string[] | null>(null);
+  const [loadingEarlierMessages, setLoadingEarlierMessages] = useState(false);
   const [streamState, dispatch] = useReducer(streamReducer, INITIAL_STREAMING_STATE);
   const [agentRunning, setAgentRunning] = useState(false);
   const [bashRunning, setBashRunning] = useState(false);
@@ -343,9 +359,20 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const modelSwitchPendingRef = useRef(false);
   const draftKeyAliasesRef = useRef(new Map<string, string>());
   const sessionHookMountedRef = useRef(true);
+  const sessionLoadControllerRef = useRef<AbortController | null>(null);
+  const sessionLoadGenerationRef = useRef(0);
+  const contextLoadControllerRef = useRef<AbortController | null>(null);
+  const contextLoadGenerationRef = useRef(0);
+  const historyLoadControllerRef = useRef<AbortController | null>(null);
+  const historyLoadGenerationRef = useRef(0);
+  const historyLoadPendingRef = useRef(false);
+  const contextPageRef = useRef<SessionContextPage | null>(null);
+  const activeLeafIdRef = useRef<string | null>(null);
 
   sessionPropIdRef.current = session?.id ?? null;
   sessionRunningRef.current = Boolean(sessionRunning);
+  contextPageRef.current = contextPage;
+  activeLeafIdRef.current = activeLeafId;
 
   if (!eventConnectionRef.current) {
     eventConnectionRef.current = new AgentEventConnection({
@@ -422,6 +449,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     if (sessionStatsOverride) {
       return { ...sessionStatsOverride, totalActiveMs: data?.totalActiveMs };
     }
+    if (contextStats && contextPage?.hasEarlier) {
+      return {
+        ...contextStats,
+        sessionFile: data?.filePath || undefined,
+        sessionId: sessionIdRef.current ?? session?.id ?? "",
+        sessionName: session?.name,
+        totalActiveMs: data?.totalActiveMs,
+        ...(contextUsage ? { contextUsage } : {}),
+      } satisfies SessionStatsInfo;
+    }
     const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
     let cost = 0;
     let userMessages = 0;
@@ -458,31 +495,62 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       totalActiveMs: data?.totalActiveMs,
       ...(contextUsage ? { contextUsage } : {}),
     } satisfies SessionStatsInfo;
-  }, [messages, sessionStatsOverride, contextUsage, data?.filePath, data?.totalActiveMs, session?.id, session?.name]);
+  }, [messages, sessionStatsOverride, contextStats, contextPage?.hasEarlier, contextUsage, data?.filePath, data?.totalActiveMs, session?.id, session?.name]);
 
   const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false) => {
+    if (sessionIdRef.current !== sid) return null;
+    const generation = sessionLoadGenerationRef.current + 1;
+    sessionLoadGenerationRef.current = generation;
+    sessionLoadControllerRef.current?.abort();
+    historyLoadGenerationRef.current += 1;
+    historyLoadControllerRef.current?.abort();
+    historyLoadControllerRef.current = null;
+    historyLoadPendingRef.current = false;
+    setLoadingEarlierMessages(false);
+    const controller = new AbortController();
+    sessionLoadControllerRef.current = controller;
+    const isCurrent = () => (
+      sessionHookMountedRef.current
+      && sessionIdRef.current === sid
+      && sessionLoadGenerationRef.current === generation
+      && !controller.signal.aborted
+    );
     let messagesLoaded = false;
     try {
       if (showLoading) setLoading(true);
-      const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1" });
-      const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}?${params}`);
+      const params = new URLSearchParams({
+        deferThinking: "1",
+        deferMedia: "1",
+        tail: String(INITIAL_SESSION_CONTEXT_MESSAGES),
+      });
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}?${params}`, {
+        signal: controller.signal,
+      });
       if (res.status === 404) {
+        if (!isCurrent()) return null;
         if (showLoading) {
           setData(null);
           setActiveLeafId(null);
           setMessages([]);
+          setEntryIds([]);
+          setContextPage(null);
+          setContextStats(null);
+          setServerInputHistory(null);
           setError(null);
         }
         return null;
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const d = await res.json() as SessionData;
-      if (sessionIdRef.current !== sid) return null;
+      if (!isCurrent()) return null;
       const persistedMessages = d.context.messages;
       setData(d);
       setActiveLeafId(d.leafId);
       setMessages(persistedMessages);
       setEntryIds(d.context.entryIds ?? []);
+      setContextPage(d.contextPage ?? null);
+      setContextStats(d.contextStats ?? null);
+      setServerInputHistory(d.inputHistory ?? null);
       setCurrentModelOverride((current) => modelSwitchPendingRef.current ? current : null);
       setError(null);
       if (d.context.thinkingLevel && d.context.thinkingLevel !== "off") {
@@ -494,10 +562,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (!includeState) return null;
 
       try {
-        const stateRes = await fetch(`/api/sessions/${encodeURIComponent(sid)}/state`);
+        const stateRes = await fetch(`/api/sessions/${encodeURIComponent(sid)}/state`, {
+          signal: controller.signal,
+        });
         if (!stateRes.ok) throw new Error(`HTTP ${stateRes.status}`);
         const agentState = await stateRes.json() as { running: boolean; state?: AgentStateResponse };
-        if (sessionIdRef.current !== sid) return null;
+        if (!isCurrent()) return null;
 
         const liveState = agentState.state;
         if (liveState) {
@@ -512,29 +582,124 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         }
         return agentState;
       } catch (e) {
-        console.error("Failed to load agent state:", e);
+        if (!controller.signal.aborted) console.error("Failed to load agent state:", e);
         return null;
       }
     } catch (e) {
-      setError(String(e));
+      if (isCurrent()) setError(String(e));
       return null;
     } finally {
-      if (showLoading && !messagesLoaded) setLoading(false);
+      if (sessionLoadControllerRef.current === controller) {
+        sessionLoadControllerRef.current = null;
+      }
+      if (showLoading && !messagesLoaded && isCurrent()) setLoading(false);
     }
   }, []);
 
   const loadContext = useCallback(async (sid: string, leafId: string | null) => {
+    if (sessionIdRef.current !== sid) return;
+    const generation = contextLoadGenerationRef.current + 1;
+    contextLoadGenerationRef.current = generation;
+    contextLoadControllerRef.current?.abort();
+    historyLoadGenerationRef.current += 1;
+    historyLoadControllerRef.current?.abort();
+    historyLoadControllerRef.current = null;
+    historyLoadPendingRef.current = false;
+    setLoadingEarlierMessages(false);
+    const controller = new AbortController();
+    contextLoadControllerRef.current = controller;
     try {
-      const params = new URLSearchParams({ deferThinking: "1", deferMedia: "1" });
+      const params = new URLSearchParams({
+        deferThinking: "1",
+        deferMedia: "1",
+        tail: String(INITIAL_SESSION_CONTEXT_MESSAGES),
+      });
       if (leafId) params.set("leafId", leafId);
       const url = `/api/sessions/${encodeURIComponent(sid)}/context?${params}`;
-      const res = await fetch(url);
+      const res = await fetch(url, { signal: controller.signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const d = await res.json() as { context: { messages: AgentMessage[]; entryIds: string[] } };
+      const d = await res.json() as {
+        context: { messages: AgentMessage[]; entryIds: string[] };
+        page?: SessionContextPage;
+        contextStats?: SessionContextStats;
+        inputHistory?: string[];
+      };
+      if (
+        controller.signal.aborted
+        || sessionIdRef.current !== sid
+        || contextLoadGenerationRef.current !== generation
+      ) return;
       setMessages(d.context.messages);
       setEntryIds(d.context.entryIds ?? []);
+      setContextPage(d.page ?? null);
+      setContextStats(d.contextStats ?? null);
+      setServerInputHistory(d.inputHistory ?? null);
     } catch (e) {
-      console.error("Failed to load context:", e);
+      if (!controller.signal.aborted) console.error("Failed to load context:", e);
+    } finally {
+      if (contextLoadControllerRef.current === controller) {
+        contextLoadControllerRef.current = null;
+      }
+    }
+  }, []);
+
+  const loadEarlierMessages = useCallback(async (): Promise<number> => {
+    const sid = sessionIdRef.current;
+    const page = contextPageRef.current;
+    if (!sid || !page?.hasEarlier || historyLoadPendingRef.current) return 0;
+
+    const requestedBefore = page.startIndex;
+    const requestedLeafId = activeLeafIdRef.current;
+    const generation = historyLoadGenerationRef.current + 1;
+    historyLoadGenerationRef.current = generation;
+    historyLoadControllerRef.current?.abort();
+    const controller = new AbortController();
+    historyLoadControllerRef.current = controller;
+    historyLoadPendingRef.current = true;
+    setLoadingEarlierMessages(true);
+    try {
+      const params = new URLSearchParams({
+        deferThinking: "1",
+        deferMedia: "1",
+        before: String(requestedBefore),
+        limit: String(SESSION_CONTEXT_PAGE_MESSAGES),
+      });
+      if (requestedLeafId) params.set("leafId", requestedLeafId);
+      const response = await fetch(
+        `/api/sessions/${encodeURIComponent(sid)}/context?${params}`,
+        { signal: controller.signal },
+      );
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const result = await response.json() as {
+        context: { messages: AgentMessage[]; entryIds: string[] };
+        page: SessionContextPage;
+        contextStats?: SessionContextStats;
+        inputHistory?: string[];
+      };
+      if (
+        controller.signal.aborted
+        || sessionIdRef.current !== sid
+        || activeLeafIdRef.current !== requestedLeafId
+        || historyLoadGenerationRef.current !== generation
+        || contextPageRef.current?.startIndex !== requestedBefore
+        || result.page.endIndex !== requestedBefore
+      ) return 0;
+
+      setMessages((current) => [...result.context.messages, ...current]);
+      setEntryIds((current) => [...(result.context.entryIds ?? []), ...current]);
+      setContextPage(result.page);
+      setContextStats(result.contextStats ?? null);
+      setServerInputHistory(result.inputHistory ?? null);
+      return result.context.messages.length;
+    } catch (error) {
+      if (!controller.signal.aborted) console.error("Failed to load earlier messages:", error);
+      return 0;
+    } finally {
+      if (historyLoadControllerRef.current === controller) {
+        historyLoadControllerRef.current = null;
+        historyLoadPendingRef.current = false;
+        setLoadingEarlierMessages(false);
+      }
     }
   }, []);
 
@@ -1804,43 +1969,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [scrollToBottom]);
 
-  // Load session on mount
+  // Own long-lived resources for the lifetime of the chat shell. Existing
+  // session switches are handled below without unmounting this hook.
   useEffect(() => {
     sessionHookMountedRef.current = true;
-    if (session) {
-      sessionIdRef.current = session.id;
-      loadSession(session.id, true, true).then((agentState) => {
-        if (agentState?.running) {
-          loadTools(session.id);
-          if (agentState.state?.isStreaming || agentState.state?.isPromptRunning) {
-            sdkAgentActiveRef.current = Boolean(agentState.state.isStreaming);
-            rpcPromptPendingRef.current = Boolean(agentState.state.isPromptRunning);
-            agentRunningRef.current = true;
-            setAgentRunning(true);
-            setAgentPhase(agentState.state.isStreaming ? { kind: "waiting_model" } : { kind: "running_command" });
-            dispatch({ type: "start" });
-            void maintainEventsConnected(session.id);
-            if (!agentState.state.isStreaming && agentState.state.isPromptRunning) {
-              void waitForPromptSettlement(session.id);
-            }
-          }
-          if (agentState.state?.isBashRunning) {
-            bashRunningRef.current = true;
-            setBashRunning(true);
-            void waitForBashSettlement(session.id);
-          }
-        }
-        if (agentState?.state) {
-          if (agentState.state.isCompacting !== undefined) setIsCompacting(agentState.state.isCompacting);
-          if (agentState.state.contextUsage !== undefined) setContextUsage(agentState.state.contextUsage ?? null);
-          if (agentState.state.systemPrompt !== undefined) setSystemPrompt(agentState.state.systemPrompt ?? null);
-          if (agentState.state.thinkingLevel !== undefined) setThinkingLevel((agentState.state.thinkingLevel as ThinkingLevelOption) ?? "auto");
-          if (agentState.state.extensionStatuses !== undefined) setExtensionStatuses(agentState.state.extensionStatuses ?? []);
-          if (agentState.state.extensionWidgets !== undefined) setExtensionWidgets(agentState.state.extensionWidgets ?? []);
-          if (agentState.state.queuedMessages !== undefined) setQueuedMessages(normalizeQueuedMessages(agentState.state.queuedMessages));
-        }
-      });
-    }
     return () => {
       sessionHookMountedRef.current = false;
       const abandonedDraftKey = isNew ? newSessionDraftKey : null;
@@ -1856,11 +1988,123 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         liveFollowFrameRef.current = null;
       }
       bashRecoveryIdRef.current += 1;
+      sessionLoadGenerationRef.current += 1;
+      sessionLoadControllerRef.current?.abort();
+      sessionLoadControllerRef.current = null;
+      contextLoadGenerationRef.current += 1;
+      contextLoadControllerRef.current?.abort();
+      contextLoadControllerRef.current = null;
+      historyLoadGenerationRef.current += 1;
+      historyLoadControllerRef.current?.abort();
+      historyLoadControllerRef.current = null;
+      historyLoadPendingRef.current = false;
       cancelEventStreamGrace();
       closeEvents();
     };
+    // Cleanup intentionally captures the composer that owns this mounted shell.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Load by session id without rebuilding ChatWindow. A fresh composer is
+  // promoted in-place after its first prompt; that transition already owns the
+  // live refs and SSE connection, so it must not be reset or reloaded here.
+  useEffect(() => {
+    if (!session) return;
+    const sid = session.id;
+    if (newSessionPromotedRef.current && sessionIdRef.current === sid) return;
+
+    sessionIdRef.current = sid;
+    newSessionPromotedRef.current = false;
+    sessionLoadGenerationRef.current += 1;
+    sessionLoadControllerRef.current?.abort();
+    contextLoadGenerationRef.current += 1;
+    contextLoadControllerRef.current?.abort();
+    historyLoadGenerationRef.current += 1;
+    historyLoadControllerRef.current?.abort();
+    historyLoadControllerRef.current = null;
+    historyLoadPendingRef.current = false;
+    cancelEventStreamGrace();
+    closeEvents();
+    agentRunningRef.current = false;
+    sdkAgentActiveRef.current = false;
+    rpcPromptPendingRef.current = false;
+    bashRunningRef.current = false;
+    bashRecoveryIdRef.current += 1;
+    initialScrollDoneRef.current = false;
+    pendingScrollToUserRef.current = false;
+    setData(null);
+    setActiveLeafId(null);
+    setMessages([]);
+    setEntryIds([]);
+    setContextPage(null);
+    setContextStats(null);
+    setServerInputHistory(null);
+    setLoadingEarlierMessages(false);
+    setError(null);
+    setAgentRunning(false);
+    setBashRunning(false);
+    setPendingBash(null);
+    setAgentPhase(null);
+    setPromptAnchorActive(false);
+    setRetryInfo(null);
+    setContextUsage(null);
+    setSystemPrompt(null);
+    setCurrentModelOverride(null);
+    setPendingModel(null);
+    modelSwitchPendingRef.current = false;
+    setModelSwitching(false);
+    setToolPresetState("default");
+    setThinkingLevel("auto");
+    setForkingEntryId(null);
+    setIsCompacting(false);
+    setCompactError(null);
+    setCompactResult(null);
+    setSlashCommands([]);
+    setSlashCommandsLoading(false);
+    setSessionStatsOverride(null);
+    dispatchNotice({ type: "reset" });
+    setExtensionDialog(null);
+    setExtensionCustomUi(null);
+    setExtensionStatuses([]);
+    setExtensionWidgets([]);
+    setQueuedMessages({ steering: [], followUp: [] });
+    dispatch({ type: "end" });
+
+    void loadSession(sid, true, true).then((agentState) => {
+      if (sessionIdRef.current !== sid || !agentState) return;
+      if (agentState.running) {
+        void loadTools(sid);
+        if (agentState.state?.isStreaming || agentState.state?.isPromptRunning) {
+          sdkAgentActiveRef.current = Boolean(agentState.state.isStreaming);
+          rpcPromptPendingRef.current = Boolean(agentState.state.isPromptRunning);
+          agentRunningRef.current = true;
+          setAgentRunning(true);
+          setAgentPhase(agentState.state.isStreaming ? { kind: "waiting_model" } : { kind: "running_command" });
+          dispatch({ type: "start" });
+          void maintainEventsConnected(sid);
+          if (!agentState.state.isStreaming && agentState.state.isPromptRunning) {
+            void waitForPromptSettlement(sid);
+          }
+        }
+        if (agentState.state?.isBashRunning) {
+          bashRunningRef.current = true;
+          setBashRunning(true);
+          void waitForBashSettlement(sid);
+        }
+      }
+      const liveState = agentState.state;
+      if (!liveState) return;
+      if (liveState.isCompacting !== undefined) setIsCompacting(liveState.isCompacting);
+      if (liveState.contextUsage !== undefined) setContextUsage(liveState.contextUsage ?? null);
+      if (liveState.systemPrompt !== undefined) setSystemPrompt(liveState.systemPrompt ?? null);
+      if (liveState.thinkingLevel !== undefined) setThinkingLevel((liveState.thinkingLevel as ThinkingLevelOption) ?? "auto");
+      if (liveState.extensionStatuses !== undefined) setExtensionStatuses(liveState.extensionStatuses ?? []);
+      if (liveState.extensionWidgets !== undefined) setExtensionWidgets(liveState.extensionWidgets ?? []);
+      if (liveState.queuedMessages !== undefined) setQueuedMessages(normalizeQueuedMessages(liveState.queuedMessages));
+    });
+    // Stable callbacks deliberately read the current session through refs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.id]);
 
   useEffect(() => {
     onSystemPromptChange?.(systemPrompt);
@@ -1941,9 +2185,19 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     setSessionStatsOverride(null);
   }, [messages.length, contextUsage?.tokens, contextUsage?.percent, contextUsage?.contextWindow]);
 
+  const sessionTransitionPending = Boolean(
+    session
+    && data?.sessionId !== session.id
+    && !(newSessionPromotedRef.current && sessionIdRef.current === session.id),
+  );
+
   return {
     // State
-    data, loading, error, activeLeafId, messages, entryIds, streamState,
+    data, loading: loading || sessionTransitionPending, error, activeLeafId, messages, entryIds, streamState,
+    hasEarlierMessages: Boolean(contextPage?.hasEarlier),
+    earlierMessageCount: contextPage?.startIndex ?? 0,
+    loadingEarlierMessages,
+    serverInputHistory,
     agentRunning, modelNames, modelList, modelError, modelScopeWarnings, modelThinkingLevels, modelThinkingLevelMaps, newSessionModel, toolPreset, thinkingLevel,
     retryInfo, contextUsage, systemPrompt, forkingEntryId,
     isCompacting, compactError, compactResult, currentModel, displayModel, modelSwitching, sessionStats,
@@ -1961,7 +2215,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     handleCompact, handleSteer, handleFollowUp, handlePromptWithStreamingBehavior, handleAbortCompaction,
     handleRecallQueue,
     handleBuiltinSlashCommand,
-    handleToolPresetChange, handleThinkingLevelChange, loadTools, loadSlashCommands, setActiveLeafId, setData, setMessages,
+    handleToolPresetChange, handleThinkingLevelChange, loadTools, loadSlashCommands, loadEarlierMessages, setActiveLeafId, setData, setMessages,
     scrollToBottom, scrollUserMsgToTop,
     dispatch, setAgentRunning, setForkingEntryId,
     bashRunning, pendingBash,

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useRef, useCallback, useMemo, type CSSProperties, type MouseEvent } from "react";
+import { useDeferredValue, useEffect, useState, useRef, useCallback, useMemo, type CSSProperties, type MouseEvent } from "react";
 import {
   Prism as SyntaxHighlighter,
   createElement as renderSyntaxNode,
@@ -25,12 +25,20 @@ import { CodeBlock, MermaidBlock } from "./MermaidBlock";
 import { FrontmatterCard } from "./FrontmatterCard";
 import { parseUnifiedPatch } from "@/lib/patch";
 import type { GitFileDiffResponse } from "@/lib/git-types";
+import type { FileVersion } from "@/lib/file-version";
 import { useI18n } from "@/hooks/useI18n";
 import {
   resolveInitialFileDisplayMode,
   type FileViewerDisplayMode as DisplayMode,
   type FileViewerState,
 } from "@/lib/file-viewer-state";
+import {
+  getCachedTextFile,
+  invalidateCachedTextFile,
+  setCachedTextFile,
+  textFileCacheKey,
+  type CachedTextFileData,
+} from "./file-content-cache";
 
 export type { FileViewerState } from "@/lib/file-viewer-state";
 
@@ -49,11 +57,7 @@ interface Props {
   watchEnabled?: boolean;
 }
 
-interface FileData {
-  content: string;
-  language: string;
-  size: number;
-}
+type FileData = CachedTextFileData;
 
 const DISPLAY_MODE_LABELS: Record<DisplayMode, string> = {
   source: "Source",
@@ -422,90 +426,125 @@ function DiffView({ patch }: { patch: string }) {
   );
 }
 
+function useWatchedFileVersion(
+  filePath: string,
+  sourceSessionId: string | null | undefined,
+  watchEnabled: boolean,
+): { version: FileVersion | null; watching: boolean; watchError: string | null } {
+  const [version, setVersion] = useState<FileVersion | null>(null);
+  const [watching, setWatching] = useState(false);
+  const [watchError, setWatchError] = useState<string | null>(null);
+  const versionRef = useRef<FileVersion | null>(null);
+
+  useEffect(() => {
+    versionRef.current = null;
+    setVersion(null);
+    setWatching(false);
+    setWatchError(null);
+  }, [filePath, sourceSessionId]);
+
+  useEffect(() => {
+    let active = true;
+    let connected = false;
+    let fallbackStarted = false;
+    let changeTimer: ReturnType<typeof setTimeout> | null = null;
+    const controller = new AbortController();
+
+    const applyVersion = (nextVersion: FileVersion) => {
+      if (!active || versionRef.current?.etag === nextVersion.etag) return;
+      versionRef.current = nextVersion;
+      setVersion(nextVersion);
+      setWatchError(nextVersion.exists ? null : "Not found");
+    };
+    const parseVersion = (event: Event): FileVersion | null => {
+      try {
+        return (JSON.parse((event as MessageEvent).data) as { version?: FileVersion }).version ?? null;
+      } catch {
+        return null;
+      }
+    };
+    const loadMeta = async () => {
+      if (fallbackStarted || versionRef.current) return;
+      fallbackStarted = true;
+      try {
+        const response = await fetch(getFileApiUrl(filePath, "meta", sourceSessionId), {
+          signal: controller.signal,
+        });
+        const data = await response.json() as { version?: FileVersion; error?: string };
+        if (!active) return;
+        if (!response.ok || !data.version) {
+          setWatchError(data.error ?? `HTTP ${response.status}`);
+          return;
+        }
+        applyVersion(data.version);
+      } catch (error) {
+        if (active && (error as { name?: string }).name !== "AbortError") {
+          setWatchError(String(error));
+        }
+      }
+    };
+
+    if (!watchEnabled) {
+      void loadMeta();
+      return () => {
+        active = false;
+        controller.abort();
+      };
+    }
+
+    const es = new EventSource(getFileApiUrl(filePath, "watch", sourceSessionId));
+    es.addEventListener("connected", (event) => {
+      connected = true;
+      setWatching(true);
+      const nextVersion = parseVersion(event);
+      if (nextVersion) applyVersion(nextVersion);
+      else void loadMeta();
+    });
+    es.addEventListener("change", (event) => {
+      const nextVersion = parseVersion(event);
+      if (!nextVersion || nextVersion.etag === versionRef.current?.etag) return;
+      if (changeTimer) clearTimeout(changeTimer);
+      changeTimer = setTimeout(() => applyVersion(nextVersion), 80);
+    });
+    const markDisconnected = () => {
+      setWatching(false);
+      if (!connected) void loadMeta();
+    };
+    es.addEventListener("error", markDisconnected);
+
+    return () => {
+      active = false;
+      if (changeTimer) clearTimeout(changeTimer);
+      controller.abort();
+      es.close();
+    };
+  }, [filePath, sourceSessionId, watchEnabled]);
+
+  return { version, watching, watchError };
+}
+
 function ImageViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Props) {
   const { t } = useI18n();
-  const [watching, setWatching] = useState(false);
-  const [bust, setBust] = useState(0);
-  const [size, setSize] = useState<number | null>(null);
+  const { version, watching, watchError } = useWatchedFileVersion(
+    filePath,
+    sourceSessionId,
+    watchEnabled,
+  );
   const [naturalSize, setNaturalSize] = useState<{ w: number; h: number } | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const esRef = useRef<EventSource | null>(null);
-  const syncRequestRef = useRef(0);
+  const [renderError, setRenderError] = useState<string | null>(null);
 
   const ext = getFileName(filePath).toLowerCase().split(".").pop() ?? "";
 
   useEffect(() => {
-    setBust(0);
-    setSize(null);
     setNaturalSize(null);
-    setError(null);
-    setWatching(false);
-  }, [filePath, sourceSessionId]);
+    setRenderError(null);
+  }, [filePath, sourceSessionId, version?.etag]);
 
-  useEffect(() => {
-    setWatching(false);
-
-    if (esRef.current) {
-      esRef.current.close();
-      esRef.current = null;
-    }
-
-    if (!watchEnabled) return;
-
-    let active = true;
-    const synchronize = () => {
-      const requestId = ++syncRequestRef.current;
-      fetch(getFileApiUrl(filePath, "meta", sourceSessionId))
-        .then((response) => response.json())
-        .then((next: { size?: number; error?: string }) => {
-          if (!active || requestId !== syncRequestRef.current) return;
-          if (next.error) {
-            setError(next.error);
-            return;
-          }
-          if (typeof next.size === "number") setSize(next.size);
-          setNaturalSize(null);
-          setError(null);
-          setBust((value) => value + 1);
-        })
-        .catch((nextError) => {
-          if (active && requestId === syncRequestRef.current) setError(String(nextError));
-        });
-    };
-
-    const es = new EventSource(getFileApiUrl(filePath, "watch", sourceSessionId));
-    esRef.current = es;
-
-    es.addEventListener("connected", () => {
-      setWatching(true);
-      synchronize();
-    });
-    es.addEventListener("change", (e) => {
-      syncRequestRef.current += 1;
-      try {
-        const d = JSON.parse((e as MessageEvent).data) as { size?: number };
-        if (typeof d.size === "number") setSize(d.size);
-      } catch { /* ignore */ }
-      setNaturalSize(null);
-      setError(null);
-      setBust((b) => b + 1);
-    });
-    const markDisconnected = () => {
-      setWatching(false);
-    };
-    es.addEventListener("error", markDisconnected);
-    es.onerror = markDisconnected;
-
-    return () => {
-      active = false;
-      es.close();
-      if (esRef.current === es) esRef.current = null;
-    };
-  }, [filePath, sourceSessionId, watchEnabled]);
-
-  const src = getFileApiUrl(filePath, "read", sourceSessionId, bust ? { v: bust } : undefined);
-
-  const formatSizeStr = size != null ? formatSize(size) : null;
+  const src = version?.exists
+    ? getFileApiUrl(filePath, "read", sourceSessionId, { v: version.etag })
+    : null;
+  const error = renderError ?? watchError;
+  const formatSizeStr = version?.exists ? formatSize(version.size) : null;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
@@ -563,7 +602,7 @@ function ImageViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
       >
         {error ? (
           <div style={{ color: "#f87171", fontSize: 13 }}>{error}</div>
-        ) : (
+        ) : src ? (
           // eslint-disable-next-line @next/next/no-img-element
           <img
             src={src}
@@ -572,7 +611,7 @@ function ImageViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
               const img = e.currentTarget;
               setNaturalSize({ w: img.naturalWidth, h: img.naturalHeight });
             }}
-            onError={() => setError("Failed to load image")}
+            onError={() => setRenderError("Failed to load image")}
             style={{
               maxWidth: "100%",
               maxHeight: "100%",
@@ -580,6 +619,8 @@ function ImageViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
               boxShadow: "0 2px 8px rgba(0,0,0,0.15)",
             }}
           />
+        ) : (
+          <div style={{ color: "var(--text-muted)", fontSize: 13 }}>{t("i18n.loading")}</div>
         )}
       </div>
     </div>
@@ -596,86 +637,26 @@ function formatDuration(seconds: number): string {
 
 function AudioViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Props) {
   const { t } = useI18n();
-  const [watching, setWatching] = useState(false);
-  const [bust, setBust] = useState(0);
-  const [size, setSize] = useState<number | null>(null);
+  const { version, watching, watchError } = useWatchedFileVersion(
+    filePath,
+    sourceSessionId,
+    watchEnabled,
+  );
   const [duration, setDuration] = useState<number | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const esRef = useRef<EventSource | null>(null);
-  const syncRequestRef = useRef(0);
+  const [renderError, setRenderError] = useState<string | null>(null);
 
   const ext = getFileName(filePath).toLowerCase().split(".").pop() ?? "";
 
   useEffect(() => {
-    setBust(0);
-    setSize(null);
     setDuration(null);
-    setError(null);
-    setWatching(false);
-  }, [filePath, sourceSessionId]);
+    setRenderError(null);
+  }, [filePath, sourceSessionId, version?.etag]);
 
-  useEffect(() => {
-    setWatching(false);
-
-    if (esRef.current) {
-      esRef.current.close();
-      esRef.current = null;
-    }
-
-    if (!watchEnabled) return;
-
-    let active = true;
-    const synchronize = () => {
-      const requestId = ++syncRequestRef.current;
-      fetch(getFileApiUrl(filePath, "meta", sourceSessionId))
-        .then((response) => response.json())
-        .then((next: { size?: number; error?: string }) => {
-          if (!active || requestId !== syncRequestRef.current) return;
-          if (next.error) {
-            setError(next.error);
-            return;
-          }
-          if (typeof next.size === "number") setSize(next.size);
-          setDuration(null);
-          setError(null);
-          setBust((value) => value + 1);
-        })
-        .catch((nextError) => {
-          if (active && requestId === syncRequestRef.current) setError(String(nextError));
-        });
-    };
-
-    const es = new EventSource(getFileApiUrl(filePath, "watch", sourceSessionId));
-    esRef.current = es;
-
-    es.addEventListener("connected", () => {
-      setWatching(true);
-      synchronize();
-    });
-    es.addEventListener("change", (e) => {
-      syncRequestRef.current += 1;
-      try {
-        const d = JSON.parse((e as MessageEvent).data) as { size?: number };
-        if (typeof d.size === "number") setSize(d.size);
-      } catch { /* ignore */ }
-      setDuration(null);
-      setError(null);
-      setBust((b) => b + 1);
-    });
-    const markDisconnected = () => {
-      setWatching(false);
-    };
-    es.addEventListener("error", markDisconnected);
-    es.onerror = markDisconnected;
-
-    return () => {
-      active = false;
-      es.close();
-      if (esRef.current === es) esRef.current = null;
-    };
-  }, [filePath, sourceSessionId, watchEnabled]);
-
-  const src = getFileApiUrl(filePath, "read", sourceSessionId, bust ? { v: bust } : undefined);
+  const src = version?.exists
+    ? getFileApiUrl(filePath, "read", sourceSessionId, { v: version.etag })
+    : null;
+  const error = renderError ?? watchError;
+  const size = version?.exists ? version.size : null;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
@@ -732,15 +713,21 @@ function AudioViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
               {error}
             </div>
           )}
-          <audio
-            key={src}
-            controls
-            preload="metadata"
-            src={src}
-            onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
-            onError={() => setError("Failed to load audio")}
-            style={{ width: "100%" }}
-          />
+          {src ? (
+            <audio
+              key={src}
+              controls
+              preload="metadata"
+              src={src}
+              onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
+              onError={() => setRenderError("Failed to load audio")}
+              style={{ width: "100%" }}
+            />
+          ) : !error ? (
+            <div style={{ color: "var(--text-muted)", fontSize: 13, textAlign: "center" }}>
+              {t("i18n.loading")}
+            </div>
+          ) : null}
         </div>
       </div>
     </div>
@@ -749,118 +736,21 @@ function AudioViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
 
 function DocumentViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Props) {
   const { t } = useI18n();
-  const [watching, setWatching] = useState(false);
-  const [bust, setBust] = useState(0);
-  const [size, setSize] = useState<number | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const esRef = useRef<EventSource | null>(null);
-  const syncRequestRef = useRef(0);
-
+  const { version, watching, watchError } = useWatchedFileVersion(
+    filePath,
+    sourceSessionId,
+    watchEnabled,
+  );
   const ext = getFileExt(filePath);
   const isPdf = ext === "pdf";
-  const previewUrl = isPdf
-    ? getFileApiUrl(filePath, "read", sourceSessionId, bust ? { v: bust } : undefined)
-    : getFileApiUrl(filePath, "preview", sourceSessionId, bust ? { v: bust } : undefined);
-
-  useEffect(() => {
-    setBust(0);
-    setSize(null);
-    setError(null);
-    setWatching(false);
-
-    let active = true;
-    const requestId = ++syncRequestRef.current;
-    fetch(getFileApiUrl(filePath, "meta", sourceSessionId))
-      .then((r) => r.json())
-      .then((d: { size?: number; error?: string }) => {
-        if (!active || requestId !== syncRequestRef.current) return;
-        if (d.error) setError(d.error);
-        if (typeof d.size === "number") {
-          setSize(d.size);
-          if (!isPdf && d.size > DOCX_PREVIEW_MAX_BYTES) {
-            setError("DOCX too large for preview (>10MB)");
-          }
-        }
-      })
-      .catch((nextError) => {
-        if (active && requestId === syncRequestRef.current) setError(String(nextError));
-      });
-
-    return () => {
-      active = false;
-    };
-  }, [filePath, isPdf, sourceSessionId]);
-
-  useEffect(() => {
-    setWatching(false);
-
-    if (esRef.current) {
-      esRef.current.close();
-      esRef.current = null;
-    }
-
-    if (!watchEnabled) return;
-
-    let active = true;
-    const synchronize = () => {
-      const requestId = ++syncRequestRef.current;
-      fetch(getFileApiUrl(filePath, "meta", sourceSessionId))
-        .then((r) => r.json())
-        .then((d: { size?: number; error?: string }) => {
-          if (!active || requestId !== syncRequestRef.current) return;
-          if (d.error) {
-            setError(d.error);
-            return;
-          }
-          if (typeof d.size === "number") {
-            setSize(d.size);
-            if (!isPdf && d.size > DOCX_PREVIEW_MAX_BYTES) {
-              setError("DOCX too large for preview (>10MB)");
-              return;
-            }
-          }
-          setError(null);
-          setBust((value) => value + 1);
-        })
-        .catch((nextError) => {
-          if (active && requestId === syncRequestRef.current) setError(String(nextError));
-        });
-    };
-
-    const es = new EventSource(getFileApiUrl(filePath, "watch", sourceSessionId));
-    esRef.current = es;
-
-    es.addEventListener("connected", () => {
-      setWatching(true);
-      synchronize();
-    });
-    es.addEventListener("change", (e) => {
-      syncRequestRef.current += 1;
-      try {
-        const d = JSON.parse((e as MessageEvent).data) as { size?: number };
-        if (typeof d.size === "number") {
-          setSize(d.size);
-          if (!isPdf && d.size > DOCX_PREVIEW_MAX_BYTES) {
-            setError("DOCX too large for preview (>10MB)");
-            return;
-          }
-        }
-      } catch { /* ignore */ }
-      setError(null);
-      setBust((b) => b + 1);
-    });
-    const markDisconnected = () => {
-      setWatching(false);
-    };
-    es.addEventListener("error", markDisconnected);
-    es.onerror = markDisconnected;
-
-    return () => {
-      active = false;
-      es.close();
-      if (esRef.current === es) esRef.current = null;
-    };
-  }, [filePath, isPdf, sourceSessionId, watchEnabled]);
+  const size = version?.exists ? version.size : null;
+  const tooLarge = !isPdf && size !== null && size > DOCX_PREVIEW_MAX_BYTES;
+  const error = tooLarge ? "DOCX too large for preview (>10MB)" : watchError;
+  const previewUrl = version?.exists && !tooLarge
+    ? isPdf
+      ? getFileApiUrl(filePath, "read", sourceSessionId, { v: version.etag })
+      : getFileApiUrl(filePath, "preview", sourceSessionId, { v: version.etag })
+    : null;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
@@ -905,7 +795,7 @@ function DocumentViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }:
           <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", padding: 24, color: "#f87171", fontSize: 13, textAlign: "center" }}>
             {error}
           </div>
-        ) : (
+        ) : previewUrl ? (
           <iframe
             key={previewUrl}
             src={previewUrl}
@@ -913,6 +803,10 @@ function DocumentViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }:
             title={t("i18n.previewFile", { file: getFileName(filePath) })}
             style={{ width: "100%", height: "100%", border: "none", background: isPdf ? "var(--bg)" : "#eef1f5" }}
           />
+        ) : (
+          <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", color: "var(--text-muted)", fontSize: 13 }}>
+            {t("i18n.loading")}
+          </div>
         )}
       </div>
     </div>
@@ -979,7 +873,17 @@ function TextFileViewer({
   const [gitDiffResolved, setGitDiffResolved] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const requestedInitialDisplayMode = resolveInitialFileDisplayMode(initialState, initialDisplayMode);
+  const fileExtension = getFileExt(filePath);
+  const extensionDefaultDisplayMode: DisplayMode | undefined =
+    initialState === undefined
+    && initialDisplayMode === undefined
+    && ["md", "mdx", "html", "htm"].includes(fileExtension)
+      ? "preview"
+      : initialDisplayMode;
+  const requestedInitialDisplayMode = resolveInitialFileDisplayMode(
+    initialState,
+    extensionDefaultDisplayMode,
+  );
   const initialWrapLines = initialState?.wrapLines ?? false;
   const initialScrollTop = initialState?.scrollTop ?? 0;
   const initialScrollLeft = initialState?.scrollLeft ?? 0;
@@ -989,11 +893,13 @@ function TextFileViewer({
   const esRef = useRef<EventSource | null>(null);
   const contentRequestRef = useRef(0);
   const gitDiffRequestRef = useRef(0);
+  const contentAbortRef = useRef<AbortController | null>(null);
+  const gitDiffAbortRef = useRef<AbortController | null>(null);
+  const dataRef = useRef<FileData | null>(null);
+  const gitLoadKeyRef = useRef<string | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const autoDiffAppliedRef = useRef(false);
-  const defaultPreviewEligibleRef = useRef(
-    initialState === undefined && initialDisplayMode === undefined,
-  );
+  const defaultPreviewEligibleRef = useRef(false);
   const scrollRestorePendingRef = useRef(true);
   const viewerStateRef = useRef<FileViewerState>({
     displayMode: requestedInitialDisplayMode,
@@ -1003,6 +909,10 @@ function TextFileViewer({
   });
   const onStateChangeRef = useRef(onStateChange);
   const [selectedLineRange, setSelectedLineRange] = useState<SelectedLineRange | null>(null);
+  const cacheKey = useMemo(
+    () => textFileCacheKey(filePath, sourceSessionId),
+    [filePath, sourceSessionId],
+  );
 
   onStateChangeRef.current = onStateChange;
 
@@ -1045,46 +955,75 @@ function TextFileViewer({
     initialScrollLeft,
   ]);
 
-  const fetchContent = useCallback((filePath: string) => {
+  const fetchContent = useCallback(async (targetPath: string) => {
     const requestId = ++contentRequestRef.current;
-    return fetch(getFileApiUrl(filePath, "read", sourceSessionId))
-      .then((r) => r.json())
-      .then((d: FileData & { error?: string }) => {
-        if (requestId !== contentRequestRef.current) return null;
-        if (d.error) {
-          setError(d.error);
-          return null;
-        }
-        setError(null);
-        setData(d);
-        return d;
-      })
-      .catch((e) => {
-        if (requestId !== contentRequestRef.current) return null;
-        setError(String(e));
-        return null;
+    contentAbortRef.current?.abort();
+    const controller = new AbortController();
+    contentAbortRef.current = controller;
+    const current = dataRef.current;
+
+    try {
+      const response = await fetch(getFileApiUrl(targetPath, "read", sourceSessionId), {
+        signal: controller.signal,
+        headers: current ? { "If-None-Match": current.version.etag } : undefined,
       });
-  }, [sourceSessionId]);
+      if (requestId !== contentRequestRef.current) return null;
+      if (response.status === 304 && current) {
+        setError(null);
+        setData(current);
+        return current;
+      }
+      const next = await response.json() as FileData & { error?: string };
+      if (next.error) {
+        setError(next.error);
+        return null;
+      }
+      setError(null);
+      dataRef.current = next;
+      setCachedTextFile(cacheKey, next);
+      setData(next);
+      return next;
+    } catch (nextError) {
+      if (
+        requestId !== contentRequestRef.current
+        || (nextError as { name?: string }).name === "AbortError"
+      ) return null;
+      setError(String(nextError));
+      return null;
+    } finally {
+      if (contentAbortRef.current === controller) contentAbortRef.current = null;
+    }
+  }, [cacheKey, sourceSessionId]);
 
   const fetchGitDiff = useCallback(async (targetPath: string) => {
     const requestId = ++gitDiffRequestRef.current;
+    gitDiffAbortRef.current?.abort();
+    const controller = new AbortController();
+    gitDiffAbortRef.current = controller;
     setGitDiffLoading(true);
     if (!cwd) {
       setGitDiff(null);
       setGitDiffLoading(false);
       setGitDiffResolved(true);
+      if (gitDiffAbortRef.current === controller) gitDiffAbortRef.current = null;
       return;
     }
 
     try {
       const params = new URLSearchParams({ cwd, path: targetPath });
-      const response = await fetch(`/api/git/diff?${params.toString()}`);
+      const response = await fetch(`/api/git/diff?${params.toString()}`, {
+        signal: controller.signal,
+      });
       const next = await response.json() as GitFileDiffResponse & { error?: string };
       if (requestId !== gitDiffRequestRef.current) return;
       setGitDiff(response.ok && next.supported && typeof next.patch === "string" ? next : null);
-    } catch {
-      if (requestId === gitDiffRequestRef.current) setGitDiff(null);
+    } catch (nextError) {
+      if (
+        requestId === gitDiffRequestRef.current
+        && (nextError as { name?: string }).name !== "AbortError"
+      ) setGitDiff(null);
     } finally {
+      if (gitDiffAbortRef.current === controller) gitDiffAbortRef.current = null;
       if (requestId === gitDiffRequestRef.current) {
         setGitDiffLoading(false);
         setGitDiffResolved(true);
@@ -1092,25 +1031,21 @@ function TextFileViewer({
     }
   }, [cwd]);
 
-  // Reset and load the file itself when its identity changes. Live watching is
-  // managed separately so pausing it never clears the displayed content.
+  // Reset only when file identity changes. The watcher effect owns the first
+  // snapshot so Strict Effects and connected cannot race two full reads.
   useEffect(() => {
-    let active = true;
+    contentAbortRef.current?.abort();
+    contentRequestRef.current += 1;
+    dataRef.current = getCachedTextFile(cacheKey) ?? null;
     setLoading(true);
     setError(null);
+    // Cached content remains provisional until the watcher or conditional
+    // read has re-authorized the request and confirmed its version.
     setData(null);
     setGitDiff(null);
     setGitDiffResolved(false);
     setWatching(false);
-
-    fetchContent(filePath).finally(() => {
-      if (active) setLoading(false);
-    });
-
-    return () => {
-      active = false;
-    };
-  }, [filePath, fetchContent, sourceSessionId]);
+  }, [cacheKey, filePath, sourceSessionId]);
 
   useEffect(() => {
     setWatching(false);
@@ -1120,40 +1055,82 @@ function TextFileViewer({
       esRef.current = null;
     }
 
-    if (!watchEnabled) return;
+    let active = true;
+    let connected = false;
+    let fallbackStarted = false;
+    let changeTimer: ReturnType<typeof setTimeout> | null = null;
 
-    const synchronize = () => {
-      void fetchContent(filePath);
-      void fetchGitDiff(filePath);
+    const loadSnapshot = (nextVersion?: FileVersion, refreshDiff = false) => {
+      if (nextVersion && dataRef.current?.version.etag === nextVersion.etag) {
+        setData(dataRef.current);
+        setLoading(false);
+        return;
+      }
+      void fetchContent(filePath).finally(() => {
+        if (active) setLoading(false);
+      });
+      if (
+        refreshDiff
+        && (viewerStateRef.current.displayMode === "diff" || requestedInitialDisplayMode === "diff")
+      ) void fetchGitDiff(filePath);
     };
 
+    if (!watchEnabled) {
+      // A conditional read re-authorizes a provisional cache entry before it
+      // can become visible while live watching is paused.
+      loadSnapshot();
+      return () => {
+        active = false;
+      };
+    }
+
+    const eventVersion = (event: Event): FileVersion | undefined => {
+      try {
+        return (JSON.parse((event as MessageEvent).data) as { version?: FileVersion }).version;
+      } catch {
+        return undefined;
+      }
+    };
     const es = new EventSource(getFileApiUrl(filePath, "watch", sourceSessionId));
     esRef.current = es;
 
-    es.addEventListener("connected", () => {
+    es.addEventListener("connected", (event) => {
+      connected = true;
       setWatching(true);
-      // The server emits connected only after its watcher exists. Reading now
-      // closes the gap between the last snapshot and live events.
-      synchronize();
+      loadSnapshot(eventVersion(event));
     });
 
-    es.addEventListener("change", synchronize);
+    es.addEventListener("change", (event) => {
+      const nextVersion = eventVersion(event);
+      if (nextVersion && dataRef.current?.version.etag === nextVersion.etag) return;
+      invalidateCachedTextFile(cacheKey);
+      if (changeTimer) clearTimeout(changeTimer);
+      changeTimer = setTimeout(() => loadSnapshot(nextVersion, true), 80);
+    });
 
     const markDisconnected = () => {
       setWatching(false);
+      if (!active || connected || fallbackStarted) return;
+      fallbackStarted = true;
+      loadSnapshot();
     };
     es.addEventListener("error", markDisconnected);
-    es.onerror = markDisconnected;
 
     return () => {
+      active = false;
+      if (changeTimer) clearTimeout(changeTimer);
       es.close();
       if (esRef.current === es) esRef.current = null;
     };
-  }, [filePath, fetchContent, fetchGitDiff, sourceSessionId, watchEnabled]);
+  }, [cacheKey, filePath, fetchContent, fetchGitDiff, requestedInitialDisplayMode, sourceSessionId, watchEnabled]);
 
   useEffect(() => {
+    if (displayMode !== "diff" && requestedInitialDisplayMode !== "diff") return;
+    const loadKey = `${filePath}\0${cwd ?? ""}\0${gitRefreshKey ?? 0}`;
+    if (gitLoadKeyRef.current === loadKey) return;
+    gitLoadKeyRef.current = loadKey;
     void fetchGitDiff(filePath);
-  }, [fetchGitDiff, filePath, gitRefreshKey]);
+  }, [cwd, displayMode, fetchGitDiff, filePath, gitRefreshKey, requestedInitialDisplayMode]);
 
   useEffect(() => {
     // HTML gets the same rendered-first treatment as markdown: a generated page
@@ -1264,6 +1241,8 @@ function TextFileViewer({
     loading,
     requestedInitialDisplayMode,
   ]);
+
+  const deferredSourceContent = useDeferredValue(data?.content ?? "");
 
   if (loading || (requestedInitialDisplayMode === "diff" && gitDiffLoading && !data)) {
     return (
@@ -1532,7 +1511,7 @@ function TextFileViewer({
             )}
             wrapLongLines={wrapLines}
           >
-            {content}
+            {deferredSourceContent}
           </SyntaxHighlighter>
         )}
       </div>

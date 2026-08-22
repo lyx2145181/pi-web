@@ -1,12 +1,24 @@
 import { NextResponse } from "next/server";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { resolveSessionPath, buildSessionContext } from "@/lib/session-reader";
 import { getRpcSession } from "@/lib/rpc-manager";
+import { createServerTiming } from "@/lib/server-timing";
+import {
+  getParsedSessionSnapshot,
+  getSessionContextFromSnapshot,
+} from "@/lib/session-detail-cache";
+import {
+  computeSessionContextStats,
+  computeSessionInputHistory,
+  paginateSessionContext,
+  parseSessionContextPageRequest,
+  SessionContextPageRequestError,
+} from "@/lib/session-context-page";
 
 export async function GET(
   req: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const timing = createServerTiming();
   const { id } = await params;
   const url = new URL(req.url);
   const leafId = url.searchParams.get("leafId") ?? undefined;
@@ -14,21 +26,52 @@ export async function GET(
   const deferToolResultImages = url.searchParams.has("deferMedia");
 
   try {
+    const pageRequest = parseSessionContextPageRequest(url.searchParams);
     const rpc = getRpcSession(id);
     const liveRpc = rpc?.isAlive() ? rpc : undefined;
-    const filePath = liveRpc ? null : await resolveSessionPath(id);
+    const filePath = liveRpc
+      ? null
+      : await timing.time("resolve", () => resolveSessionPath(id));
     if (!liveRpc && !filePath) {
-      return NextResponse.json({ error: "Session not found" }, { status: 404 });
+      return timing.finish(NextResponse.json({ error: "Session not found" }, { status: 404 }));
     }
 
-    const sm = liveRpc?.inner.sessionManager ?? SessionManager.open(filePath!);
-    const context = buildSessionContext(sm.getEntries() as never, leafId, {
-      deferThinking,
-      deferToolResultImages,
-    });
+    const diskSnapshot = liveRpc
+      ? null
+      : await timing.time("parse", () => getParsedSessionSnapshot(filePath!));
+    const entries = liveRpc?.inner.sessionManager.getEntries() ?? diskSnapshot!.entries;
+    const contextOptions = { deferThinking, deferToolResultImages };
+    const fullContext = timing.timeSync("context", () => diskSnapshot
+      ? getSessionContextFromSnapshot(
+          diskSnapshot,
+          leafId,
+          contextOptions,
+          () => buildSessionContext(entries as never, leafId, contextOptions),
+        )
+      : buildSessionContext(entries as never, leafId, contextOptions));
+    const contextStats = computeSessionContextStats(fullContext);
+    const inputHistory = computeSessionInputHistory(fullContext);
+    const { context, page } = pageRequest
+      ? paginateSessionContext(fullContext, pageRequest)
+      : {
+          context: fullContext,
+          page: {
+            startIndex: 0,
+            endIndex: fullContext.messages.length,
+            totalMessages: fullContext.messages.length,
+            hasEarlier: false,
+          },
+        };
 
-    return NextResponse.json({ context });
+    const response = timing.timeSync("serialize", () => NextResponse.json({
+      context,
+      page,
+      contextStats,
+      inputHistory,
+    }));
+    return timing.finish(response);
   } catch (error) {
-    return NextResponse.json({ error: String(error) }, { status: 500 });
+    const status = error instanceof SessionContextPageRequestError ? 400 : 500;
+    return timing.finish(NextResponse.json({ error: String(error) }, { status }));
   }
 }

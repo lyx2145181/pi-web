@@ -277,6 +277,7 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
 
   const {
     loading, error, messages, entryIds, streamState,
+    hasEarlierMessages, earlierMessageCount, loadingEarlierMessages, serverInputHistory,
     agentRunning, bashRunning, pendingBash, modelNames, modelList, modelError, modelScopeWarnings, modelThinkingLevels, modelThinkingLevelMaps, toolPreset, thinkingLevel,
     retryInfo, contextUsage, forkingEntryId,
     isCompacting, compactError, compactResult, displayModel: displayModelValue, modelSwitching, sessionStats,
@@ -291,7 +292,7 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
     handleCompact, handleSteer, handleFollowUp, handlePromptWithStreamingBehavior, handleAbortCompaction,
     handleRecallQueue,
     handleBuiltinSlashCommand,
-    handleToolPresetChange, handleThinkingLevelChange, loadSlashCommands, scrollUserMsgToTop,
+    handleToolPresetChange, handleThinkingLevelChange, loadSlashCommands, loadEarlierMessages, scrollUserMsgToTop,
   } = useAgentSession({
     session, sessionRunning, newSessionCwd, newSessionDraftKey, onAgentEnd: wrappedOnAgentEnd, onAttentionNeeded, onSessionCreated, onSessionForked,
     modelsRefreshKey, chatInputRef, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsPanelOpen,
@@ -316,6 +317,11 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
   const sentinelRef = useRef<HTMLDivElement>(null);
   const prevScrollDistanceRef = useRef<number | null>(null);
 
+  useEffect(() => {
+    setVisibleCount(VISIBLE_PAGE_SIZE);
+    prevScrollDistanceRef.current = null;
+  }, [session?.id]);
+
   // IntersectionObserver on the sentinel div at the top of the message list.
   // When it becomes visible, load the next page of older messages.
   useEffect(() => {
@@ -324,17 +330,25 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
     if (!sentinel || !container) return;
     const observer = new IntersectionObserver(
       (entries) => {
-        if (entries[0]?.isIntersecting) {
-          // Save distance from top before prepending to restore scroll later
-          prevScrollDistanceRef.current = captureScrollDistance(container.scrollHeight, container.scrollTop);
+        if (!entries[0]?.isIntersecting) return;
+        // Save distance from top before revealing or fetching older messages.
+        prevScrollDistanceRef.current = captureScrollDistance(container.scrollHeight, container.scrollTop);
+        if (visibleCount < messages.length) {
           setVisibleCount((prev) => getNextVisibleCount(prev));
+          return;
+        }
+        if (hasEarlierMessages && !loadingEarlierMessages) {
+          void loadEarlierMessages().then((loaded) => {
+            if (loaded > 0) setVisibleCount((previous) => previous + loaded);
+            else prevScrollDistanceRef.current = null;
+          });
         }
       },
       { root: container, threshold: 0 }
     );
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [visibleCount, messages.length, scrollContainerRef]);
+  }, [visibleCount, messages.length, hasEarlierMessages, loadingEarlierMessages, loadEarlierMessages, scrollContainerRef]);
 
   // After visibleCount increases (more messages prepended), restore the
   // scroll position so the viewport doesn't jump.
@@ -405,17 +419,21 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
     return map;
   }, [messages]);
   const inputHistory = useMemo(() => {
+    const localInputs = messages
+      .map(getUserInputText)
+      .filter((text): text is string => Boolean(text));
+    const candidates = [...(serverInputHistory ?? []), ...localInputs];
     const seen = new Set<string>();
     const history: string[] = [];
-    for (let i = messages.length - 1; i >= 0; i -= 1) {
-      const text = getUserInputText(messages[i]);
-      if (!text || seen.has(text)) continue;
+    for (let index = candidates.length - 1; index >= 0; index -= 1) {
+      const text = candidates[index];
+      if (seen.has(text)) continue;
       seen.add(text);
       history.push(text);
       if (history.length >= 50) break;
     }
     return history.reverse();
-  }, [messages]);
+  }, [messages, serverInputHistory]);
   const messageRefs = useMessageRefs(visibleMessages.length);
   const revealHistoryForMinimap = useCallback(() => {
     setVisibleCount((current) => Math.max(current, messages.length * 2));
@@ -594,6 +612,7 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
   return (
     <div
       className="relative flex h-full min-w-0 flex-col overflow-hidden"
+      data-ready-session-id={session?.id}
       style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
@@ -697,7 +716,11 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
       ) : (
       <>
       <div className="relative flex min-w-0 flex-1 overflow-hidden">
-        <div ref={scrollContainerRef} className="min-w-0 flex-1 overflow-x-hidden overflow-y-auto pt-4 [scrollbar-width:none]">
+        <div
+          ref={scrollContainerRef}
+          data-chat-scroll-container
+          className="min-w-0 flex-1 overflow-x-hidden overflow-y-auto pt-4 [scrollbar-width:none]"
+        >
           <div style={{ minWidth: 0, padding: `0 ${CHAT_COLUMN_PADDING}px` }}>
             <div ref={messageContentRef} style={{ width: "100%", minWidth: 0, maxWidth: 820, margin: "0 auto" }}>
             {(() => {
@@ -877,9 +900,16 @@ export function ChatWindow({ session, sessionRunning, newSessionCwd, newSessionD
               const { startIndex, hasMore } = getVisibleRenderWindow(rendered.length, visibleCount);
               return (
                 <>
-                  {hasMore && (
-                     <div ref={sentinelRef} className="py-3 text-center text-xs text-text-muted">
-                       {t("chat.loadEarlier", { count: startIndex })}
+                  {(hasMore || hasEarlierMessages) && (
+                     <div
+                       ref={sentinelRef}
+                       data-history-sentinel
+                       data-earlier-count={earlierMessageCount + (hasMore ? startIndex : 0)}
+                       className="py-3 text-center text-xs text-text-muted"
+                     >
+                       {t("chat.loadEarlier", {
+                         count: earlierMessageCount + (hasMore ? startIndex : 0),
+                       })}
                     </div>
                   )}
                   {rendered.slice(startIndex)}

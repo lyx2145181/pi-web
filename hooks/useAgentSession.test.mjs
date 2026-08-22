@@ -192,13 +192,82 @@ test("abandoned fresh-session drafts are cleared and cannot be recreated by late
     source.indexOf("  const sessionStats = useMemo"),
   );
   const mountSource = source.slice(
-    source.indexOf("  // Load session on mount"),
+    source.indexOf("  // Own long-lived resources"),
     source.indexOf("  useEffect(() => {\n    onSystemPromptChange"),
   );
 
   assert.match(restoreSource, /!sessionHookMountedRef\.current[\s\S]*?!newSessionPromotedRef\.current/);
   assert.match(mountSource, /const abandonedDraftKey = isNew \? newSessionDraftKey : null/);
   assert.match(mountSource, /clearDraft\(abandonedDraftKey\)/);
+});
+
+test("session and branch loads cancel predecessors and reject stale generations", () => {
+  const sessionLoadSource = source.slice(
+    source.indexOf("  const loadSession = useCallback"),
+    source.indexOf("  const loadContext = useCallback"),
+  );
+  const contextLoadSource = source.slice(
+    source.indexOf("  const loadContext = useCallback"),
+    source.indexOf("  const loadTools = useCallback"),
+  );
+  const cleanupSource = source.slice(
+    source.indexOf("  // Own long-lived resources"),
+    source.indexOf("  useEffect(() => {\n    onSystemPromptChange"),
+  );
+
+  assert.match(sessionLoadSource, /sessionLoadControllerRef\.current\?\.abort\(\)/);
+  assert.match(sessionLoadSource, /sessionLoadGenerationRef\.current === generation/);
+  assert.match(sessionLoadSource, /signal: controller\.signal/);
+  assert.match(sessionLoadSource, /if \(!isCurrent\(\)\) return null/);
+  assert.match(contextLoadSource, /contextLoadControllerRef\.current\?\.abort\(\)/);
+  assert.match(contextLoadSource, /contextLoadGenerationRef\.current !== generation/);
+  assert.match(contextLoadSource, /fetch\(url, \{ signal: controller\.signal \}\)/);
+  assert.match(cleanupSource, /sessionLoadControllerRef\.current\?\.abort\(\)/);
+  assert.match(cleanupSource, /contextLoadControllerRef\.current\?\.abort\(\)/);
+});
+
+test("paged history prepends only contiguous pages owned by the active session and leaf", () => {
+  const sessionLoadSource = source.slice(
+    source.indexOf("  const loadSession = useCallback"),
+    source.indexOf("  const loadContext = useCallback"),
+  );
+  const earlierSource = source.slice(
+    source.indexOf("  const loadEarlierMessages = useCallback"),
+    source.indexOf("  const loadTools = useCallback"),
+  );
+
+  assert.match(sessionLoadSource, /tail: String\(INITIAL_SESSION_CONTEXT_MESSAGES\)/);
+  assert.match(earlierSource, /before: String\(requestedBefore\)/);
+  assert.match(earlierSource, /activeLeafIdRef\.current !== requestedLeafId/);
+  assert.match(earlierSource, /contextPageRef\.current\?\.startIndex !== requestedBefore/);
+  assert.match(earlierSource, /result\.page\.endIndex !== requestedBefore/);
+  assert.match(earlierSource, /setMessages\(\(current\) => \[\.\.\.result\.context\.messages, \.\.\.current\]\)/);
+  assert.match(earlierSource, /setServerInputHistory\(result\.inputHistory \?\? null\)/);
+  assert.match(chatWindowSource, /serverInputHistory \?\? \[\]/);
+  assert.match(chatWindowSource, /hasEarlierMessages && !loadingEarlierMessages/);
+  assert.match(chatWindowSource, /loadEarlierMessages\(\)\.then/);
+});
+
+test("existing session switches reuse the chat shell and reload by session id", () => {
+  const selectSource = appShellSource.slice(
+    appShellSource.indexOf("  const handleSelectSession = useCallback"),
+    appShellSource.indexOf("  const handleNewSession = useCallback"),
+  );
+  const transitionSource = source.slice(
+    source.indexOf("  // Load by session id without rebuilding ChatWindow"),
+    source.indexOf("  useEffect(() => {\n    onSystemPromptChange"),
+  );
+
+  assert.doesNotMatch(selectSource, /setSessionKey/);
+  assert.match(transitionSource, /sessionIdRef\.current = sid/);
+  assert.match(transitionSource, /loadSession\(sid, true, true\)/);
+  assert.match(transitionSource, /setData\(null\)/);
+  assert.match(transitionSource, /dispatchNotice\(\{ type: "reset" \}\)/);
+  assert.match(transitionSource, /setExtensionStatuses\(\[\]\)/);
+  assert.match(transitionSource, /setSlashCommands\(\[\]\)/);
+  assert.match(transitionSource, /\}, \[session\?\.id\]\)/);
+  assert.match(source, /loading: loading \|\| sessionTransitionPending/);
+  assert.match(chatWindowSource, /setVisibleCount\(VISIBLE_PAGE_SIZE\)[\s\S]*?\}, \[session\?\.id\]\)/);
 });
 
 test("streaming submissions cannot be stranded in an idle direct queue", () => {

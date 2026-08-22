@@ -6,8 +6,11 @@
 npm run dev   # port 30141
 ```
 
-Typecheck: `node_modules/.bin/tsc --noEmit`  
-Lint: `npm run lint`  
+- Typecheck: `node_modules/.bin/tsc --noEmit`
+- Lint: `npm run lint`
+- Synthetic session-list baseline: `npm run perf:sessions` (use `-- --dir <path>` for an explicit read-only session directory)
+- Browser interaction baseline: `npm run perf:browser` (requires the dev server and local `google-chrome`; repeat `-- --file-label <root-file>` for sanitized Viewer open/switch/cache measurements)
+
 **Never run `next build` during dev** — pollutes `.next/` and breaks `npm run dev`.
 
 ## Personal Fork Update Workflow
@@ -60,7 +63,7 @@ Browser                Next.js Server              AgentSession (in-process)
   │◀── data: {...} ─────────│                               │
 ```
 
-**Session browsing** (read-only): reads `.jsonl` files through SDK `SessionManager` helpers and `lib/session-reader.ts` — no AgentSession created.  
+**Session browsing** (read-only): the session list uses Pi Web's fingerprinted derived index; session detail/context still reads `.jsonl` through SDK `SessionManager` helpers and `lib/session-reader.ts` — no AgentSession created.
 **Sending a message**: `startRpcSession()` in `lib/rpc-manager.ts` creates an AgentSession in-process.
 
 ---
@@ -71,6 +74,7 @@ Browser                Next.js Server              AgentSession (in-process)
 app/api/
   sessions/route.ts               GET  list all sessions
   sessions/[id]/route.ts          GET/PATCH/DELETE session
+  sessions/[id]/meta/route.ts     GET lightweight verified indexed metadata for one session
   sessions/[id]/context/route.ts  GET ?leafId= — context for a specific leaf
   sessions/[id]/export/route.ts   GET exported HTML for a session
   agent/new/route.ts              POST { cwd, message, toolNames?, provider?, modelId? }
@@ -85,7 +89,7 @@ app/api/
   auth/providers/route.ts         GET OAuth provider list
   cwd/validate/route.ts           POST validate/select a cwd
   default-cwd/route.ts            POST create ~/pi-cwd-YYYYMMDD
-  files/[...path]/route.ts        GET file contents for viewer
+  files/[...path]/route.ts        GET viewer/list content; POST uploads and batched directory versions
   home/route.ts                   GET user home directory
   models/route.ts                 GET { models, modelList, defaultModel }
   models-config/route.ts          GET/PUT — read/write ~/.pi/agent/models.json
@@ -101,13 +105,21 @@ app/api/
 bin/
   process-lifecycle.js forwards shutdown signals to the spawned Next.js child
 
+scripts/
+  interaction-browser-baseline.mjs measures local navigation, ordinary/rapid session switching, paged history loading, Viewer and Explorer refresh interactions, API request counts, and browser long tasks through a temporary headless Chrome profile
+  session-list-baseline.mjs generates a temporary session corpus or reads an explicit directory and compares SDK scan/parse with index cold-build and warm-fingerprint P50/P95
+
 lib/
   agent-client.ts      typed fetch helper for /api/agent commands
   agent-event-wire.ts  filters/projects SDK events into SSE-safe client deltas
   agent-session-services.ts serialized extension-aware SDK service creation
   draft-store.ts       local draft persistence helpers
+  document-preview-cache.ts bounded, version-keyed DOCX conversion cache
   file-access.ts       allowed file roots for /api/files and worktrees
   file-paths.ts        client/server path encoding helpers
+  file-version.ts      opaque file identity, ETag, Last-Modified, and conditional request helpers
+  git-changes.ts       bounded checkout/CWD status snapshots and on-demand file diff helpers
+  git-process.ts       shared bounded-concurrency Git subprocess runner
   markdown.ts          shared markdown helpers
   npx.ts               npx runner used by skill install
   pi-types.ts          local structural types for pi SDK objects
@@ -115,7 +127,11 @@ lib/
   project-groups.ts    stable-key project grouping and activity aggregation
   project-identity.ts  platform-aware internal project identity
   rpc-manager.ts      AgentSessionWrapper + registry + startRpcSession
-  session-reader.ts   SessionManager wrappers + path cache + buildSessionContext adapter
+  server-timing.ts    request-local, non-sensitive Server-Timing metric collector
+  session-context-page.ts bounded tail/earlier context paging plus full-context stats/history summaries
+  session-detail-cache.ts bounded fingerprint-keyed read-only SessionManager snapshot LRU
+  session-index*.ts/mts derived metadata index, worker coordination, and private persistence
+  session-reader.ts   indexed listing + SessionManager detail wrappers + path/context adapters
   streaming-message.ts reconstructs streamed assistant blocks and tool-call arguments
   tool-execution-progress.ts extracts bounded progress text from partial tool results
   tool-presets.ts     PRESET_NONE/READ_ONLY/DEFAULT/FULL + getPresetFromTools()
@@ -141,6 +157,7 @@ components/
   FileExplorer.tsx    file tree inside sidebar
   FileIcons.tsx       file icon helpers
   FileViewer.tsx      file content in a tab
+  file-content-cache.ts bounded authorization-context-aware text content LRU
   TabBar.tsx          tab bar (Chat + open file tabs)
 
 hooks/
@@ -204,14 +221,26 @@ Newer pi emits `compaction_start` / `compaction_end`; older versions emitted `au
 - `useAgentSession` treats per-session SSE as primary for chat events and opens it before each prompt. `prompt_done` completes the current UI stage and notification immediately, but the idle SSE stays open for a 30-second grace window and is reused by the next prompt. `agent_start` cancels that close timer; `agent_settled` finishes extension-injected runs that have no wrapper-level `prompt_done` and starts a fresh grace window. Do not close on the first `agent_end`: retries, compaction, and extension-queued messages can continue the same logical prompt.
 - While a run is active, `useAgentSession` periodically calls `GET /api/agent/[id]` and also reconciles on `visibilitychange`/`online`. This fixes missed terminal events from background tabs or half-open connections.
 - Prompt runs use a monotonic run id; late SSE or slow reconciliation responses from an old run must be ignored so they cannot resurrect stale streaming bubbles.
+- Existing-session A→B switches keep one ChatWindow shell. Detail and leaf-context fetches each abort predecessors and use monotonic generations; the target remains loading until its own payload arrives, so controls cannot act on the previous session's messages. Fresh composers and project lifecycle resets still use explicit shell remounts.
+- Read-only detail/context responses support absolute-index tail/earlier paging. The client initially requests 60 messages and prepends contiguous 120-message pages while preserving `messages[]`/`entryIds[]` alignment and scroll distance. Full active-branch statistics and the bounded 50-item input history are computed from the complete cached context, so paging does not weaken stats or prompt recall.
+
+### Session-list refresh, index, and request ordering
+- The sidebar's initial list effect is idempotent under React Strict Effects. Lifecycle refreshes and background completion discovery use the normal cached endpoint; only explicit user refresh uses `force=1`.
+- `listAllSessions({ force: true })` coalesces concurrent callers into one refresh that remains pending across generation invalidation retries. Browser list, file-tree, Git, Worktrees, and workspace-restore requests abort predecessors and guard against stale responses. Workspace restore resolves its remembered id through `/api/sessions/[id]/meta`, not a full session-list response; the meta route waits for a current-process verified index snapshot before confirming presence.
+- Session list metadata is a derived, versioned index under the agent cache directory. A worker enumerates SDK-compatible session paths and reparses only files whose size/nanosecond times/device/inode fingerprint changed; session details and context remain SDK-authoritative.
+- Worker reconciliation and persistence are separate generation-gated phases. Only accepted generations update memory, and accepted snapshots persist serially with private permissions, integrity checks, and entry/byte limits. Known Agent, naming, fork, delete, and reparent mutations pass exact session paths so the worker patches only those entries; manual force and periodic external-change validation still enumerate all fingerprints. Authorization callers use the same periodic verified refresh rather than retaining a startup-verified root indefinitely.
+- Session-index worker sources remain `.mts` so Node executes them as ESM. Production Webpack applies `scripts/next-mts-loader.cjs` only when `NODE_ENV=production`; development stays on native Turbopack handling. Node workers are constructed indirectly so Turbopack does not misclassify a `worker_threads` entry as a browser worker and traverse arbitrary project files.
+- Persisted startup snapshots may accelerate list display but are not authorization evidence. `getAllowedFileRoots()` waits for the current process's reconciled snapshot before deriving cwd/project roots; lexical and realpath checks remain the final security boundary.
+- Read-only session detail/context routes share bounded path-fingerprint parsed-snapshot and fingerprint/leaf context LRUs. Active RPC wrappers always bypass them, and known writes, naming, fork, delete, and reparent operations invalidate the affected paths.
 
 ### Worktrees and project grouping
 - `lib/worktree.ts` resolves linked worktree top-levels back to the main repo `projectRoot`; `listAllSessions()` attaches both that display/filesystem path and a stable server-computed `projectKey` to each `SessionInfo` so all worktrees for one repo are grouped together in the sidebar.
 - Grouping and equality use `projectKey` through `workspaceKeyOf()` / `lib/project-groups.ts`; keep `projectRoot` or `cwd` for display and filesystem operations. This is required on Windows, where project identity is case- and separator-insensitive.
-- Worktree operations are served by `/api/worktrees` and guarded by the same allowed-root rules as `/api/files`.
+- Worktree operations are served by `/api/worktrees` and guarded by the same allowed-root rules as `/api/files`. Canonical CWD project discovery uses a 60-second/256-entry LRU; `ProjectInfo.repositoryRoot` identifies the current checkout while `gitCommonRoot` identifies the main repo shared by linked worktrees. Worktree lists use a 5-second/64-project LRU plus common-root in-flight coalescing.
 - New worktrees are created under `<repoRoot>-worktrees/<sanitized-branch>`. Existing branches are reused; otherwise `git worktree add -b` creates the branch.
 - Removing a dirty worktree returns `409` with `{ dirty: true }` so the UI can ask before retrying with `force`.
 - Sessions whose cwd points at a removed worktree are inferred back into the main project instead of becoming a phantom project row.
+- All Git callers share `lib/git-process.ts`'s eight-process global pool. Git status uses 1.5-second, 32-entry checkout/CWD LRUs: porcelain is shared per checkout, cwd-scoped line stats and untracked counts are stored in the response snapshot, and file Diff reuses porcelain while fetching the patch only on demand. Agent/Bash completion invalidates the affected checkout; explicit refresh uses `force=1`.
 - git prints POSIX-style absolute paths even on Windows, so every path read out of git goes through `toNativePath()` (`lib/paths.ts`) before it is compared or returned. Compare paths with `samePath()`, never `===` — raw equality made `isTopLevel` permanently false on Windows and hid the worktree switcher entirely. Branch names are not paths and must keep their forward slashes. Browser code cannot apply Node path rules, so `/api/worktrees` resolves `currentWorktreePath` server-side; the sidebar must use that identity for highlighting and removal fallback.
 
 ### Project command environment
@@ -223,6 +252,15 @@ Newer pi emits `compaction_start` / `compaction_end`; older versions emitted `au
 - `/api/files` is intentionally not a general filesystem browser. Allowed roots come from session cwds, their resolved project roots, `~/pi-cwd-*`, and roots explicitly added with `allowFileRoot()`.
 - `/api/cwd/validate`, `/api/default-cwd`, and `/api/worktrees` call `allowFileRoot()` when they make a new location browsable.
 - Allowed roots are stored slash-normalized, but that is a Set-key convention, not a correctness requirement: `isPathWithinRoots()` (`lib/path-security.ts`, the single implementation behind `isFilePathAllowed()`) re-resolves and case-folds both sides, so either path form authorizes correctly. Keep that one implementation — it is the security boundary.
+
+### File tree refresh
+- Directory list responses include a metadata version. FileExplorer retains at most 512 directory versions and, on automatic/Agent refresh, validates expanded directories through bounded 128-path `directory-versions` batches; only changed directories re-enumerate. Root enumeration and Git status still refresh once.
+- Explicit user refresh is stronger: it re-enumerates every expanded directory and forces Git and Worktrees validation. Session-list refresh alone never invalidates Worktrees.
+
+### File viewer versioning and cache
+- File `read`, `meta`, media/download streams, and DOCX preview expose one opaque metadata-derived version through `ETag`/`Last-Modified`; conditional checks happen only after lexical, session-reference, and realpath authorization.
+- File watchers re-stat after `fs.watch` is established and send the same full version on `connected` and `change`, including explicit missing-file identity. Text and media viewers start their only initial snapshot from that handshake and use a bounded cache keyed by requested path plus `sourceSessionId`; cached text is not rendered until the current watcher or conditional request has re-authorized and validated it. Each EventSource owns one error listener and retains browser auto-reconnect after transient post-connect failures.
+- DOCX conversion output uses a separate bounded server LRU keyed by path and file ETag. Equal conversions share in-flight work, and route authorization still runs before every cache lookup or 304 response.
 
 ### Plugins and skills
 - `/api/plugins` uses pi's `SettingsManager` + `DefaultPackageManager` for global/project package install, remove, update, enable, and disable. Disabling writes empty `extensions/skills/prompts/themes` arrays for that package entry.

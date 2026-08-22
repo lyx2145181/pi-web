@@ -27,6 +27,8 @@ import type {
 } from "./types";
 import { createHeadlessCustomUiTui, DEFAULT_CUSTOM_UI_COLUMNS, type HeadlessCustomUiTui } from "./custom-ui-terminal";
 import { createSubagentBackgroundWorkProbe, type BackgroundWorkProbe } from "./subagent-background-work";
+import { invalidateParsedSession } from "./session-detail-cache";
+import { invalidateGitStatus } from "./git-changes";
 
 // ============================================================================
 // Types
@@ -228,11 +230,18 @@ export class AgentSessionWrapper {
     return this._alive && (this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning);
   }
 
+  private invalidateSessionList(): void {
+    const sessionFile = this.sessionFile;
+    if (sessionFile) invalidateParsedSession(sessionFile);
+    invalidateSessionListCache(sessionFile ? [sessionFile] : undefined);
+  }
+
   start(): void {
     this.unsubscribe = this.inner.subscribe((event: AgentEvent) => {
-      if (event.type === "agent_end") {
-        invalidateSessionListCache();
+      if (event.type === "agent_end" || event.type === "session_info_changed") {
+        this.invalidateSessionList();
       }
+      if (event.type === "agent_end") invalidateGitStatus(this.cwd);
       if (IDLE_RESET_EVENT_TYPES.has(event.type)) this.resetIdleTimer();
       this.emit(event);
       if (RUNNING_STATE_EVENT_TYPES.has(event.type)) notifyRunningChange();
@@ -513,7 +522,7 @@ export class AgentSessionWrapper {
           }, (error) => {
             rejectPreflight(error);
             finishPrompt();
-            invalidateSessionListCache();
+            this.invalidateSessionList();
             // A preflight rejection is returned by the POST itself. Only an
             // unexpected failure after acceptance needs the asynchronous event.
             if (preflightAccepted) {
@@ -580,7 +589,7 @@ export class AgentSessionWrapper {
         if (!model) throw new Error(`Model not found: ${provider}/${modelId}`);
         await this.inner.setModel(model);
         invalidateModelsCache();
-        invalidateSessionListCache();
+        this.invalidateSessionList();
         return { id: model.id, provider: model.provider };
       }
 
@@ -616,7 +625,8 @@ export class AgentSessionWrapper {
 
         const newSessionId = SessionManager.open(newSessionFile, sessionDir).getSessionId();
         cacheSessionPath(newSessionId, newSessionFile);
-        invalidateSessionListCache();
+        invalidateParsedSession(newSessionFile);
+        invalidateSessionListCache([newSessionFile]);
         await this.shutdown();
         return { cancelled: false, newSessionId };
       }
@@ -638,7 +648,7 @@ export class AgentSessionWrapper {
         if (level === "xhigh" && (this.inner.model as { compat?: { thinkingFormat?: string } } | null)?.compat?.thinkingFormat === "deepseek" && this.inner.agent?.state) {
           this.inner.agent.state.thinkingLevel = "xhigh";
         }
-        invalidateSessionListCache();
+        this.invalidateSessionList();
         return null;
       }
 
@@ -648,7 +658,7 @@ export class AgentSessionWrapper {
             this.inner.compact(command.customInstructions as string | undefined)
           );
         } finally {
-          invalidateSessionListCache();
+          this.invalidateSessionList();
         }
       }
 
@@ -656,7 +666,7 @@ export class AgentSessionWrapper {
         const name = (command.name as string | undefined)?.trim();
         if (!name) throw new Error("Session name cannot be empty");
         this.inner.setSessionName(name);
-        invalidateSessionListCache();
+        this.invalidateSessionList();
         return null;
       }
 
@@ -796,7 +806,8 @@ export class AgentSessionWrapper {
           return result;
         } finally {
           this.resetIdleTimer();
-          invalidateSessionListCache();
+          this.invalidateSessionList();
+          invalidateGitStatus(this.cwd);
           notifyRunningChange();
         }
       }

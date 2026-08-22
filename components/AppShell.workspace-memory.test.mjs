@@ -34,6 +34,21 @@ test("all active-session transitions share one persistence effect", () => {
   );
 });
 
+test("workspace restoration aborts stale requests and keeps its generation guard", () => {
+  const restore = callbackBody("restoreWorkspaceContext", "handleCwdChange");
+  assert.match(restore, /workspaceRestoreControllerRef\.current\?\.abort\(\)/);
+  assert.match(
+    restore,
+    /fetch\(`\/api\/sessions\/\$\{encodeURIComponent\(lastOpenSessionId\)\}\/meta`, \{\s*signal: controller\.signal/,
+  );
+  assert.doesNotMatch(restore, /fetch\("\/api\/sessions"/);
+  assert.match(restore, /token !== workspaceRestoreTokenRef\.current/);
+  assert.match(restore, /response\.status === 404/);
+  assert.match(restore, /if \(result\?\.missing\) clearLastOpen\(projectKey\)/);
+  assert.match(restore, /workspaceRestoreControllerRef\.current === controller/);
+  assert.match(callbackBody("invalidateWorkspaceRestore", "restoreWorkspaceContext"), /\.abort\(\)/);
+});
+
 test("workspace restoration remains inside the cross-project branch", () => {
   assert.match(
     callbackBody("handleCwdChange", "handleSelectSession"),

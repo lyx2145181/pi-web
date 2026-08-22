@@ -938,6 +938,14 @@ select {
   }
 }
 
+/* Keep the complete source/diff DOM for selection and references while
+   letting the browser skip layout and paint for off-screen rows. */
+.file-source-line,
+.file-diff-line {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 20.8px;
+}
+
 /* File viewer toolbar */
 .file-viewer-toolbar {
   min-width: 0;

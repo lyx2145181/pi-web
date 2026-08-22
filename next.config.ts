@@ -11,6 +11,14 @@ try {
   piVersion = (JSON.parse(readFileSync(piPkgPath, "utf8")) as { version: string }).version;
 } catch { /* package not found, use default */ }
 
+const configureWebpack: NonNullable<NextConfig["webpack"]> = (config) => {
+  config.module.rules.push({
+    test: /\.mts$/,
+    use: [{ loader: join(configDir, "scripts/next-mts-loader.cjs") }],
+  });
+  return config;
+};
+
 const nextConfig: NextConfig = {
   outputFileTracingRoot: configDir,
   serverExternalPackages: [
@@ -21,6 +29,7 @@ const nextConfig: NextConfig = {
     "@earendil-works/pi-tui",
   ],
   allowedDevOrigins: ["127.0.0.1", "192.168.*.*"],
+  ...(process.env.NODE_ENV === "production" ? { webpack: configureWebpack } : {}),
   async headers() {
     return [
       {

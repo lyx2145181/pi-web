@@ -64,12 +64,38 @@ test("offers the downstream context-menu hook only on a normal session row", () 
   );
 });
 
-test("manual and lifecycle refreshes bypass the server session-list cache", () => {
+test("only manual refresh bypasses the server session-list cache", () => {
   assert.match(source, /force \? "\/api\/sessions\?force=1" : "\/api\/sessions"/);
   assert.match(source, /cache: "no-store"/);
-  assert.match(source, /loadSessions\(isFirst, !isFirst\)/);
+  assert.match(source, /void loadSessions\(isFirst, false\)/);
   assert.match(source, /onClick=\{\(\) => loadSessions\(false, true\)\}/);
-  assert.match(source, /loadSessions\(false, true\);[\s\S]*?onBackgroundTaskDone/);
+  assert.match(source, /loadSessions\(false, false\);[\s\S]*?onBackgroundTaskDone/);
+});
+
+test("Strict Effects replay does not issue a second session-list request", () => {
+  const effectStart = source.indexOf("const sessionRefreshEffectRef = useRef");
+  const effectEnd = source.indexOf("// Browser storage is unavailable", effectStart);
+  const effect = source.slice(effectStart, effectEnd);
+  assert.match(effect, /effect\.initialized && Object\.is\(effect\.refreshKey, refreshKey\)/);
+  assert.match(effect, /void loadSessions\(isFirst, false\)/);
+
+  const state = { initialized: false, refreshKey: undefined };
+  const calls = [];
+  for (const refreshKey of [undefined, undefined]) {
+    if (state.initialized && Object.is(state.refreshKey, refreshKey)) continue;
+    const isFirst = !state.initialized;
+    state.initialized = true;
+    state.refreshKey = refreshKey;
+    calls.push({ showLoading: isFirst, force: false });
+  }
+  assert.deepEqual(calls, [{ showLoading: true, force: false }]);
+});
+
+test("session-list requests abort predecessors and ignore stale responses", () => {
+  assert.match(source, /sessionListControllerRef\.current\?\.abort\(\)/);
+  assert.match(source, /signal: controller\.signal/);
+  assert.match(source, /if \(requestId !== sessionListRequestRef\.current\) return/);
+  assert.match(source, /name !== "AbortError"/);
 });
 
 test("does not expose disk-backed actions for transient sessions", () => {

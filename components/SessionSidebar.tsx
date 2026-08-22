@@ -28,6 +28,7 @@ function ToolbarIconButton({
   background = "none",
   marginRight,
   ariaPressed,
+  dataAction,
   children,
 }: {
   onClick: () => void;
@@ -38,6 +39,7 @@ function ToolbarIconButton({
   background?: string;
   marginRight?: number;
   ariaPressed?: boolean;
+  dataAction?: string;
   children: ReactNode;
 }) {
   const enter = (e: React.MouseEvent<HTMLButtonElement>) => {
@@ -57,6 +59,7 @@ function ToolbarIconButton({
       title={title}
       aria-label={title}
       aria-pressed={ariaPressed}
+      data-action={dataAction}
       style={{
         position: "relative",
         display: "flex", alignItems: "center", justifyContent: "center",
@@ -421,6 +424,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const wtNewInputRef = useRef<HTMLInputElement>(null);
   const [explorerOpen, setExplorerOpen] = useState(true);
   const [explorerKey, setExplorerKey] = useState(0);
+  const [explorerForceKey, setExplorerForceKey] = useState(0);
   const [explorerUploadBusy, setExplorerUploadBusy] = useState(false);
   const [changesCount, setChangesCount] = useState(0);
   const [changesCollapsed, setChangesCollapsed] = useState(true);
@@ -434,16 +438,26 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const runningPollAuthoritativeRef = useRef(false);
   const sessionRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const explorerRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const suppressNextExternalExplorerRefreshRef = useRef(false);
   const fileExplorerRef = useRef<FileExplorerHandle>(null);
+  const sessionListRequestRef = useRef(0);
+  const sessionListControllerRef = useRef<AbortController | null>(null);
 
   const loadSessions = useCallback(async (showLoading = false, force = false) => {
+    const requestId = ++sessionListRequestRef.current;
+    sessionListControllerRef.current?.abort();
+    const controller = new AbortController();
+    sessionListControllerRef.current = controller;
+
     try {
       if (showLoading) setLoading(true);
       const res = await fetch(force ? "/api/sessions?force=1" : "/api/sessions", {
         cache: "no-store",
+        signal: controller.signal,
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json() as { sessions: SessionInfo[]; runningSessionIds?: string[] };
+      if (requestId !== sessionListRequestRef.current) return;
       setAllSessions(data.sessions);
       // Treat the fetched running set as an initial fallback only. Once the
       // lightweight poll is live, a slow session-list fetch cannot overwrite it.
@@ -464,17 +478,28 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
         sessionRefreshTimerRef.current = setTimeout(() => setSessionRefreshDone(false), 2000);
       }
     } catch (e) {
-      setError(String(e));
+      if ((e as { name?: string }).name !== "AbortError" && requestId === sessionListRequestRef.current) {
+        setError(String(e));
+      }
     } finally {
-      if (showLoading) setLoading(false);
+      if (requestId === sessionListRequestRef.current) {
+        if (sessionListControllerRef.current === controller) sessionListControllerRef.current = null;
+        if (showLoading) setLoading(false);
+      }
     }
   }, []);
 
-  const initialLoadDone = useRef(false);
+  const sessionRefreshEffectRef = useRef<{
+    initialized: boolean;
+    refreshKey: number | undefined;
+  }>({ initialized: false, refreshKey: undefined });
   useEffect(() => {
-    const isFirst = !initialLoadDone.current;
-    initialLoadDone.current = true;
-    loadSessions(isFirst, !isFirst);
+    const effect = sessionRefreshEffectRef.current;
+    if (effect.initialized && Object.is(effect.refreshKey, refreshKey)) return;
+    const isFirst = !effect.initialized;
+    effect.initialized = true;
+    effect.refreshKey = refreshKey;
+    void loadSessions(isFirst, false);
   }, [loadSessions, refreshKey]);
 
   // Browser storage is unavailable during server rendering. Restore the panel
@@ -569,7 +594,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
       (id) => !allSessions.some((session) => session.id === id),
     );
     if (completedInBackground.length > 0 || hasUnlistedRunningSession) {
-      loadSessions(false, true);
+      loadSessions(false, false);
     }
     if (completedInBackground.length > 0) {
       onBackgroundTaskDone?.();
@@ -589,7 +614,12 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   }, [selectedSessionId]);
 
   useEffect(() => {
-    if (explorerRefreshKey !== undefined) setExplorerKey((k) => k + 1);
+    if (explorerRefreshKey === undefined) return;
+    if (suppressNextExternalExplorerRefreshRef.current) {
+      suppressNextExternalExplorerRefreshRef.current = false;
+      return;
+    }
+    setExplorerKey((k) => k + 1);
   }, [explorerRefreshKey]);
 
   useEffect(() => {
@@ -659,6 +689,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
 
   // Load worktrees for the current effective cwd
   const [wtRefreshKey, setWtRefreshKey] = useState(0);
+  const wtLoadedRefreshKeyRef = useRef(0);
   useLayoutEffect(() => {
     if (!selectedCwd) {
       setWorktreeState(null);
@@ -666,8 +697,15 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
       return;
     }
     let cancelled = false;
+    const controller = new AbortController();
+    const force = wtLoadedRefreshKeyRef.current !== wtRefreshKey;
+    wtLoadedRefreshKeyRef.current = wtRefreshKey;
     setWorktreeLoadingCwd(selectedCwd);
-    fetch(`/api/worktrees?cwd=${encodeURIComponent(selectedCwd)}`)
+    const worktreeParams = new URLSearchParams({ cwd: selectedCwd });
+    if (force) worktreeParams.set("force", "1");
+    fetch(`/api/worktrees?${worktreeParams}`, {
+      signal: controller.signal,
+    })
       .then((r) => r.json())
       .then((d: { projectRoot?: string; projectKey?: string; isGit?: boolean; isTopLevel?: boolean; currentWorktreePath?: string | null; worktrees?: WorktreeEntry[]; error?: string }) => {
         if (cancelled) return;
@@ -692,8 +730,11 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
           setWorktreeState(null);
         }
       });
-    return () => { cancelled = true; };
-  }, [selectedCwd, wtRefreshKey, refreshKey]);
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [selectedCwd, wtRefreshKey]);
 
   // Auto-select cwd and restore session from URL on first load
   useEffect(() => {
@@ -1717,9 +1758,16 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
               </ToolbarIconButton>
             )}
             <ToolbarIconButton
+              dataAction="refresh-file-explorer"
               onClick={() => {
-                if (onExplorerRefresh) onExplorerRefresh();
-                else setExplorerKey((k) => k + 1);
+                setWtRefreshKey((key) => key + 1);
+                setExplorerForceKey((key) => key + 1);
+                if (onExplorerRefresh) {
+                  suppressNextExternalExplorerRefreshRef.current = true;
+                  onExplorerRefresh();
+                } else {
+                  setExplorerKey((k) => k + 1);
+                }
                 setExplorerRefreshDone(true);
                 if (explorerRefreshTimerRef.current) clearTimeout(explorerRefreshTimerRef.current);
                 explorerRefreshTimerRef.current = setTimeout(() => setExplorerRefreshDone(false), 2000);
@@ -1749,6 +1797,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
                 cwd={selectedCwd ?? selectedCwdProp!}
                 onOpenFile={onOpenFile ?? (() => {})}
                 refreshKey={explorerKey}
+                forceRefreshKey={explorerForceKey}
                 onAtMention={onAtMention}
                 onAtMentions={onAtMentions}
                 onUploadBusyChange={setExplorerUploadBusy}
@@ -2109,6 +2158,7 @@ function SessionItem({
 
   return (
     <div
+      data-session-id={session.id}
       onClick={confirmDelete || renaming ? undefined : onClick}
       onContextMenu={confirmDelete || renaming ? undefined : handleContextMenu}
       onMouseEnter={() => setHovered(true)}
