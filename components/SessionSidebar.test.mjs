@@ -110,6 +110,15 @@ test("session-list requests abort predecessors and ignore stale responses", () =
   assert.match(source, /name !== "AbortError"/);
 });
 
+test("a replacement refresh always clears initial loading state", () => {
+  const loadBlock = source.slice(
+    source.indexOf("const loadSessions = useCallback"),
+    source.indexOf("const sessionRefreshEffectRef"),
+  );
+  assert.match(loadBlock, /if \(requestId === sessionListRequestRef\.current\) \{[\s\S]*setLoading\(false\)/);
+  assert.doesNotMatch(loadBlock, /if \(showLoading\) setLoading\(false\)/);
+});
+
 test("does not expose disk-backed actions for transient sessions", () => {
   assert.match(sessionItemSource, /if \(session\.transient\) return;/);
   assert.match(sessionItemSource, /\{hovered && !session\.transient && \(/);

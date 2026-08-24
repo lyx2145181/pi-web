@@ -502,7 +502,9 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     } finally {
       if (requestId === sessionListRequestRef.current) {
         if (sessionListControllerRef.current === controller) sessionListControllerRef.current = null;
-        if (showLoading) setLoading(false);
+        // A non-loading refresh may replace the initial loading request. The
+        // current request owns completion even when it did not start loading.
+        setLoading(false);
       }
     }
   }, []);
