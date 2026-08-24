@@ -468,6 +468,9 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const sessionOrderSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const [draggingPinnedSessionId, setDraggingPinnedSessionId] = useState<string | null>(null);
   const [dragOverPinnedSessionId, setDragOverPinnedSessionId] = useState<string | null>(null);
+  const [dragPreviewPinnedSessionIds, setDragPreviewPinnedSessionIds] = useState<string[] | null>(null);
+  const sessionListRef = useRef<HTMLDivElement>(null);
+  const pinnedDragLayoutRef = useRef<Map<string, { top: number; height: number }>>(new Map());
 
   useEffect(() => {
     setCollapsedSessionIds(loadCollapsedSessionIds());
@@ -1086,30 +1089,59 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   // Build parent-child trees within the filtered set. Only top-level roots can
   // be pinned; their complete fork subtree moves with them.
   const selectedProjectKey = selectedProject?.key ?? null;
-  const projectPinnedSessionIds = selectedProjectKey
+  const storedProjectPinnedSessionIds = selectedProjectKey
     ? (sessionOrderPreferences.projects[selectedProjectKey] ?? [])
     : [];
-  const sessionTree = buildSessionTree(filteredSessions, projectPinnedSessionIds);
-  const pinnedSessionIdSet = new Set(projectPinnedSessionIds);
+  // Keep the DOM order stable during native drag. Reordering the source node
+  // can make the browser terminate the drag before drop fires.
+  const sessionTree = buildSessionTree(filteredSessions, storedProjectPinnedSessionIds);
+  const pinnedSessionIdSet = new Set(storedProjectPinnedSessionIds);
   const pinnedSessionTrees = sessionTree.filter((node) => pinnedSessionIdSet.has(node.session.id));
   const recentSessionTrees = sessionTree.filter((node) => !pinnedSessionIdSet.has(node.session.id));
   const visibleRootSessionIds = new Set(sessionTree.map((node) => node.session.id));
+  const pinnedDragOffsets = new Map<string, number>();
+  if (dragPreviewPinnedSessionIds && pinnedDragLayoutRef.current.size > 0) {
+    let nextTop = Math.min(
+      ...[...pinnedDragLayoutRef.current.values()].map((layout) => layout.top),
+    );
+    for (const sessionId of dragPreviewPinnedSessionIds) {
+      const layout = pinnedDragLayoutRef.current.get(sessionId);
+      if (!layout) continue;
+      pinnedDragOffsets.set(sessionId, nextTop - layout.top);
+      nextTop += layout.height;
+    }
+  }
 
   const toggleSessionPinned = (sessionId: string, pinned: boolean) => {
     if (!selectedProjectKey) return;
     updateProjectPinnedSessions(selectedProjectKey, (current) => setSessionPinned(current, sessionId, pinned));
   };
 
-  const moveVisiblePinnedSession = (
-    sourceId: string,
-    targetId: string,
-    afterTarget: boolean,
-  ) => {
-    if (!selectedProjectKey) return;
-    updateProjectPinnedSessions(selectedProjectKey, (current) => {
-      const visiblePinned = current.filter((id) => visibleRootSessionIds.has(id));
-      return movePinnedSession(visiblePinned, sourceId, targetId, afterTarget);
+  const previewPinnedSessionMove = (targetId: string, afterTarget: boolean) => {
+    if (!draggingPinnedSessionId || draggingPinnedSessionId === targetId) return;
+    setDragPreviewPinnedSessionIds((current) => {
+      const visiblePinned = current
+        ?? storedProjectPinnedSessionIds.filter((id) => visibleRootSessionIds.has(id));
+      const moved = movePinnedSession(
+        visiblePinned,
+        draggingPinnedSessionId,
+        targetId,
+        afterTarget,
+      );
+      return moved.every((id, index) => id === visiblePinned[index]) ? visiblePinned : moved;
     });
+  };
+
+  const commitPinnedSessionMove = () => {
+    if (!selectedProjectKey || !dragPreviewPinnedSessionIds) return;
+    updateProjectPinnedSessions(selectedProjectKey, () => dragPreviewPinnedSessionIds);
+  };
+
+  const finishPinnedDrag = () => {
+    setDraggingPinnedSessionId(null);
+    setDragOverPinnedSessionId(null);
+    setDragPreviewPinnedSessionIds(null);
+    pinnedDragLayoutRef.current = new Map();
   };
 
   const renderRootSessionTree = (node: SessionTreeNode) => (
@@ -1139,18 +1171,28 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
       onTogglePinned={(pinned) => toggleSessionPinned(node.session.id, pinned)}
       isDragging={draggingPinnedSessionId === node.session.id}
       isDragOver={dragOverPinnedSessionId === node.session.id}
-      onPinnedDragStart={() => setDraggingPinnedSessionId(node.session.id)}
-      onPinnedDragEnd={() => {
-        setDraggingPinnedSessionId(null);
-        setDragOverPinnedSessionId(null);
-      }}
-      onPinnedDragOver={() => setDragOverPinnedSessionId(node.session.id)}
-      onPinnedDrop={(afterTarget) => {
-        if (draggingPinnedSessionId && draggingPinnedSessionId !== node.session.id) {
-          moveVisiblePinnedSession(draggingPinnedSessionId, node.session.id, afterTarget);
+      dragOffsetY={pinnedDragOffsets.get(node.session.id) ?? 0}
+      animateDragOffset={dragPreviewPinnedSessionIds !== null}
+      onPinnedDragStart={() => {
+        const layouts = new Map<string, { top: number; height: number }>();
+        for (const element of sessionListRef.current?.querySelectorAll<HTMLElement>("[data-pinned-session-root]") ?? []) {
+          const sessionId = element.dataset.pinnedSessionRoot;
+          if (!sessionId) continue;
+          const bounds = element.getBoundingClientRect();
+          layouts.set(sessionId, { top: bounds.top, height: bounds.height });
         }
-        setDraggingPinnedSessionId(null);
-        setDragOverPinnedSessionId(null);
+        pinnedDragLayoutRef.current = layouts;
+        setDraggingPinnedSessionId(node.session.id);
+        setDragPreviewPinnedSessionIds(pinnedSessionTrees.map((tree) => tree.session.id));
+      }}
+      onPinnedDragEnd={finishPinnedDrag}
+      onPinnedDragOver={(afterTarget) => {
+        setDragOverPinnedSessionId(node.session.id);
+        previewPinnedSessionMove(node.session.id, afterTarget);
+      }}
+      onPinnedDrop={() => {
+        commitPinnedSessionMove();
+        finishPinnedDrag();
       }}
     />
   );
@@ -1806,7 +1848,10 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
       </div>
 
       {/* Session list */}
-      <div style={{ flex: explorerOpen && (selectedCwdProp || selectedCwd) ? "1 1 0" : "1 1 auto", overflowY: "auto", padding: "0", minHeight: 80 }}>
+      <div
+        ref={sessionListRef}
+        style={{ flex: explorerOpen && (selectedCwdProp || selectedCwd) ? "1 1 0" : "1 1 auto", overflowY: "auto", padding: "0", minHeight: 80 }}
+      >
         {loading && (
           <div style={{ padding: "16px 14px", color: "var(--text-muted)", fontSize: 12 }}>
             {t("sidebar.loading")}
@@ -1822,12 +1867,9 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
             {t("sidebar.noSessions")}
           </div>
         )}
-        {pinnedSessionTrees.length > 0 && (
-          <SessionListSectionLabel label={t("sidebar.pinnedSessions")} />
-        )}
         {pinnedSessionTrees.map(renderRootSessionTree)}
         {pinnedSessionTrees.length > 0 && recentSessionTrees.length > 0 && (
-          <SessionListSectionLabel label={t("sidebar.recentSessions")} />
+          <SessionListSectionLabel label={t("sidebar.unpinnedSessions")} />
         )}
         {recentSessionTrees.map(renderRootSessionTree)}
       </div>
@@ -1962,23 +2004,31 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
 }
 
 function SessionListSectionLabel({ label }: { label: string }) {
+  const dividerStyle = {
+    height: 1,
+    flex: 1,
+    background: "var(--border)",
+  };
+
   return (
     <div
       style={{
-        height: 25,
+        height: 18,
         display: "flex",
         alignItems: "center",
-        padding: "5px 14px 3px",
+        gap: 8,
+        padding: "0 10px",
         color: "var(--text-dim)",
         fontSize: 10,
         fontWeight: 650,
         letterSpacing: "0.06em",
         textTransform: "uppercase",
-        borderTop: "1px solid var(--border)",
         boxSizing: "border-box",
       }}
     >
-      {label}
+      <span aria-hidden="true" style={dividerStyle} />
+      <span style={{ flexShrink: 0 }}>{label}</span>
+      <span aria-hidden="true" style={dividerStyle} />
     </div>
   );
 }
@@ -1998,6 +2048,8 @@ function SessionTreeItem({
   onTogglePinned,
   isDragging = false,
   isDragOver = false,
+  dragOffsetY = 0,
+  animateDragOffset = false,
   onPinnedDragStart,
   onPinnedDragEnd,
   onPinnedDragOver,
@@ -2017,9 +2069,11 @@ function SessionTreeItem({
   onTogglePinned?: (pinned: boolean) => void;
   isDragging?: boolean;
   isDragOver?: boolean;
+  dragOffsetY?: number;
+  animateDragOffset?: boolean;
   onPinnedDragStart?: () => void;
   onPinnedDragEnd?: () => void;
-  onPinnedDragOver?: () => void;
+  onPinnedDragOver?: (afterTarget: boolean) => void;
   onPinnedDrop?: (afterTarget: boolean) => void;
 }) {
   const collapsed = collapsedSessionIds.has(node.session.id);
@@ -2027,10 +2081,12 @@ function SessionTreeItem({
 
   return (
     <div
+      data-pinned-session-root={isPinned ? node.session.id : undefined}
       onDragOver={isPinned ? (event) => {
         event.preventDefault();
         event.dataTransfer.dropEffect = "move";
-        onPinnedDragOver?.();
+        const bounds = event.currentTarget.getBoundingClientRect();
+        onPinnedDragOver?.(event.clientY > bounds.top + bounds.height / 2);
       } : undefined}
       onDrop={isPinned ? (event) => {
         event.preventDefault();
@@ -2040,8 +2096,11 @@ function SessionTreeItem({
       style={{
         position: "relative",
         zIndex: isDragging ? 3 : 0,
-        opacity: isDragging ? 0.72 : 1,
-        transition: "opacity 140ms ease",
+        transform: `translateY(${dragOffsetY}px)`,
+        transition: animateDragOffset
+          ? "transform 160ms cubic-bezier(0.2, 0.8, 0.2, 1)"
+          : "none",
+        willChange: dragOffsetY !== 0 ? "transform" : "auto",
       }}
     >
       <div
@@ -2386,6 +2445,15 @@ function SessionItem({
     e.stopPropagation();
     e.dataTransfer.effectAllowed = "move";
     e.dataTransfer.setData("text/plain", session.id);
+
+    // Hide the browser's translucent card snapshot. The live, fully opaque
+    // list and insertion indicator provide the drag feedback instead.
+    const dragImage = document.createElement("span");
+    dragImage.style.cssText = "position:fixed;left:-10px;top:-10px;width:1px;height:1px;";
+    document.body.appendChild(dragImage);
+    e.dataTransfer.setDragImage(dragImage, 0, 0);
+    requestAnimationFrame(() => dragImage.remove());
+
     onPinnedDragStart?.();
   }, [onPinnedDragStart, session.id]);
 
