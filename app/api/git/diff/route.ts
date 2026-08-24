@@ -8,6 +8,7 @@ export async function GET(request: NextRequest) {
   try {
     const cwd = request.nextUrl.searchParams.get("cwd")?.trim() ?? "";
     const filePath = request.nextUrl.searchParams.get("path")?.trim() ?? "";
+    const includePatch = request.nextUrl.searchParams.get("probe") !== "1";
     if (!cwd || (!cwd.startsWith("/") && !isWindowsAbsolutePath(cwd))) {
       return timing.finish(NextResponse.json({ error: "cwd must be an absolute path" }, { status: 400 }));
     }
@@ -26,7 +27,7 @@ export async function GET(request: NextRequest) {
       return timing.finish(NextResponse.json({ error: "Access denied" }, { status: 403 }));
     }
 
-    const result = await timing.time("git", () => getGitFileDiff(cwd, filePath));
+    const result = await timing.time("git", () => getGitFileDiff(cwd, filePath, { includePatch }));
     const response = timing.timeSync("serialize", () => NextResponse.json(result));
     return timing.finish(response);
   } catch (error) {

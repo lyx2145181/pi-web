@@ -53,7 +53,10 @@ test("TextFileViewer uses one watcher-owned initial content snapshot", () => {
   assert.match(block, /dataRef\.current\?\.version\.etag === nextVersion\.etag/);
   assert.match(block, /changeTimer = setTimeout\(\(\) => loadSnapshot\(nextVersion, true\), 80\)/);
   assert.match(block, /contentAbortRef\.current\?\.abort\(\)/);
-  assert.match(block, /displayMode !== "diff" && requestedInitialDisplayMode !== "diff"/);
+  assert.match(block, /const loadKind = wantsPatch \? "patch" : "probe"/);
+  assert.match(block, /fetchGitDiff\(filePath, !wantsPatch\)/);
+  assert.match(block, /params\.set\("probe", "1"\)/);
+  assert.match(block, /\.\.\.\(canShowGitDiff \? \["diff" as const\] : \[\]\)/);
   assert.match(block, /deferredSourceContent = useDeferredValue\(data\?\.content \?\? ""\)/);
   assert.match(block, /if \(!watchEnabled\) \{[\s\S]*loadSnapshot\(\)/);
   assert.equal(block.match(/addEventListener\("error", markDisconnected\)/g)?.length, 1);

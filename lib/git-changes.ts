@@ -299,7 +299,11 @@ async function createTrackedFilePatch(
   }
 }
 
-export async function getGitFileDiff(cwd: string, filePath: string): Promise<GitFileDiffResponse> {
+export async function getGitFileDiff(
+  cwd: string,
+  filePath: string,
+  options: { includePatch?: boolean } = {},
+): Promise<GitFileDiffResponse> {
   const project = await resolveProject(cwd);
   const repositoryRoot = project.repositoryRoot;
   if (!repositoryRoot || !isWithinPath(repositoryRoot, filePath)) return { supported: false };
@@ -318,6 +322,7 @@ export async function getGitFileDiff(cwd: string, filePath: string): Promise<Git
 
   const { status } = classifyGitStatus(entry);
   if (status === "deleted") {
+    if (options.includePatch === false) return { supported: true, status };
     const patch = await createTrackedFilePatch(repositoryRoot, relativePath, entry.originalPath);
     if (!patch?.includes("\n@@ ")) return { supported: false };
     return { supported: true, status, patch };
@@ -330,6 +335,7 @@ export async function getGitFileDiff(cwd: string, filePath: string): Promise<Git
     return { supported: false };
   }
   if (!stat.isFile() || stat.size > TEXT_PREVIEW_MAX_BYTES) return { supported: false };
+  if (options.includePatch === false) return { supported: true, status };
 
   const currentBuffer = fs.readFileSync(resolvedFilePath);
   if (hasNullByte(currentBuffer)) return { supported: false };

@@ -869,6 +869,7 @@ function TextFileViewer({
   const { t } = useI18n();
   const [data, setData] = useState<FileData | null>(null);
   const [gitDiff, setGitDiff] = useState<GitFileDiffResponse | null>(null);
+  const [gitDiffAvailable, setGitDiffAvailable] = useState(false);
   const [gitDiffLoading, setGitDiffLoading] = useState(false);
   const [gitDiffResolved, setGitDiffResolved] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -995,7 +996,7 @@ function TextFileViewer({
     }
   }, [cacheKey, sourceSessionId]);
 
-  const fetchGitDiff = useCallback(async (targetPath: string) => {
+  const fetchGitDiff = useCallback(async (targetPath: string, probeOnly = false) => {
     const requestId = ++gitDiffRequestRef.current;
     gitDiffAbortRef.current?.abort();
     const controller = new AbortController();
@@ -1003,6 +1004,7 @@ function TextFileViewer({
     setGitDiffLoading(true);
     if (!cwd) {
       setGitDiff(null);
+      setGitDiffAvailable(false);
       setGitDiffLoading(false);
       setGitDiffResolved(true);
       if (gitDiffAbortRef.current === controller) gitDiffAbortRef.current = null;
@@ -1011,17 +1013,24 @@ function TextFileViewer({
 
     try {
       const params = new URLSearchParams({ cwd, path: targetPath });
+      if (probeOnly) params.set("probe", "1");
       const response = await fetch(`/api/git/diff?${params.toString()}`, {
         signal: controller.signal,
       });
       const next = await response.json() as GitFileDiffResponse & { error?: string };
       if (requestId !== gitDiffRequestRef.current) return;
-      setGitDiff(response.ok && next.supported && typeof next.patch === "string" ? next : null);
+      const available = response.ok && next.supported;
+      const completeDiff = available && typeof next.patch === "string" ? next : null;
+      setGitDiffAvailable(probeOnly ? available : completeDiff !== null);
+      setGitDiff(probeOnly ? null : completeDiff);
     } catch (nextError) {
       if (
         requestId === gitDiffRequestRef.current
         && (nextError as { name?: string }).name !== "AbortError"
-      ) setGitDiff(null);
+      ) {
+        setGitDiff(null);
+        setGitDiffAvailable(false);
+      }
     } finally {
       if (gitDiffAbortRef.current === controller) gitDiffAbortRef.current = null;
       if (requestId === gitDiffRequestRef.current) {
@@ -1043,6 +1052,7 @@ function TextFileViewer({
     // read has re-authorized the request and confirmed its version.
     setData(null);
     setGitDiff(null);
+    setGitDiffAvailable(false);
     setGitDiffResolved(false);
     setWatching(false);
   }, [cacheKey, filePath, sourceSessionId]);
@@ -1069,10 +1079,11 @@ function TextFileViewer({
       void fetchContent(filePath).finally(() => {
         if (active) setLoading(false);
       });
-      if (
-        refreshDiff
-        && (viewerStateRef.current.displayMode === "diff" || requestedInitialDisplayMode === "diff")
-      ) void fetchGitDiff(filePath);
+      if (refreshDiff) {
+        const wantsPatch = viewerStateRef.current.displayMode === "diff"
+          || requestedInitialDisplayMode === "diff";
+        void fetchGitDiff(filePath, !wantsPatch);
+      }
     };
 
     if (!watchEnabled) {
@@ -1125,11 +1136,12 @@ function TextFileViewer({
   }, [cacheKey, filePath, fetchContent, fetchGitDiff, requestedInitialDisplayMode, sourceSessionId, watchEnabled]);
 
   useEffect(() => {
-    if (displayMode !== "diff" && requestedInitialDisplayMode !== "diff") return;
-    const loadKey = `${filePath}\0${cwd ?? ""}\0${gitRefreshKey ?? 0}`;
+    const wantsPatch = displayMode === "diff" || requestedInitialDisplayMode === "diff";
+    const loadKind = wantsPatch ? "patch" : "probe";
+    const loadKey = `${filePath}\0${cwd ?? ""}\0${gitRefreshKey ?? 0}\0${loadKind}`;
     if (gitLoadKeyRef.current === loadKey) return;
     gitLoadKeyRef.current = loadKey;
-    void fetchGitDiff(filePath);
+    void fetchGitDiff(filePath, !wantsPatch);
   }, [cwd, displayMode, fetchGitDiff, filePath, gitRefreshKey, requestedInitialDisplayMode]);
 
   useEffect(() => {
@@ -1147,11 +1159,12 @@ function TextFileViewer({
   }, [data?.language, updateDisplayMode]);
 
   const hasGitDiff = gitDiff?.supported === true && typeof gitDiff.patch === "string";
+  const canShowGitDiff = gitDiffAvailable || hasGitDiff;
   const isDeletedDiff = hasGitDiff && gitDiff.status === "deleted";
 
   useEffect(() => {
-    if (gitDiffResolved && !hasGitDiff && displayMode === "diff") updateDisplayMode("source");
-  }, [displayMode, gitDiffResolved, hasGitDiff, updateDisplayMode]);
+    if (gitDiffResolved && !canShowGitDiff && displayMode === "diff") updateDisplayMode("source");
+  }, [canShowGitDiff, displayMode, gitDiffResolved, updateDisplayMode]);
 
   // Wait for the git request before restoring diff mode so the unresolved
   // placeholder cannot immediately demote it back to source.
@@ -1275,7 +1288,7 @@ function TextFileViewer({
     : [
         "source",
         ...(hasPreview ? ["preview" as const] : []),
-        ...(hasGitDiff ? ["diff" as const] : []),
+        ...(canShowGitDiff ? ["diff" as const] : []),
       ];
   const metadata = isDeletedDiff
     ? t("files.deleted")
