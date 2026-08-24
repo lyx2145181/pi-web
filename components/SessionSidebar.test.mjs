@@ -24,6 +24,15 @@ test("persists recursive session-tree collapse state outside unmounted rows", ()
   assert.doesNotMatch(treeItemSource, /useState\(false\)/);
 });
 
+test("uses the full pinned card as the drag surface with visible motion feedback", () => {
+  assert.match(sessionItemSource, /const canDragPinned = isPinned && depth === 0/);
+  assert.match(sessionItemSource, /draggable=\{canDragPinned\}/);
+  assert.match(sessionItemSource, /onDragStart=\{canDragPinned \? handlePinnedDragStart : undefined\}/);
+  assert.doesNotMatch(sessionItemSource, /<button[\s\S]{0,200}?draggable/);
+  assert.match(source, /translateY\(-2px\) scale\(1\.015\)/);
+  assert.match(source, /transition: "transform 140ms ease, box-shadow 140ms ease, background 140ms ease"/);
+});
+
 test("does not register row-level session deletion shortcuts", () => {
   assert.doesNotMatch(sessionItemSource, /const handleKeyDown/);
   assert.doesNotMatch(sessionItemSource, /onKeyDown=\{handleKeyDown\}/);

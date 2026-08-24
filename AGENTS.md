@@ -77,6 +77,7 @@ app/api/
   sessions/[id]/meta/route.ts     GET lightweight verified indexed metadata for one session
   sessions/[id]/context/route.ts  GET ?leafId= — context for a specific leaf
   sessions/[id]/export/route.ts   GET exported HTML for a session
+  session-order/route.ts          GET/PUT project-scoped pinned session order
   agent/new/route.ts              POST { cwd, message, toolNames?, provider?, modelId? }
   agent/[id]/route.ts             GET state | POST any command
   agent/[id]/events/route.ts      GET SSE stream
@@ -132,6 +133,7 @@ lib/
   session-detail-cache.ts bounded fingerprint-keyed read-only SessionManager snapshot LRU
   session-index*.ts/mts derived metadata index, worker coordination, and private persistence
   session-reader.ts   indexed listing + SessionManager detail wrappers + path/context adapters
+  session-order*.ts   pinned-session ordering helpers + private preference persistence
   streaming-message.ts reconstructs streamed assistant blocks and tool-call arguments
   tool-execution-progress.ts extracts bounded progress text from partial tool results
   tool-presets.ts     PRESET_NONE/READ_ONLY/DEFAULT/FULL + getPresetFromTools()
@@ -223,6 +225,11 @@ Newer pi emits `compaction_start` / `compaction_end`; older versions emitted `au
 - Prompt runs use a monotonic run id; late SSE or slow reconciliation responses from an old run must be ignored so they cannot resurrect stale streaming bubbles.
 - Existing-session A→B switches keep one ChatWindow shell. Detail and leaf-context fetches each abort predecessors and use monotonic generations; the target remains loading until its own payload arrives, so controls cannot act on the previous session's messages. Fresh composers and project lifecycle resets still use explicit shell remounts.
 - Read-only detail/context responses support absolute-index tail/earlier paging. The client initially requests 60 messages and prepends contiguous 120-message pages while preserving `messages[]`/`entryIds[]` alignment and scroll distance. Full active-branch statistics and the bounded 50-item input history are computed from the complete cached context, so paging does not weaken stats or prompt recall.
+
+### Session pinning and manual order
+- Pinning is project-scoped and applies only to top-level session trees. A pinned root moves together with its fork subtree; child sessions retain recent-activity order.
+- Pinned roots use their stored manual order above ordinary roots, while ordinary roots continue sorting by `modified` descending. Dragging is limited to the pinned section.
+- Order preferences live in the private Pi Web preference file under the agent directory, not in session `.jsonl` files or the derived session index. Pinning must never change session activity timestamps.
 
 ### Session-list refresh, index, and request ordering
 - The sidebar's initial list effect is idempotent under React Strict Effects. Lifecycle refreshes and background completion discovery use the normal cached endpoint; only explicit user refresh uses `force=1`.

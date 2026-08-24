@@ -11,6 +11,15 @@ import {
   setSessionTreeCollapsed,
 } from "@/lib/session-tree-collapse";
 import { getProjectActivity, getRecentProjects, sessionsForProject } from "@/lib/project-groups";
+import {
+  compareSessionRootOrder,
+  emptySessionOrderPreferences,
+  movePinnedSession,
+  normalizeSessionOrderPreferences,
+  setProjectPinnedSessionIds,
+  setSessionPinned,
+  type SessionOrderPreferences,
+} from "@/lib/session-order";
 import { workspaceKeyOf } from "@/lib/workspace-memory";
 import { useI18n } from "@/hooks/useI18n";
 import { DirectoryPicker } from "./DirectoryPicker";
@@ -268,7 +277,7 @@ interface SessionTreeNode {
   children: SessionTreeNode[];
 }
 
-function buildSessionTree(sessions: SessionInfo[]): SessionTreeNode[] {
+function buildSessionTree(sessions: SessionInfo[], pinnedSessionIds: readonly string[] = []): SessionTreeNode[] {
   const byId = new Map<string, SessionTreeNode>();
   for (const s of sessions) {
     byId.set(s.id, { session: s, children: [] });
@@ -303,12 +312,15 @@ function buildSessionTree(sessions: SessionInfo[]): SessionTreeNode[] {
     }
   }
 
-  // Sort each level by modified desc
-  const sort = (nodes: SessionTreeNode[]) => {
+  // Pinned order applies only to top-level conversation trees. Forks remain
+  // attached to their parent and keep the normal recent-activity order.
+  const pinnedIndexes = new Map(pinnedSessionIds.map((id, index) => [id, index]));
+  roots.sort((a, b) => compareSessionRootOrder(a.session, b.session, pinnedIndexes));
+  const sortChildren = (nodes: SessionTreeNode[]) => {
     nodes.sort((a, b) => b.session.modified.localeCompare(a.session.modified));
-    nodes.forEach((n) => sort(n.children));
+    nodes.forEach((node) => sortChildren(node.children));
   };
-  sort(roots);
+  roots.forEach((root) => sortChildren(root.children));
   return roots;
 }
 
@@ -448,9 +460,65 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const fileExplorerRef = useRef<FileExplorerHandle>(null);
   const sessionListRequestRef = useRef(0);
   const sessionListControllerRef = useRef<AbortController | null>(null);
+  const [sessionOrderPreferences, setSessionOrderPreferences] = useState<SessionOrderPreferences>(
+    () => emptySessionOrderPreferences(),
+  );
+  const sessionOrderPreferencesRef = useRef(sessionOrderPreferences);
+  const sessionOrderMutationRef = useRef(0);
+  const sessionOrderSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const [draggingPinnedSessionId, setDraggingPinnedSessionId] = useState<string | null>(null);
+  const [dragOverPinnedSessionId, setDragOverPinnedSessionId] = useState<string | null>(null);
 
   useEffect(() => {
     setCollapsedSessionIds(loadCollapsedSessionIds());
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const mutationAtStart = sessionOrderMutationRef.current;
+    void fetch("/api/session-order", { cache: "no-store", signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const preferences = normalizeSessionOrderPreferences(await response.json());
+        if (mutationAtStart !== sessionOrderMutationRef.current) return;
+        sessionOrderPreferencesRef.current = preferences;
+        setSessionOrderPreferences(preferences);
+      })
+      .catch((loadError) => {
+        if ((loadError as { name?: string }).name !== "AbortError") {
+          console.error("Failed to load session order:", loadError);
+        }
+      });
+    return () => controller.abort();
+  }, []);
+
+  const updateProjectPinnedSessions = useCallback((
+    projectKey: string,
+    update: (current: readonly string[]) => string[],
+  ) => {
+    const pinnedSessionIds = update(sessionOrderPreferencesRef.current.projects[projectKey] ?? []);
+    const preferences = setProjectPinnedSessionIds(
+      sessionOrderPreferencesRef.current,
+      projectKey,
+      pinnedSessionIds,
+    );
+    sessionOrderMutationRef.current += 1;
+    sessionOrderPreferencesRef.current = preferences;
+    setSessionOrderPreferences(preferences);
+
+    sessionOrderSaveQueueRef.current = sessionOrderSaveQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        const response = await fetch("/api/session-order", {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ projectKey, pinnedSessionIds }),
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      })
+      .catch((saveError) => {
+        console.error("Failed to save session order:", saveError);
+      });
   }, []);
 
   const handleSessionTreeCollapse = useCallback((sessionId: string, collapsed: boolean) => {
@@ -1015,8 +1083,77 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
         }
       : null);
 
-  // Build parent-child tree within the filtered set
-  const sessionTree = buildSessionTree(filteredSessions);
+  // Build parent-child trees within the filtered set. Only top-level roots can
+  // be pinned; their complete fork subtree moves with them.
+  const selectedProjectKey = selectedProject?.key ?? null;
+  const projectPinnedSessionIds = selectedProjectKey
+    ? (sessionOrderPreferences.projects[selectedProjectKey] ?? [])
+    : [];
+  const sessionTree = buildSessionTree(filteredSessions, projectPinnedSessionIds);
+  const pinnedSessionIdSet = new Set(projectPinnedSessionIds);
+  const pinnedSessionTrees = sessionTree.filter((node) => pinnedSessionIdSet.has(node.session.id));
+  const recentSessionTrees = sessionTree.filter((node) => !pinnedSessionIdSet.has(node.session.id));
+  const visibleRootSessionIds = new Set(sessionTree.map((node) => node.session.id));
+
+  const toggleSessionPinned = (sessionId: string, pinned: boolean) => {
+    if (!selectedProjectKey) return;
+    updateProjectPinnedSessions(selectedProjectKey, (current) => setSessionPinned(current, sessionId, pinned));
+  };
+
+  const moveVisiblePinnedSession = (
+    sourceId: string,
+    targetId: string,
+    afterTarget: boolean,
+  ) => {
+    if (!selectedProjectKey) return;
+    updateProjectPinnedSessions(selectedProjectKey, (current) => {
+      const visiblePinned = current.filter((id) => visibleRootSessionIds.has(id));
+      return movePinnedSession(visiblePinned, sourceId, targetId, afterTarget);
+    });
+  };
+
+  const renderRootSessionTree = (node: SessionTreeNode) => (
+    <SessionTreeItem
+      key={node.session.id}
+      node={node}
+      selectedSessionId={selectedSessionId}
+      runningSessionIds={runningSessionIds}
+      unreadSessionIds={unreadSessionIds}
+      collapsedSessionIds={collapsedSessionIds}
+      onCollapseChange={handleSessionTreeCollapse}
+      onSelectSession={handleSelectSessionFromList}
+      onRenamed={loadSessions}
+      onSessionDeleted={(id) => {
+        if (selectedProjectKey) {
+          updateProjectPinnedSessions(
+            selectedProjectKey,
+            (current) => setSessionPinned(current, id, false),
+          );
+        }
+        handleSessionTreeCollapse(id, false);
+        onSessionDeleted?.(id);
+        loadSessions();
+      }}
+      depth={0}
+      isPinned={pinnedSessionIdSet.has(node.session.id)}
+      onTogglePinned={(pinned) => toggleSessionPinned(node.session.id, pinned)}
+      isDragging={draggingPinnedSessionId === node.session.id}
+      isDragOver={dragOverPinnedSessionId === node.session.id}
+      onPinnedDragStart={() => setDraggingPinnedSessionId(node.session.id)}
+      onPinnedDragEnd={() => {
+        setDraggingPinnedSessionId(null);
+        setDragOverPinnedSessionId(null);
+      }}
+      onPinnedDragOver={() => setDragOverPinnedSessionId(node.session.id)}
+      onPinnedDrop={(afterTarget) => {
+        if (draggingPinnedSessionId && draggingPinnedSessionId !== node.session.id) {
+          moveVisiblePinnedSession(draggingPinnedSessionId, node.session.id, afterTarget);
+        }
+        setDraggingPinnedSessionId(null);
+        setDragOverPinnedSessionId(null);
+      }}
+    />
+  );
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
@@ -1685,25 +1822,14 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
             {t("sidebar.noSessions")}
           </div>
         )}
-        {sessionTree.map((node) => (
-          <SessionTreeItem
-            key={node.session.id}
-            node={node}
-            selectedSessionId={selectedSessionId}
-            runningSessionIds={runningSessionIds}
-            unreadSessionIds={unreadSessionIds}
-            collapsedSessionIds={collapsedSessionIds}
-            onCollapseChange={handleSessionTreeCollapse}
-            onSelectSession={handleSelectSessionFromList}
-            onRenamed={loadSessions}
-            onSessionDeleted={(id) => {
-              handleSessionTreeCollapse(id, false);
-              onSessionDeleted?.(id);
-              loadSessions();
-            }}
-            depth={0}
-          />
-        ))}
+        {pinnedSessionTrees.length > 0 && (
+          <SessionListSectionLabel label={t("sidebar.pinnedSessions")} />
+        )}
+        {pinnedSessionTrees.map(renderRootSessionTree)}
+        {pinnedSessionTrees.length > 0 && recentSessionTrees.length > 0 && (
+          <SessionListSectionLabel label={t("sidebar.recentSessions")} />
+        )}
+        {recentSessionTrees.map(renderRootSessionTree)}
       </div>
 
       {/* File Explorer section */}
@@ -1835,6 +1961,28 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   );
 }
 
+function SessionListSectionLabel({ label }: { label: string }) {
+  return (
+    <div
+      style={{
+        height: 25,
+        display: "flex",
+        alignItems: "center",
+        padding: "5px 14px 3px",
+        color: "var(--text-dim)",
+        fontSize: 10,
+        fontWeight: 650,
+        letterSpacing: "0.06em",
+        textTransform: "uppercase",
+        borderTop: "1px solid var(--border)",
+        boxSizing: "border-box",
+      }}
+    >
+      {label}
+    </div>
+  );
+}
+
 function SessionTreeItem({
   node,
   selectedSessionId,
@@ -1846,6 +1994,14 @@ function SessionTreeItem({
   onRenamed,
   onSessionDeleted,
   depth,
+  isPinned = false,
+  onTogglePinned,
+  isDragging = false,
+  isDragOver = false,
+  onPinnedDragStart,
+  onPinnedDragEnd,
+  onPinnedDragOver,
+  onPinnedDrop,
 }: {
   node: SessionTreeNode;
   selectedSessionId: string | null;
@@ -1857,13 +2013,52 @@ function SessionTreeItem({
   onRenamed?: () => void;
   onSessionDeleted?: (id: string) => void;
   depth: number;
+  isPinned?: boolean;
+  onTogglePinned?: (pinned: boolean) => void;
+  isDragging?: boolean;
+  isDragOver?: boolean;
+  onPinnedDragStart?: () => void;
+  onPinnedDragEnd?: () => void;
+  onPinnedDragOver?: () => void;
+  onPinnedDrop?: (afterTarget: boolean) => void;
 }) {
   const collapsed = collapsedSessionIds.has(node.session.id);
   const hasChildren = node.children.length > 0;
 
   return (
-    <div>
-      <div style={{ position: "relative" }}>
+    <div
+      onDragOver={isPinned ? (event) => {
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+        onPinnedDragOver?.();
+      } : undefined}
+      onDrop={isPinned ? (event) => {
+        event.preventDefault();
+        const bounds = event.currentTarget.getBoundingClientRect();
+        onPinnedDrop?.(event.clientY > bounds.top + bounds.height / 2);
+      } : undefined}
+      style={{
+        position: "relative",
+        zIndex: isDragging ? 3 : 0,
+        opacity: isDragging ? 0.72 : 1,
+        transition: "opacity 140ms ease",
+      }}
+    >
+      <div
+        style={{
+          position: "relative",
+          borderRadius: 6,
+          transform: isDragging
+            ? "translateY(-2px) scale(1.015)"
+            : isDragOver ? "scale(0.985)" : "translateY(0) scale(1)",
+          boxShadow: isDragging
+            ? "0 7px 18px rgba(15,23,42,0.20)"
+            : isDragOver ? "inset 0 2px 0 var(--accent), 0 2px 8px rgba(15,23,42,0.10)" : "none",
+          background: isDragOver && !isDragging ? "var(--bg-hover)" : "transparent",
+          transition: "transform 140ms ease, box-shadow 140ms ease, background 140ms ease",
+          willChange: isDragging || isDragOver ? "transform" : "auto",
+        }}
+      >
         {/* Indent line for child sessions */}
         {depth > 0 && (
           <div style={{
@@ -1887,6 +2082,11 @@ function SessionTreeItem({
           hasChildren={hasChildren}
           collapsed={collapsed}
           onToggleCollapse={() => onCollapseChange(node.session.id, !collapsed)}
+          isPinned={isPinned}
+          isDragging={isDragging}
+          onTogglePinned={depth === 0 ? onTogglePinned : undefined}
+          onPinnedDragStart={depth === 0 ? onPinnedDragStart : undefined}
+          onPinnedDragEnd={depth === 0 ? onPinnedDragEnd : undefined}
         />
       </div>
       {hasChildren && !collapsed && (
@@ -2073,6 +2273,11 @@ function SessionItem({
   hasChildren = false,
   collapsed = false,
   onToggleCollapse,
+  isPinned = false,
+  isDragging = false,
+  onTogglePinned,
+  onPinnedDragStart,
+  onPinnedDragEnd,
 }: {
   session: SessionInfo;
   isSelected: boolean;
@@ -2085,6 +2290,11 @@ function SessionItem({
   hasChildren?: boolean;
   collapsed?: boolean;
   onToggleCollapse?: () => void;
+  isPinned?: boolean;
+  isDragging?: boolean;
+  onTogglePinned?: (pinned: boolean) => void;
+  onPinnedDragStart?: () => void;
+  onPinnedDragEnd?: () => void;
 }) {
   const { t } = useI18n();
   const [hovered, setHovered] = useState(false);
@@ -2167,6 +2377,23 @@ function SessionItem({
     setConfirmDelete(false);
   }, []);
 
+  const handlePinClick = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation();
+    onTogglePinned?.(!isPinned);
+  }, [isPinned, onTogglePinned]);
+
+  const handlePinnedDragStart = useCallback((e: React.DragEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", session.id);
+    onPinnedDragStart?.();
+  }, [onPinnedDragStart, session.id]);
+
+  const handlePinnedDragEnd = useCallback((e: React.DragEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    onPinnedDragEnd?.();
+  }, [onPinnedDragEnd]);
+
   const handleContextMenu = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const handled = dispatchSessionRowContextMenu({
       id: session.id,
@@ -2184,10 +2411,15 @@ function SessionItem({
 
   // Fixed-height outer wrapper — content swaps in place so the list never reflows
   const ITEM_HEIGHT = 54;
+  const canDragPinned = isPinned && depth === 0 && !confirmDelete && !renaming && !deleting;
 
   return (
     <div
       data-session-id={session.id}
+      draggable={canDragPinned}
+      aria-grabbed={canDragPinned ? isDragging : undefined}
+      onDragStart={canDragPinned ? handlePinnedDragStart : undefined}
+      onDragEnd={canDragPinned ? handlePinnedDragEnd : undefined}
       onClick={confirmDelete || renaming ? undefined : onClick}
       onContextMenu={confirmDelete || renaming ? undefined : handleContextMenu}
       onMouseEnter={() => setHovered(true)}
@@ -2198,14 +2430,14 @@ function SessionItem({
         alignItems: "center",
         paddingLeft: depth > 0 ? depth * 12 + 14 : 14,
         paddingRight: 8,
-        cursor: confirmDelete || renaming ? "default" : "pointer",
+        cursor: canDragPinned ? (isDragging ? "grabbing" : "grab") : confirmDelete || renaming ? "default" : "pointer",
         background: confirmDelete
           ? "rgba(239,68,68,0.06)"
           : isSelected ? "var(--bg-selected)" : hovered ? "var(--bg-hover)" : "transparent",
         borderLeft: confirmDelete
           ? "2px solid #ef4444"
           : isSelected ? "2px solid var(--accent)" : "2px solid transparent",
-        transition: "background 0.1s",
+        transition: "background 0.1s, opacity 0.14s ease",
         opacity: deleting ? 0.5 : 1,
         gap: 6,
         overflow: "hidden",
@@ -2305,6 +2537,23 @@ function SessionItem({
               <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
                 {title}
               </span>
+              {isPinned && (
+                <svg
+                  width="11"
+                  height="11"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="var(--accent)"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-label={t("sidebar.pinned")}
+                  style={{ flexShrink: 0 }}
+                >
+                  <path d="M12 17v5" />
+                  <path d="m5 17 3-7V4h8v6l3 7Z" />
+                </svg>
+              )}
             </div>
             <div style={{ marginTop: 2, display: "flex", alignItems: "center", gap: 8, color: "var(--text-dim)", fontSize: 11.25, minWidth: 0 }}>
               {isRunning ? (
@@ -2354,13 +2603,34 @@ function SessionItem({
 
           {/* Action buttons — shown on hover */}
           {hovered && !session.transient && (
-            <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+            <div style={{ display: "flex", gap: 3, flexShrink: 0 }}>
+              {onTogglePinned && (
+                <button
+                  onClick={handlePinClick}
+                  title={isPinned ? t("sidebar.unpinSession") : t("sidebar.pinSession")}
+                  aria-pressed={isPinned}
+                  style={{
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    width: 28, height: 28, padding: 0,
+                    background: isPinned ? "rgba(37,99,235,0.1)" : "var(--bg-hover)",
+                    border: "1px solid var(--border)",
+                    borderRadius: 7, color: isPinned ? "var(--accent)" : "var(--text-muted)",
+                    cursor: "pointer", flexShrink: 0,
+                    transition: "background 0.12s, color 0.12s, border-color 0.12s",
+                  }}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M12 17v5" />
+                    <path d="m5 17 3-7V4h8v6l3 7Z" />
+                  </svg>
+                </button>
+              )}
               <button
                 onClick={startRename}
                 title={t("sidebar.rename")}
                 style={{
                   display: "flex", alignItems: "center", justifyContent: "center",
-                  width: 32, height: 32, padding: 0,
+                  width: 28, height: 28, padding: 0,
                   background: "var(--bg-hover)", border: "1px solid var(--border)",
                   borderRadius: 7, color: "var(--text-muted)",
                   cursor: "pointer", flexShrink: 0,
@@ -2386,7 +2656,7 @@ function SessionItem({
                 title={t("sidebar.deleteWithShiftClick")}
                 style={{
                   display: "flex", alignItems: "center", justifyContent: "center",
-                  width: 32, height: 32, padding: 0,
+                  width: 28, height: 28, padding: 0,
                   background: "var(--bg-hover)", border: "1px solid var(--border)",
                   borderRadius: 7, color: "var(--text-muted)",
                   cursor: "pointer", flexShrink: 0,
