@@ -56,6 +56,9 @@ test("TextFileViewer uses one watcher-owned initial content snapshot", () => {
   assert.match(block, /const loadKind = wantsPatch \? "patch" : "probe"/);
   assert.match(block, /fetchGitDiff\(filePath, !wantsPatch\)/);
   assert.match(block, /params\.set\("probe", "1"\)/);
+  assert.match(block, /if \(!probeOnly\) setGitDiffLoading\(true\)/);
+  assert.match(block, /startTransition\(\(\) => \{[\s\S]*setGitDiffAvailable\(available\)/);
+  assert.match(block, /requestId === gitDiffRequestRef\.current && !probeOnly/);
   assert.match(block, /\.\.\.\(canShowGitDiff \? \["diff" as const\] : \[\]\)/);
   assert.match(block, /deferredSourceContent = useDeferredValue\(data\?\.content \?\? ""\)/);
   assert.match(block, /if \(!watchEnabled\) \{[\s\S]*loadSnapshot\(\)/);
@@ -90,6 +93,14 @@ test("TextFileViewer selects Markdown and HTML preview before content rendering"
   assert.match(block, /\["md", "mdx", "html", "htm"\]\.includes\(fileExtension\)/);
   assert.match(block, /\? "preview"/);
   assert.match(block, /defaultPreviewEligibleRef = useRef\(false\)/);
+});
+
+test("Git probes cannot rerender expensive text viewer content", () => {
+  assert.match(source, /const SourceFileContent = memo\(/);
+  assert.match(source, /const MarkdownFilePreview = memo\(/);
+  const block = functionBlock("TextFileViewer", null);
+  assert.match(block, /<MarkdownFilePreview/);
+  assert.match(block, /<SourceFileContent/);
 });
 
 test("source and diff rows retain full DOM content with off-screen rendering containment", () => {

@@ -1,6 +1,6 @@
 "use client";
 
-import { useDeferredValue, useEffect, useState, useRef, useCallback, useMemo, type CSSProperties, type MouseEvent } from "react";
+import { memo, startTransition, useDeferredValue, useEffect, useState, useRef, useCallback, useMemo, type CSSProperties, type MouseEvent } from "react";
 import {
   Prism as SyntaxHighlighter,
   createElement as renderSyntaxNode,
@@ -241,6 +241,123 @@ function DownloadLink({ filePath, sourceSessionId }: { filePath: string; sourceS
     </a>
   );
 }
+
+const SourceFileContent = memo(function SourceFileContent({
+  content,
+  language,
+  wrapLines,
+}: {
+  content: string;
+  language: string;
+  wrapLines: boolean;
+}) {
+  const { isDark } = useTheme();
+  return (
+    <SyntaxHighlighter
+      className={wrapLines ? "file-source-view is-wrapped" : "file-source-view"}
+      language={language === "text" ? "plaintext" : language}
+      style={isDark ? vscDarkPlus : vs}
+      showLineNumbers
+      lineNumberStyle={{ ...FILE_LINE_NUMBER_STYLE }}
+      customStyle={{
+        margin: 0,
+        padding: 0,
+        border: 0,
+        background: "var(--bg)",
+        ...FILE_CODE_STYLE,
+        width: wrapLines ? "100%" : "max-content",
+        minWidth: "100%",
+        minHeight: "100%",
+        overflow: "visible",
+      }}
+      codeTagProps={{
+        style: {
+          fontFamily: "var(--font-mono)",
+          overflowWrap: wrapLines ? "anywhere" : "normal",
+        },
+      }}
+      renderer={(rendererProps) => (
+        <SourceCodeRenderer {...rendererProps} wrapLines={wrapLines} />
+      )}
+      wrapLongLines={wrapLines}
+    >
+      {content}
+    </SyntaxHighlighter>
+  );
+});
+
+const MarkdownFilePreview = memo(function MarkdownFilePreview({
+  content,
+  filePath,
+  cwd,
+  sourceSessionId,
+  onOpenFile,
+}: {
+  content: string;
+  filePath: string;
+  cwd?: string;
+  sourceSessionId?: string | null;
+  onOpenFile?: (filePath: string) => void;
+}) {
+  const markdownDirectory = getFileDirectory(filePath);
+  const markdownPreview = useMemo(() => normalizeDisplayMath(content), [content]);
+  const frontmatter = useMemo(() => parseFrontmatter(content), [content]);
+
+  return (
+    <div className="markdown-body markdown-file-preview" style={{ padding: "24px 32px" }}>
+      {frontmatter?.data && <FrontmatterCard data={frontmatter.data} />}
+      <ReactMarkdown
+        remarkPlugins={markdownPreviewRemarkPlugins}
+        rehypePlugins={markdownPreviewRehypePlugins}
+        components={{
+          code({ className, children, ...props }) {
+            const lang = className?.replace("language-", "").toLowerCase() ?? "";
+            const raw = String(children);
+            const isBlock = className?.includes("language-") || raw.includes("\n");
+            if (isBlock) {
+              if (lang === "mermaid") {
+                return <MermaidBlock code={raw.replace(/\n$/, "")} defaultPreview />;
+              }
+              return <CodeBlock code={raw.replace(/\n$/, "")} lang={lang} />;
+            }
+            return <code className={className} {...props}>{children}</code>;
+          },
+          pre({ children }) {
+            return <>{children}</>;
+          },
+          a({ href, children, ...props }) {
+            delete props.node;
+            const linkedFile = onOpenFile
+              ? resolveLocalFileHref(href, markdownDirectory, cwd ?? markdownDirectory)
+              : null;
+            if (!linkedFile || !onOpenFile) return <a href={href} {...props}>{children}</a>;
+
+            const handleClick = (event: MouseEvent<HTMLAnchorElement>) => {
+              if (event.defaultPrevented || event.button !== 0) return;
+              if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+              event.preventDefault();
+              onOpenFile(linkedFile);
+            };
+            return <a href={href} {...props} onClick={handleClick}>{children}</a>;
+          },
+          img({ src, alt, ...props }) {
+            delete props.node;
+            const imagePath = typeof src === "string"
+              ? resolveLocalFileHref(src, markdownDirectory, cwd ?? markdownDirectory)
+              : null;
+            const imageSrc = imagePath
+              ? getFileApiUrl(imagePath, "read", sourceSessionId)
+              : src;
+            // eslint-disable-next-line @next/next/no-img-element
+            return <img src={imageSrc} alt={alt ?? ""} loading="lazy" {...props} />;
+          },
+        }}
+      >
+        {markdownPreview}
+      </ReactMarkdown>
+    </div>
+  );
+});
 
 type DiffLine = {
   type: "unchanged" | "removed" | "added";
@@ -865,7 +982,6 @@ function TextFileViewer({
   onStateChange,
   watchEnabled = true,
 }: Props) {
-  const { isDark } = useTheme();
   const { t } = useI18n();
   const [data, setData] = useState<FileData | null>(null);
   const [gitDiff, setGitDiff] = useState<GitFileDiffResponse | null>(null);
@@ -1001,12 +1117,24 @@ function TextFileViewer({
     gitDiffAbortRef.current?.abort();
     const controller = new AbortController();
     gitDiffAbortRef.current = controller;
-    setGitDiffLoading(true);
+    if (!probeOnly) setGitDiffLoading(true);
+
+    const applyProbeResult = (available: boolean) => {
+      startTransition(() => {
+        setGitDiffAvailable(available);
+        setGitDiff(null);
+      });
+    };
+
     if (!cwd) {
-      setGitDiff(null);
-      setGitDiffAvailable(false);
-      setGitDiffLoading(false);
-      setGitDiffResolved(true);
+      if (probeOnly) {
+        applyProbeResult(false);
+      } else {
+        setGitDiff(null);
+        setGitDiffAvailable(false);
+        setGitDiffLoading(false);
+        setGitDiffResolved(true);
+      }
       if (gitDiffAbortRef.current === controller) gitDiffAbortRef.current = null;
       return;
     }
@@ -1020,20 +1148,28 @@ function TextFileViewer({
       const next = await response.json() as GitFileDiffResponse & { error?: string };
       if (requestId !== gitDiffRequestRef.current) return;
       const available = response.ok && next.supported;
-      const completeDiff = available && typeof next.patch === "string" ? next : null;
-      setGitDiffAvailable(probeOnly ? available : completeDiff !== null);
-      setGitDiff(probeOnly ? null : completeDiff);
+      if (probeOnly) {
+        applyProbeResult(available);
+      } else {
+        const completeDiff = available && typeof next.patch === "string" ? next : null;
+        setGitDiffAvailable(completeDiff !== null);
+        setGitDiff(completeDiff);
+      }
     } catch (nextError) {
       if (
         requestId === gitDiffRequestRef.current
         && (nextError as { name?: string }).name !== "AbortError"
       ) {
-        setGitDiff(null);
-        setGitDiffAvailable(false);
+        if (probeOnly) {
+          applyProbeResult(false);
+        } else {
+          setGitDiff(null);
+          setGitDiffAvailable(false);
+        }
       }
     } finally {
       if (gitDiffAbortRef.current === controller) gitDiffAbortRef.current = null;
-      if (requestId === gitDiffRequestRef.current) {
+      if (requestId === gitDiffRequestRef.current && !probeOnly) {
         setGitDiffLoading(false);
         setGitDiffResolved(true);
       }
@@ -1175,16 +1311,6 @@ function TextFileViewer({
     }
   }, [requestedInitialDisplayMode, hasGitDiff, updateDisplayMode]);
 
-  const markdownPreview = useMemo(
-    () => (data?.language === "markdown" ? normalizeDisplayMath(data.content) : ""),
-    [data],
-  );
-
-  const frontmatter = useMemo(
-    () => (data?.language === "markdown" ? parseFrontmatter(data.content) : null),
-    [data],
-  );
-
   useEffect(() => {
     const updateSelectedLineRange = () => {
       const root = contentRef.current;
@@ -1280,7 +1406,6 @@ function TextFileViewer({
   const isHtml = language === "html";
   const isMarkdown = language === "markdown";
   const hasPreview = isHtml || isMarkdown;
-  const markdownDirectory = getFileDirectory(filePath);
   const lines = content.split("\n");
   const effectiveDisplayMode = isDeletedDiff ? "diff" : displayMode;
   const displayModes: DisplayMode[] = isDeletedDiff
@@ -1428,104 +1553,19 @@ function TextFileViewer({
              title={t("i18n.htmlPreview")}
           />
         ) : isMarkdown && effectiveDisplayMode === "preview" ? (
-          <div
-            className="markdown-body markdown-file-preview"
-            style={{ padding: "24px 32px" }}
-          >
-            {frontmatter?.data && <FrontmatterCard data={frontmatter.data} />}
-            <ReactMarkdown
-              remarkPlugins={markdownPreviewRemarkPlugins}
-              rehypePlugins={markdownPreviewRehypePlugins}
-              components={{
-                code({ className, children, ...props }) {
-                  const lang = className?.replace("language-", "").toLowerCase() ?? "";
-                  const raw = String(children);
-                  const isBlock = className?.includes("language-") || raw.includes("\n");
-                  if (isBlock) {
-                    if (lang === "mermaid") {
-                      return <MermaidBlock code={raw.replace(/\n$/, "")} defaultPreview />;
-                    }
-                    return <CodeBlock code={raw.replace(/\n$/, "")} lang={lang} />;
-                  }
-                  return (
-                    <code className={className} {...props}>
-                      {children}
-                    </code>
-                  );
-                },
-                pre({ children }) {
-                  // Render the code block directly — CodeBlock provides its own wrapping.
-                  // For non-mermaid blocks, pass through to default pre rendering.
-                  return <>{children}</>;
-                },
-                a({ href, children, ...props }) {
-                  delete props.node;
-                  const linkedFile = onOpenFile
-                    ? resolveLocalFileHref(href, markdownDirectory, cwd ?? markdownDirectory)
-                    : null;
-                  if (!linkedFile || !onOpenFile) {
-                    return <a href={href} {...props}>{children}</a>;
-                  }
-
-                  const handleClick = (event: MouseEvent<HTMLAnchorElement>) => {
-                    if (event.defaultPrevented || event.button !== 0) return;
-                    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-                    event.preventDefault();
-                    onOpenFile(linkedFile);
-                  };
-
-                  return <a href={href} {...props} onClick={handleClick}>{children}</a>;
-                },
-                img({ src, alt, ...props }) {
-                  delete props.node;
-                  const imagePath = typeof src === "string"
-                    ? resolveLocalFileHref(src, markdownDirectory, cwd ?? markdownDirectory)
-                    : null;
-                  const imageSrc = imagePath
-                    ? getFileApiUrl(imagePath, "read", sourceSessionId)
-                    : src;
-                  // Dynamic local paths are served directly by the file API.
-                  // eslint-disable-next-line @next/next/no-img-element
-                  return <img src={imageSrc} alt={alt ?? ""} loading="lazy" {...props} />;
-                },
-              }}
-            >
-              {markdownPreview}
-            </ReactMarkdown>
-          </div>
+          <MarkdownFilePreview
+            content={content}
+            filePath={filePath}
+            cwd={cwd}
+            sourceSessionId={sourceSessionId}
+            onOpenFile={onOpenFile}
+          />
         ) : (
-          <SyntaxHighlighter
-            className={wrapLines ? "file-source-view is-wrapped" : "file-source-view"}
-            language={language === "text" ? "plaintext" : language}
-            style={isDark ? vscDarkPlus : vs}
-            showLineNumbers
-            lineNumberStyle={{
-              ...FILE_LINE_NUMBER_STYLE,
-            }}
-            customStyle={{
-              margin: 0,
-              padding: 0,
-              border: 0,
-              background: "var(--bg)",
-              ...FILE_CODE_STYLE,
-              width: wrapLines ? "100%" : "max-content",
-              minWidth: "100%",
-              minHeight: "100%",
-              overflow: "visible",
-            }}
-            codeTagProps={{
-              style: {
-                fontFamily: "var(--font-mono)",
-                overflowWrap: wrapLines ? "anywhere" : "normal",
-              },
-            }}
-            renderer={(rendererProps) => (
-              <SourceCodeRenderer {...rendererProps} wrapLines={wrapLines} />
-            )}
-            wrapLongLines={wrapLines}
-          >
-            {deferredSourceContent}
-          </SyntaxHighlighter>
+          <SourceFileContent
+            content={deferredSourceContent}
+            language={language}
+            wrapLines={wrapLines}
+          />
         )}
       </div>
     </div>
