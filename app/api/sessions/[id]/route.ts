@@ -3,6 +3,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import {
+  attachSessionProjectInfo,
   resolveSessionPath,
   resolveSessionIdByPath,
   invalidateSessionPathCache,
@@ -27,6 +28,10 @@ import {
   parseSessionContextPageRequest,
   SessionContextPageRequestError,
 } from "@/lib/session-context-page";
+import { computeSessionStats } from "@/lib/session-stats";
+import type { SessionEntry } from "@/lib/types";
+import { readSubagentRun, readSubagentSessionResources, SUBAGENT_META_TYPE } from "@/lib/subagents";
+import { readSessionToolSelection } from "@/lib/session-tool-selection";
 
 export async function GET(
   req: Request,
@@ -51,19 +56,19 @@ export async function GET(
     const { filePath, entries, leafId, tree } = timing.timeSync("session-read", () => ({
       filePath: liveRpc?.sessionFile || diskSnapshot?.filePath || resolvedPath || "",
       entries: sm?.getEntries() ?? diskSnapshot!.entries,
-      leafId: sm?.getLeafId() ?? diskSnapshot!.leafId,
+      leafId: sm ? sm.getLeafId() : diskSnapshot!.leafId,
       tree: sm ? projectTreeForResponse(sm.getTree()) : diskSnapshot!.tree,
     }));
     const searchParams = new URL(req.url).searchParams;
     const deferThinking = searchParams.has("deferThinking");
     const deferToolResultImages = searchParams.has("deferMedia");
     const pageRequest = parseSessionContextPageRequest(searchParams);
-    const contextOptions = { deferThinking, deferToolResultImages };
+    const contextOptions = { deferThinking, deferToolResultImages, sessionId: id };
     const { fullContext, totalActiveMs } = timing.timeSync("context", () => ({
       fullContext: diskSnapshot
         ? getSessionContextFromSnapshot(
             diskSnapshot,
-            leafId ?? undefined,
+            leafId,
             contextOptions,
             () => buildSessionContext(entries as never, leafId, contextOptions),
           )
@@ -84,31 +89,41 @@ export async function GET(
     const contextStats = computeSessionContextStats(fullContext);
     const inputHistory = computeSessionInputHistory(fullContext);
 
+    const stats = diskSnapshot?.stats ?? computeSessionStats(entries as unknown as SessionEntry[]);
+    const toolNames = readSubagentSessionResources(entries as never)?.tools
+      ?? readSessionToolSelection(entries as never);
     const info = await timing.time("metadata", async () => {
       const header = sm?.getHeader() ?? diskSnapshot?.header ?? null;
-      let modified = header?.timestamp ?? new Date().toISOString();
+      if (!header) return null;
+      let modified = header.timestamp;
       try { modified = statSync(filePath).mtime.toISOString(); } catch { /* use header timestamp */ }
-      const parentSessionId = header?.parentSession
+      const subagent = readSubagentRun(entries as never, header.id, filePath);
+      const originSessionId = header.parentSession
         ? await resolveSessionIdByPath(header.parentSession)
         : undefined;
-      return header ? {
+      const firstEntry = entries.find((entry) => entry.type === "message" && entry.message.role === "user");
+      const content = firstEntry?.type === "message" && firstEntry.message.role === "user"
+        ? firstEntry.message.content
+        : undefined;
+      const firstMessage = typeof content === "string" ? content
+        : Array.isArray(content) ? content.filter((block) => block.type === "text").map((block) => block.text).join(" ") : "";
+      return (await attachSessionProjectInfo([{
         path: filePath,
         id: header.id,
         cwd: header.cwd ?? "",
         name: sm?.getSessionName() ?? diskSnapshot?.sessionName,
         created: header.timestamp,
         modified,
-        messageCount: fullContext.messages.length,
-        firstMessage: fullContext.messages.find((m) => m.role === "user")
-          ? (() => {
-              const msg = fullContext.messages.find((m) => m.role === "user")!;
-              const c = (msg as { content: unknown }).content;
-              return typeof c === "string" ? c : (Array.isArray(c) ? (c.find((b: { type: string }) => b.type === "text") as { text: string } | undefined)?.text ?? "" : "") || "(no messages)";
-            })()
-          : "(no messages)",
-        parentSessionId,
+        messageCount: stats.totalMessages,
+        firstMessage: firstMessage || "(no messages)",
+        parentSessionId: subagent?.parentSessionId ?? originSessionId,
+        ...(subagent
+          ? { relation: { kind: "subagent" as const, parentSessionId: subagent.parentSessionId, profile: subagent.profile, description: subagent.description, status: liveRpc?.isRunning() ? "running" as const : subagent.status } }
+          : header.parentSession
+            ? { relation: { kind: "fork" as const, ...(originSessionId ? { originSessionId } : {}) } }
+            : {}),
         transient: !filePath || !existsSync(filePath),
-      } : null;
+      }]))[0];
     });
 
     const response = timing.timeSync("serialize", () => NextResponse.json({
@@ -121,7 +136,9 @@ export async function GET(
       contextPage,
       contextStats,
       inputHistory,
+      stats,
       totalActiveMs,
+      ...(toolNames !== undefined ? { toolNames } : {}),
     }));
     return timing.finish(response);
   } catch (error) {
@@ -169,6 +186,15 @@ export async function DELETE(
 
     // Read only the bounded header before deleting.
     const parentSessionPath = readSessionHeader(filePath)?.parentSession;
+    let parentSessionId: string | undefined;
+    if (parentSessionPath) {
+      try {
+        // The parent may have been deleted or moved already; treat it as absent.
+        parentSessionId = readSessionHeader(parentSessionPath)?.id;
+      } catch {
+        parentSessionId = undefined;
+      }
+    }
 
     // Re-attach all direct children to this session's parent (cascade re-parent)
     // Scan sibling files in the same directory
@@ -193,6 +219,30 @@ export async function DELETE(
             // Rewrite header with new parentSession
             header.parentSession = parentSessionPath;
             lines[0] = JSON.stringify(header);
+            if (parentSessionPath && parentSessionId) {
+              for (let index = 1; index < lines.length; index += 1) {
+                let entry: { type?: string; customType?: string; data?: unknown };
+                try {
+                  entry = JSON.parse(lines[index]);
+                } catch {
+                  continue;
+                }
+                if (
+                  entry.type !== "custom"
+                  || entry.customType !== SUBAGENT_META_TYPE
+                  || typeof entry.data !== "object"
+                  || entry.data === null
+                  || Array.isArray(entry.data)
+                ) continue;
+                entry.data = {
+                  ...entry.data,
+                  parentSessionId,
+                  parentSessionPath,
+                };
+                lines[index] = JSON.stringify(entry);
+                break;
+              }
+            }
             writeFileSync(childPath, lines.join("\n"));
             invalidateParsedSession(childPath);
             reparentedPaths.push(childPath);

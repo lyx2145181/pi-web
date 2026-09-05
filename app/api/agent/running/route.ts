@@ -1,12 +1,22 @@
 import { NextResponse } from "next/server";
-import { getRunningRpcSessionIds } from "@/lib/rpc-manager";
+import { getSessionListVersion } from "@/lib/session-reader";
+import { refreshSessionIndexInBackground } from "@/lib/session-index";
+import {
+  getCompletionNotificationSuppressedRpcSessionIds,
+  getRunningRpcSessionIds,
+} from "@/lib/rpc-manager";
 
 export const dynamic = "force-dynamic";
 
 // GET /api/agent/running - Lightweight snapshot for visible-tab polling.
 export async function GET() {
+  refreshSessionIndexInBackground();
   return NextResponse.json(
-    { runningSessionIds: getRunningRpcSessionIds() },
+    {
+      sessionListVersion: getSessionListVersion(),
+      runningSessionIds: getRunningRpcSessionIds(),
+      completionNotificationSuppressedSessionIds: getCompletionNotificationSuppressedRpcSessionIds(),
+    },
     { headers: { "Cache-Control": "no-store" } },
   );
 }

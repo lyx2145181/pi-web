@@ -1,9 +1,36 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { createJiti } from "jiti";
+
+const jiti = createJiti(import.meta.url, { jsx: { runtime: "automatic" }, tsconfigPaths: true });
+const { getSessionListIndices, getVariableSessionListIndices } = await jiti.import("./SessionSidebar.tsx");
 
 const source = await readFile(new URL("./SessionSidebar.tsx", import.meta.url), "utf8");
 const sessionItemSource = source.slice(source.indexOf("function SessionItem("));
+
+test("scrolling keeps the focused session and the viewport mounted without expanding the whole window", () => {
+  for (const [scrollTop, focusedIndex] of [[0, 1999], [10000, 0]]) {
+    const indices = getSessionListIndices(2000, scrollTop, 335, focusedIndex);
+    const firstVisible = Math.floor(scrollTop / 54);
+    const lastVisible = Math.ceil((scrollTop + 335) / 54) - 1;
+    for (let index = firstVisible; index <= lastVisible; index++) assert.ok(indices.includes(index));
+    assert.ok(indices.includes(focusedIndex));
+    assert.equal(indices.length, 24);
+    assert.equal(new Set(indices).size, indices.length);
+    assert.deepEqual(indices, [...indices].sort((a, b) => a - b));
+  }
+  assert.equal(getSessionListIndices(2000, 0, 335, 3).length, 23);
+  const blurred = getSessionListIndices(2000, 10000, 335);
+  assert.equal(blurred.length, 23);
+  assert.ok(!blurred.includes(0));
+});
+
+test("session windows stay valid after a project shrinks and before the viewport is measured", () => {
+  assert.deepEqual(getSessionListIndices(5, 80000, 335, 1999), [0, 1, 2, 3, 4]);
+  assert.deepEqual(getSessionListIndices(0, 80000, 335, 1999), []);
+  assert.equal(getSessionListIndices(2000, 0, 0).length, 28);
+});
 
 test("only Shift+click bypasses session deletion confirmation", () => {
   assert.match(
@@ -51,6 +78,25 @@ test("exposes the polled running-session set to the shell", () => {
   assert.match(source, /onRunningSessionIdsChange\?\.\(runningSessionIds\)/);
 });
 
+test("exposes the loaded session catalog to the shell", () => {
+  assert.match(source, /onSessionsChange\?: \(sessions: SessionInfo\[\]\) => void/);
+  assert.match(source, /onSessionsChange\?\.\(allSessions\)/);
+});
+
+test("subagent completion stays silent and never becomes unread", () => {
+  assert.match(source, /completionNotificationSuppressedSessionIds\?: string\[\]/);
+  assert.match(
+    source,
+    /completedWithNotifications = completedInBackground\.filter\([\s\S]*?!previousSuppressedCompletionSessionIdsRef\.current\.has\(id\)[\s\S]*?!knownSubagentIds\.has\(id\)/,
+  );
+  assert.match(source, /completedWithNotifications\.forEach\(\(id\) => next\.add\(id\)\)/);
+  assert.match(source, /if \(completedWithNotifications\.length > 0\) \{\s*onBackgroundTaskDone\?\.\(\)/);
+  assert.match(
+    source,
+    /filter\(\(session\) => session\.relation\?\.kind !== "subagent"\)[\s\S]*?unreadEligibleIds\.has\(id\)/,
+  );
+});
+
 test("includes project activity counts in accessible labels", () => {
   assert.match(
     source,
@@ -68,6 +114,12 @@ test("summarizes running and completed activity across every project", () => {
   assert.match(source, /<WorkspaceActivitySummary activity=\{workspaceActivity\} \/>/);
   assert.match(source, /sidebar\.backgroundSessionRunning/);
   assert.match(source, /sidebar\.backgroundSessionComplete/);
+});
+
+test("formats session timestamps with the active locale", () => {
+  assert.match(source, /import \{ formatRelativeTime \} from "@\/lib\/i18n\/format"/);
+  assert.match(sessionItemSource, /const \{ locale, t \} = useI18n\(\)/);
+  assert.match(sessionItemSource, /formatRelativeTime\(session\.modified, locale\)/);
 });
 
 test("does not persist an unchanged fallback title ending in whitespace", () => {
@@ -128,7 +180,46 @@ test("a replacement refresh always clears initial loading state", () => {
   assert.doesNotMatch(loadBlock, /if \(showLoading\) setLoading\(false\)/);
 });
 
+test("cross-window version polling reuses the invalidated cache", () => {
+  assert.match(source, /data\.sessionListVersion !== sessionListVersionRef\.current[\s\S]*?await loadSessions\(\)/);
+  assert.doesNotMatch(source, /sessionRefreshDone|sessionRefreshTimerRef/);
+});
+
 test("does not expose disk-backed actions for transient sessions", () => {
   assert.match(sessionItemSource, /if \(session\.transient\) return;/);
   assert.match(sessionItemSource, /\{hovered && !session\.transient && \(/);
+});
+
+test("hides subagent rows, aggregates their state, and preserves the visible fork tree", () => {
+  assert.match(source, /const families = listSessionFamilies\(sessions\)/);
+  assert.match(source, /familySelected = node\.familySessions\.some\(\(session\) => session\.id === selectedSessionId\)/);
+  assert.match(source, /familyRunning = node\.familySessions\.some\(\(session\) => runningSessionIds\.has\(session\.id\)\)/);
+  assert.match(source, /function SessionTreeItem/);
+  assert.match(source, /node\.children\.map\(\(child\)/);
+});
+
+test("virtualizes variable-height root subtrees while retaining focused or dragged roots", () => {
+  const layouts = [
+    { top: 0, height: 54 },
+    { top: 54, height: 540 },
+    { top: 594, height: 108 },
+    { top: 702, height: 54 },
+    { top: 756, height: 54 },
+    { top: 810, height: 54 },
+    { top: 864, height: 54 },
+    { top: 918, height: 54 },
+    { top: 972, height: 54 },
+    { top: 1026, height: 54 },
+    { top: 1080, height: 54 },
+    { top: 1134, height: 54 },
+    { top: 1188, height: 54 },
+  ];
+  const visible = getVariableSessionListIndices(layouts, 1080, 54, [0]);
+  assert.ok(visible.includes(0), "forced root remains mounted");
+  assert.ok(visible.includes(10));
+  assert.ok(visible.includes(11));
+  assert.ok(!visible.includes(1), "distant variable-height subtree stays unmounted");
+  assert.deepEqual(visible, [...visible].sort((a, b) => a - b));
+  assert.match(source, /visibleSessionTreeRows\(node, collapsedSessionIds\) \* SESSION_LIST_ITEM_HEIGHT/);
+  assert.match(source, /getVariableSessionListIndices\([\s\S]*?forcedLayoutIndices/);
 });

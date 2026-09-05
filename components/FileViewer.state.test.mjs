@@ -31,7 +31,8 @@ test("media viewers share one versioned watcher-first handshake", () => {
 
   for (const [name, nextName] of [
     ["ImageViewer", "formatDuration"],
-    ["AudioViewer", "DocumentViewer"],
+    ["AudioViewer", "VideoViewer"],
+    ["VideoViewer", "DocumentViewer"],
     ["DocumentViewer", "FileViewer"],
   ]) {
     const block = functionBlock(name, nextName);
@@ -43,7 +44,7 @@ test("media viewers share one versioned watcher-first handshake", () => {
 
 test("FileViewer forwards watcher state to every viewer implementation", () => {
   const block = functionBlock("FileViewer", "TextFileViewer");
-  assert.equal(block.match(/watchEnabled=\{watchEnabled\}/g)?.length, 4);
+  assert.equal(block.match(/watchEnabled=\{watchEnabled\}/g)?.length, 5);
 });
 
 test("TextFileViewer uses one watcher-owned initial content snapshot", () => {

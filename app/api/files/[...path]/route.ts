@@ -5,8 +5,6 @@ import {
   getAllowedFileRoots,
   isExistingFilePathAllowed,
   isFilePathAllowed,
-  isWindowsAbsolutePath,
-  normalizeSlashes,
 } from "@/lib/file-access";
 import {
   DOCX_PREVIEW_MAX_BYTES,
@@ -17,6 +15,7 @@ import {
   getDocumentMime,
   getFileExt,
   getImageMime,
+  getVideoMime,
 } from "@/lib/file-types";
 import { resolveDirentIsDirectory } from "@/lib/file-dirent";
 import { isFilePathReferencedBySession } from "@/lib/session-file-references";
@@ -27,7 +26,7 @@ import {
   validateUploadFileNames,
 } from "@/lib/file-upload";
 import { parseFormDataWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-form-data";
-import { samePath } from "@/lib/paths";
+import { filePathFromApiSegments, samePath } from "@/lib/paths";
 import { createServerTiming } from "@/lib/server-timing";
 import {
   createFileVersion,
@@ -83,13 +82,6 @@ function getLanguage(filePath: string): string {
   return EXT_TO_LANGUAGE[ext] ?? "text";
 }
 
-function filePathFromSegments(segments: string[]): string {
-  const joined = segments.join("/");
-  const slashJoined = normalizeSlashes(joined);
-  if (isWindowsAbsolutePath(slashJoined)) return slashJoined;
-  return "/" + joined.replace(/^\/+/, "");
-}
-
 function parseFileRequestType(value: string): FileRequestType | null {
   return FILE_REQUEST_TYPE_SET.has(value) ? (value as FileRequestType) : null;
 }
@@ -97,7 +89,7 @@ function parseFileRequestType(value: string): FileRequestType | null {
 async function getUploadDirectory(segments: string[]): Promise<
   { directory: string } | { response: NextResponse }
 > {
-  const directory = filePathFromSegments(segments);
+  const directory = filePathFromApiSegments(segments);
   const allowedRoots = await getAllowedFileRoots();
   if (!isFilePathAllowed(directory, allowedRoots)) {
     return { response: NextResponse.json({ error: "Access denied" }, { status: 403 }) };
@@ -358,12 +350,23 @@ function streamFile(
   rangeHeader: string | null,
   asDownload = false,
 ): Response {
-  const headers = {
+  const headers: Record<string, string> = {
     ...Object.fromEntries(fileVersionHeaders(version)),
     "Content-Type": contentType,
     "Accept-Ranges": "bytes",
     "Content-Disposition": getContentDisposition(filePath, asDownload),
+    "X-Content-Type-Options": "nosniff",
   };
+  // SVG is the only preview type a browser executes as a document. A
+  // repo-controlled SVG navigated to directly (for example through a link in
+  // a transcript) would otherwise run script in the Pi Web origin, where it
+  // can call any /api route. These headers only affect document rendering;
+  // <img> preview embedding ignores them.
+  if (contentType === "image/svg+xml") {
+    headers["Content-Security-Policy"] =
+      "default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'";
+    headers["Referrer-Policy"] = "no-referrer";
+  }
 
   if (!rangeHeader) {
     return new Response(createFileBodyStream(filePath), {
@@ -481,7 +484,7 @@ export async function GET(
   const response = await timing.time("file-handler", async () => {
     try {
     const { path: segments } = await params;
-    const filePath = filePathFromSegments(segments);
+    const filePath = filePathFromApiSegments(segments);
     const rawType = request.nextUrl.searchParams.get("type") ?? "list";
     const type = parseFileRequestType(rawType);
     if (!type) {
@@ -537,6 +540,12 @@ export async function GET(
         if (notModified) return notModified;
         return streamFile(filePath, stat, version, audioMime, request.headers.get("range"));
       }
+      const videoMime = getVideoMime(filePath);
+      if (videoMime) {
+        const notModified = notModifiedResponse(request, version);
+        if (notModified) return notModified;
+        return streamFile(filePath, stat, version, videoMime, request.headers.get("range"));
+      }
       const documentMime = getDocumentMime(filePath);
       if (documentMime) {
         const notModified = notModifiedResponse(request, version);
@@ -562,7 +571,7 @@ export async function GET(
       }
       const notModified = notModifiedResponse(request, version);
       if (notModified) return notModified;
-      const mime = getImageMime(filePath) || getAudioMime(filePath) || getDocumentMime(filePath) || "application/octet-stream";
+      const mime = getImageMime(filePath) || getAudioMime(filePath) || getVideoMime(filePath) || getDocumentMime(filePath) || "application/octet-stream";
       return streamFile(filePath, stat, version, mime, request.headers.get("range"), true);
     }
 
@@ -574,11 +583,12 @@ export async function GET(
       if (notModified) return notModified;
       const imageMime = getImageMime(filePath);
       const audioMime = getAudioMime(filePath);
+      const videoMime = getVideoMime(filePath);
       const documentMime = getDocumentMime(filePath);
       return NextResponse.json({
         size: stat.size,
         language: getLanguage(filePath),
-        mime: imageMime || audioMime || documentMime || "text/plain",
+        mime: imageMime || audioMime || videoMime || documentMime || "text/plain",
         previewKind: documentPreviewKind(filePath),
         version,
       }, { headers: fileVersionHeaders(version) });

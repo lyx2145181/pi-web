@@ -16,11 +16,12 @@ import {
   isAudioPath,
   isDocumentPreviewPath,
   isImagePath,
+  isVideoPath,
 } from "@/lib/file-types";
 import { encodeFilePathForApi, getFileDirectory, getFileName, getRelativeFilePath } from "@/lib/file-paths";
-import { resolveLocalFileHref } from "@/lib/file-links";
+import { resolveLocalFileHref, shouldOpenLocalFileInApp } from "@/lib/file-links";
 import { parseFrontmatter } from "@/lib/frontmatter";
-import { markdownPreviewRehypePlugins, markdownPreviewRemarkPlugins, normalizeDisplayMath } from "@/lib/markdown";
+import { markdownPreviewRehypePlugins, markdownPreviewRemarkPlugins, markdownUrlTransform, normalizeDisplayMath } from "@/lib/markdown";
 import { CodeBlock, MermaidBlock } from "./MermaidBlock";
 import { FrontmatterCard } from "./FrontmatterCard";
 import { parseUnifiedPatch } from "@/lib/patch";
@@ -59,6 +60,7 @@ interface Props {
 
 type FileData = CachedTextFileData;
 
+const SOURCE_HIGHLIGHT_MAX_LINES = 1_000;
 const DISPLAY_MODE_LABELS: Record<DisplayMode, string> = {
   source: "Source",
   preview: "Preview",
@@ -252,6 +254,43 @@ const SourceFileContent = memo(function SourceFileContent({
   wrapLines: boolean;
 }) {
   const { isDark } = useTheme();
+  const sourceLines = useMemo(() => content.split("\n"), [content]);
+  if (sourceLines.length > SOURCE_HIGHLIGHT_MAX_LINES) {
+    return (
+      <div
+        className="file-source-view is-lightweight"
+        style={{
+          width: wrapLines ? "100%" : "max-content",
+          minWidth: "100%",
+          minHeight: "100%",
+          background: "var(--bg)",
+          ...FILE_CODE_STYLE,
+        }}
+      >
+        {sourceLines.map((line, lineIndex) => (
+          <span
+            className="file-source-line"
+            data-line-number={lineIndex + 1}
+            key={`source-line-${lineIndex}`}
+            style={{ display: "flex", minWidth: "100%" }}
+          >
+            <span aria-hidden="true" style={FILE_LINE_NUMBER_STYLE}>{lineIndex + 1}</span>
+            <span
+              className="file-source-line-content"
+              style={{
+                flex: "1 1 auto",
+                minWidth: 0,
+                overflowWrap: wrapLines ? "anywhere" : "normal",
+                whiteSpace: wrapLines ? "pre-wrap" : "pre",
+              }}
+            >
+              {line}
+            </span>
+          </span>
+        ))}
+      </div>
+    );
+  }
   return (
     <SyntaxHighlighter
       className={wrapLines ? "file-source-view is-wrapped" : "file-source-view"}
@@ -309,6 +348,7 @@ const MarkdownFilePreview = memo(function MarkdownFilePreview({
       <ReactMarkdown
         remarkPlugins={markdownPreviewRemarkPlugins}
         rehypePlugins={markdownPreviewRehypePlugins}
+        urlTransform={onOpenFile ? markdownUrlTransform : undefined}
         components={{
           code({ className, children, ...props }) {
             const lang = className?.replace("language-", "").toLowerCase() ?? "";
@@ -333,8 +373,7 @@ const MarkdownFilePreview = memo(function MarkdownFilePreview({
             if (!linkedFile || !onOpenFile) return <a href={href} {...props}>{children}</a>;
 
             const handleClick = (event: MouseEvent<HTMLAnchorElement>) => {
-              if (event.defaultPrevented || event.button !== 0) return;
-              if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+              if (!shouldOpenLocalFileInApp(event)) return;
               event.preventDefault();
               onOpenFile(linkedFile);
             };
@@ -851,6 +890,104 @@ function AudioViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Pr
   );
 }
 
+function VideoViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Props) {
+  const { t } = useI18n();
+  const { version, watching, watchError } = useWatchedFileVersion(
+    filePath,
+    sourceSessionId,
+    watchEnabled,
+  );
+  const [duration, setDuration] = useState<number | null>(null);
+  const [renderError, setRenderError] = useState<string | null>(null);
+  const ext = getFileName(filePath).toLowerCase().split(".").pop() ?? "";
+
+  useEffect(() => {
+    setDuration(null);
+    setRenderError(null);
+  }, [filePath, sourceSessionId, version?.etag]);
+
+  const src = version?.exists
+    ? getFileApiUrl(filePath, "read", sourceSessionId, { v: version.etag })
+    : null;
+  const error = renderError ?? watchError;
+  const size = version?.exists ? version.size : null;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+          padding: "4px 16px",
+          borderBottom: "1px solid var(--border)",
+          fontSize: 11,
+          color: "var(--text-dim)",
+          background: "var(--bg)",
+          flexShrink: 0,
+        }}
+      >
+        <span style={{ fontFamily: "var(--font-mono)" }} title={filePath}>
+          {getRelativeFilePath(filePath, cwd)}
+        </span>
+        <span style={{ marginLeft: "auto" }}>{ext || "video"}</span>
+        {duration != null && <span>{formatDuration(duration)}</span>}
+        {size != null && <span>{formatSize(size)}</span>}
+        <span
+          title={watching ? t("i18n.liveSync") : t("i18n.notWatching")}
+          style={{ display: "flex", alignItems: "center", gap: 4, color: watching ? "#4ade80" : "var(--text-dim)" }}
+        >
+          <span
+            style={{
+              width: 7,
+              height: 7,
+              borderRadius: "50%",
+              background: watching ? "#4ade80" : "var(--border)",
+              display: "inline-block",
+              boxShadow: watching ? "0 0 4px #4ade80" : "none",
+            }}
+          />
+          {watching ? "live" : "static"}
+        </span>
+        <DownloadLink filePath={filePath} sourceSessionId={sourceSessionId} />
+      </div>
+      <div
+        style={{
+          flex: 1,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          padding: 24,
+          background: "var(--bg-panel)",
+          minHeight: 0,
+        }}
+      >
+        <div style={{ width: "min(960px, 100%)", height: "100%", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", minHeight: 0 }}>
+          {error && (
+            <div style={{ color: "#f87171", fontSize: 13, marginBottom: 12, textAlign: "center" }}>
+              {error}
+            </div>
+          )}
+          {src ? (
+            <video
+              key={src}
+              controls
+              playsInline
+              preload="metadata"
+              src={src}
+              onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
+              onError={() => setRenderError("Failed to load video")}
+              style={{ maxWidth: "100%", maxHeight: "100%" }}
+            />
+          ) : !error ? (
+            <div style={{ color: "var(--text-muted)", fontSize: 13 }}>{t("i18n.loading")}</div>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function DocumentViewer({ filePath, cwd, sourceSessionId, watchEnabled = true }: Props) {
   const { t } = useI18n();
   const { version, watching, watchError } = useWatchedFileVersion(
@@ -948,6 +1085,9 @@ export function FileViewer({
   }
   if (isAudioPath(filePath)) {
     return <AudioViewer filePath={filePath} cwd={cwd} sourceSessionId={sourceSessionId} watchEnabled={watchEnabled} />;
+  }
+  if (isVideoPath(filePath)) {
+    return <VideoViewer filePath={filePath} cwd={cwd} sourceSessionId={sourceSessionId} watchEnabled={watchEnabled} />;
   }
   if (isDocumentPreviewPath(filePath)) {
     return <DocumentViewer filePath={filePath} cwd={cwd} sourceSessionId={sourceSessionId} watchEnabled={watchEnabled} />;
@@ -1311,14 +1451,27 @@ function TextFileViewer({
     }
   }, [requestedInitialDisplayMode, hasGitDiff, updateDisplayMode]);
 
+  const viewerContent = data?.content ?? "";
+  const sourceLines = useMemo(() => viewerContent.split("\n"), [viewerContent]);
+  const language = data?.language ?? "text";
+  const isHtml = language === "html";
+  const isMarkdown = language === "markdown";
+  const hasPreview = isHtml || isMarkdown;
+  const effectiveDisplayMode = isDeletedDiff ? "diff" : displayMode;
+
   useEffect(() => {
     const updateSelectedLineRange = () => {
       const root = contentRef.current;
-      setSelectedLineRange(
-        onMentionLines && displayMode === "source" && root
+      setSelectedLineRange((current) => {
+        const next = onMentionLines && displayMode === "source" && root
           ? getSelectedSourceLineRange(root, window.getSelection())
-          : null,
-      );
+          : null;
+        // Skip no-op updates: selectionchange fires continuously while dragging,
+        // and a fresh-but-equal range object would re-render the whole viewer.
+        if (current === null && next === null) return current;
+        if (current && next && current.startLine === next.startLine && current.endLine === next.endLine) return current;
+        return next;
+      });
     };
 
     updateSelectedLineRange();
@@ -1401,13 +1554,8 @@ function TextFileViewer({
 
   if (!data && !isDeletedDiff) return null;
 
-  const language = data?.language ?? "text";
-  const content = data?.content ?? "";
-  const isHtml = language === "html";
-  const isMarkdown = language === "markdown";
-  const hasPreview = isHtml || isMarkdown;
-  const lines = content.split("\n");
-  const effectiveDisplayMode = isDeletedDiff ? "diff" : displayMode;
+  const content = viewerContent;
+  const lines = sourceLines;
   const displayModes: DisplayMode[] = isDeletedDiff
     ? ["diff"]
     : [

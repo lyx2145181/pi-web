@@ -55,6 +55,8 @@ export function paginateSessionContext(
       ...context,
       messages: context.messages.slice(startIndex, endIndex),
       entryIds: context.entryIds.slice(startIndex, endIndex),
+      oldestEntryId: startIndex < endIndex ? context.entryIds[startIndex] ?? null : null,
+      hasMore: startIndex > 0,
     },
     page: {
       startIndex,

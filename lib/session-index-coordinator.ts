@@ -1,4 +1,4 @@
-import type { SessionIndexEntry } from "./session-index-core.mts";
+import { equalSessionFingerprint, type SessionIndexEntry } from "./session-index-core.mts";
 
 export interface SessionIndexRefreshResult {
   entries: Map<string, SessionIndexEntry>;
@@ -32,16 +32,19 @@ export class SessionIndexCoordinator {
   private freshRequired = false;
   private lastVerifiedAt = 0;
   private pendingFullRefresh = true;
+  private suppressChangeNotificationGeneration: number | null = null;
   private readonly pendingPaths = new Set<string>();
 
   constructor(
     private readonly refresh: RefreshOperation,
     private readonly persist: PersistOperation,
     private readonly refreshIntervalMs = 30_000,
+    private readonly onSnapshotChanged?: () => void,
   ) {}
 
-  invalidate(paths?: string[]): void {
+  invalidate(paths?: string[], changeAlreadyPublished = false): void {
     this.generation += 1;
+    this.suppressChangeNotificationGeneration = changeAlreadyPublished ? this.generation : null;
     this.freshRequired = true;
     this.verifiedSnapshot = null;
     if (!paths || paths.length === 0 || !this.snapshot) {
@@ -136,10 +139,24 @@ export class SessionIndexCoordinator {
         return entries;
       }
 
+      const previous = this.snapshot;
+      const changed = !previous || previous.size !== result.entries.size
+        || [...result.entries].some(([path, entry]) => {
+          const old = previous.get(path);
+          return !old || !equalSessionFingerprint(old.fingerprint, entry.fingerprint);
+        });
       this.snapshot = result.entries;
       this.verifiedSnapshot = result.entries;
       this.freshRequired = false;
       this.lastVerifiedAt = Date.now();
+      // Known writes publish their list version before refreshing this derived
+      // index. Do not publish the same change again when that refresh lands.
+      if (changed && this.suppressChangeNotificationGeneration !== generation) {
+        this.onSnapshotChanged?.();
+      }
+      if (this.suppressChangeNotificationGeneration === generation) {
+        this.suppressChangeNotificationGeneration = null;
+      }
       settleInitial(result.entries);
       this.enqueuePersistence(result.entries);
       return result.entries;

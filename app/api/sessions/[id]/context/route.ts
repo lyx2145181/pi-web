@@ -16,12 +16,13 @@ import {
 
 export async function GET(
   req: Request,
-  { params }: { params: Promise<{ id: string }> }
+  { params }: { params: Promise<{ id: string }> },
 ) {
   const timing = createServerTiming();
   const { id } = await params;
   const url = new URL(req.url);
-  const leafId = url.searchParams.get("leafId") ?? undefined;
+  // An explicit empty leaf selects the empty branch; absence uses the active leaf.
+  const requestedLeafId = url.searchParams.has("leafId") ? url.searchParams.get("leafId") || null : undefined;
   const deferThinking = url.searchParams.has("deferThinking");
   const deferToolResultImages = url.searchParams.has("deferMedia");
 
@@ -39,8 +40,10 @@ export async function GET(
     const diskSnapshot = liveRpc
       ? null
       : await timing.time("parse", () => getParsedSessionSnapshot(filePath!));
-    const entries = liveRpc?.inner.sessionManager.getEntries() ?? diskSnapshot!.entries;
-    const contextOptions = { deferThinking, deferToolResultImages };
+    const manager = liveRpc?.inner.sessionManager;
+    const entries = manager?.getEntries() ?? diskSnapshot!.entries;
+    const leafId = requestedLeafId !== undefined ? requestedLeafId : (manager ? manager.getLeafId() : diskSnapshot!.leafId);
+    const contextOptions = { deferThinking, deferToolResultImages, sessionId: id };
     const fullContext = timing.timeSync("context", () => diskSnapshot
       ? getSessionContextFromSnapshot(
           diskSnapshot,

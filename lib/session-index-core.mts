@@ -22,6 +22,12 @@ export interface IndexedSessionMetadata {
   messageCount: number;
   firstMessage: string;
   parentSessionPath?: string;
+  subagent?: {
+    parentSessionId: string;
+    profile: string;
+    description: string;
+    status: "completed" | "failed" | "aborted" | "interrupted";
+  };
 }
 
 export interface SessionIndexEntry {
@@ -108,6 +114,9 @@ export async function parseIndexedSessionMetadata(
     let messageCount = 0;
     let firstMessage = "";
     let lastActivityTime: number | undefined;
+    let sawSubagentMetadata = false;
+    let subagent: IndexedSessionMetadata["subagent"];
+    let subagentStatus: NonNullable<IndexedSessionMetadata["subagent"]>["status"] = "interrupted";
     const lines = createInterface({
       input: createReadStream(filePath, { encoding: "utf8" }),
       crlfDelay: Infinity,
@@ -123,6 +132,27 @@ export async function parseIndexedSessionMetadata(
       }
       if (entry.type === "session_info") {
         name = typeof entry.name === "string" ? entry.name.trim() || undefined : undefined;
+      }
+      // Project relation data while this changed file is already being read.
+      // Match readSubagentRun: first metadata entry, latest result, no runtime inference.
+      if (entry.type === "custom" && entry.customType === "pi-web:subagent" && !sawSubagentMetadata) {
+        sawSubagentMetadata = true;
+        const data = entry.data;
+        if (isRecord(data) && data.version === 1
+          && typeof data.parentSessionId === "string" && typeof data.parentSessionPath === "string") {
+          subagent = {
+            parentSessionId: data.parentSessionId,
+            profile: typeof data.profile === "string" ? data.profile : "general-purpose",
+            description: typeof data.description === "string" ? data.description : "Subagent",
+            status: "interrupted",
+          };
+        }
+      }
+      if (entry.type === "custom" && entry.customType === "pi-web:subagent-result") {
+        const data = entry.data;
+        subagentStatus = isRecord(data)
+          && (data.status === "completed" || data.status === "failed" || data.status === "aborted")
+          ? data.status : "interrupted";
       }
       if (entry.type !== "message") continue;
       messageCount += 1;
@@ -155,6 +185,7 @@ export async function parseIndexedSessionMetadata(
       modified: modified.toISOString(),
       messageCount,
       firstMessage: firstMessage || "(no messages)",
+      ...(subagent ? { subagent: { ...subagent, status: subagentStatus } } : {}),
       ...(typeof header.parentSession === "string"
         ? { parentSessionPath: header.parentSession }
         : {}),

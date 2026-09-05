@@ -16,7 +16,7 @@ import { normalizeToolCalls } from "@/lib/normalize";
 import { isPromptBusyError, isPromptRejectedError, sendAgentCommand } from "@/lib/agent-client";
 import { clearDraft, rekeyDraft, restoreDraftSubmission } from "@/lib/draft-store";
 import { getPreferredToolPreset, setPreferredToolPreset } from "@/lib/tool-preset-preference";
-import { getToolNamesForPreset, type ToolEntry, type ToolPreset } from "@/lib/tool-presets";
+import { getPresetFromToolNames, getToolNamesForPreset, type ToolEntry, type ToolPreset } from "@/lib/tool-presets";
 import type { SessionStatsInfo } from "@/lib/pi-types";
 import {
   INITIAL_SESSION_CONTEXT_MESSAGES,
@@ -24,6 +24,7 @@ import {
   type SessionContextPage,
   type SessionContextStats,
 } from "@/lib/session-context-page";
+import { mergeSessionStats, type SessionFileStats } from "@/lib/session-stats";
 import { userMessageKey } from "@/lib/prompt-recovery";
 import { AgentEventConnection } from "@/lib/agent-event-connection";
 import { getToolExecutionProgress } from "@/lib/tool-execution-progress";
@@ -44,13 +45,25 @@ export interface SessionData {
   totalActiveMs: number;
   tree: SessionTreeNode[];
   leafId: string | null;
+  toolNames?: string[];
   context: {
     messages: AgentMessage[];
     entryIds: string[];
+    oldestEntryId: string | null;
+    hasMore: boolean;
     thinkingLevel: string;
     model: { provider: string; modelId: string } | null;
   };
   contextPage?: SessionContextPage;
+  contextStats?: SessionContextStats;
+  inputHistory?: string[];
+  /** Cumulative usage over ALL session-file entries (incl. compacted history). */
+  stats?: SessionFileStats;
+}
+
+interface ContextPageResponse {
+  context: SessionData["context"];
+  page: SessionContextPage;
   contextStats?: SessionContextStats;
   inputHistory?: string[];
 }
@@ -155,10 +168,12 @@ export interface UseAgentSessionOptions {
   chatInputRef?: React.RefObject<ChatInputHandle | null>;
   onBranchDataChange?: (tree: SessionTreeNode[], activeLeafId: string | null, onLeafChange: (leafId: string | null) => void) => void;
   onSystemPromptChange?: (prompt: string | null) => void;
-  /** Registers an action that lazily starts the session and returns its system prompt. */
-  onSystemPromptLoaderChange?: (loader: (() => Promise<void>) | null) => void;
+  onSystemToolsChange?: (tools: ToolEntry[] | null) => void;
+  /** Registers an action that lazily starts the session and loads its prompt and tools. */
+  onSystemInfoLoaderChange?: (loader: (() => Promise<void>) | null) => void;
   onSessionStatsPanelOpen?: () => void;
   setToolPreset?: (preset: ToolPreset) => void;
+  deferInitialScroll?: boolean;
 }
 
 export type ThinkingLevelOption = "auto" | "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -171,6 +186,25 @@ const AGENT_STATE_RECONCILE_MS = 15_000;
 const BASH_STATE_RECONCILE_MS = 1_000;
 const EVENT_STREAM_READY_TIMEOUT_MS = 60_000;
 const EVENT_STREAM_RECONNECT_DELAY_MS = 1_000;
+const SESSION_STATE_SETTLE_DELAY_MS = 50;
+
+function waitForAbortableDelay(delayMs: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+// Retry temporary model-list failures without requiring a page refresh.
+const MODELS_RETRY_DELAYS_MS = [2_000, 5_000, 10_000];
 const MAX_NOTICES = 5;
 const NOTICE_VISIBLE_MS = 5000;
 const NOTICE_EXIT_ANIMATION_MS = 180;
@@ -276,7 +310,7 @@ type SlashCommandsResponse = {
 export function useAgentSession(opts: UseAgentSessionOptions) {
   const {
     session, sessionRunning, newSessionCwd, newSessionDraftKey, onAgentEnd, onAttentionNeeded, onSessionCreated, onSessionForked,
-    modelsRefreshKey, onBranchDataChange, onSystemPromptChange, onSystemPromptLoaderChange, onSessionStatsPanelOpen,
+    modelsRefreshKey, onBranchDataChange, onSystemPromptChange, onSystemToolsChange, onSystemInfoLoaderChange, onSessionStatsPanelOpen,
   } = opts;
 
   const isNew = session === null && newSessionCwd !== null;
@@ -341,14 +375,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const bashRunningRef = useRef(false);
   const bashRecoveryIdRef = useRef(0);
   const handleAgentEventRef = useRef<((event: AgentEvent) => void) | null>(null);
-  const initialScrollDoneRef = useRef(false);
+  const initialScrollDoneRef = useRef(Boolean(opts.deferInitialScroll));
   const lastUserMsgRef = useRef<HTMLDivElement | null>(null);
   const pendingScrollToUserRef = useRef(false);
   const isNearBottomRef = useRef(true);
   const previousScrollTopRef = useRef(0);
   const liveFollowFrameRef = useRef<number | null>(null);
   const executeBashRef = useRef<(command: string, excludeFromContext: boolean) => Promise<void> | undefined>(undefined);
-  const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const ensuringNewSessionRef = useRef<Promise<string | null> | null>(null);
   const newSessionPromotedRef = useRef(false);
@@ -396,16 +429,22 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }
 
   const setToolPresetState = opts.setToolPreset ?? setToolPreset;
+  const existingSessionId = session?.id;
 
   useLayoutEffect(() => {
-    if (!isNew || sessionIdRef.current) return;
+    if (!existingSessionId && (!isNew || sessionIdRef.current)) return;
     setToolPresetState(getPreferredToolPreset());
-  }, [isNew, setToolPresetState]);
+  }, [existingSessionId, isNew, setToolPresetState]);
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
     const container = scrollContainerRef.current;
-    messagesEndRef.current?.scrollIntoView({ behavior });
-    if (container) previousScrollTopRef.current = container.scrollTop;
+    if (!container) return;
+    // Scroll the chat container itself instead of scrolling a sentinel element
+    // into view: that propagates to every scrollable ancestor, and on mobile
+    // the keyboard-shifted document layer visibly jumps the whole app while
+    // streaming content follows the tail.
+    container.scrollTo({ top: container.scrollHeight, behavior });
+    previousScrollTopRef.current = container.scrollTop;
   }, []);
 
   const currentModel = currentModelOverride ?? data?.context.model ?? pendingModel ?? null;
@@ -447,61 +486,33 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
 
   const sessionStats = useMemo(() => {
     if (sessionStatsOverride) {
-      return { ...sessionStatsOverride, totalActiveMs: data?.totalActiveMs };
-    }
-    if (contextStats && contextPage?.hasEarlier) {
       return {
-        ...contextStats,
-        sessionFile: data?.filePath || undefined,
-        sessionId: sessionIdRef.current ?? session?.id ?? "",
-        sessionName: session?.name,
+        ...sessionStatsOverride,
         totalActiveMs: data?.totalActiveMs,
         ...(contextUsage ? { contextUsage } : {}),
-      } satisfies SessionStatsInfo;
+      };
     }
-    const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
-    let cost = 0;
-    let userMessages = 0;
-    let assistantMessages = 0;
-    let toolResults = 0;
-    let toolCalls = 0;
-    for (const msg of messages) {
-      if (msg.role === "user") userMessages += 1;
-      if (msg.role === "toolResult") toolResults += 1;
-      if (msg.role !== "assistant") continue;
-      assistantMessages += 1;
-      const u = (msg as import("@/lib/types").AssistantMessage).usage;
-      toolCalls += (msg as import("@/lib/types").AssistantMessage).content.filter((c) => c.type === "toolCall").length;
-      if (!u) continue;
-      tokens.input += u.input ?? 0;
-      tokens.output += u.output ?? 0;
-      tokens.cacheRead += u.cacheRead ?? 0;
-      tokens.cacheWrite += u.cacheWrite ?? 0;
-      cost += u.cost?.total ?? 0;
-    }
-    tokens.total = tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite;
-    if (tokens.total === 0 && messages.length === 0) return null;
+    const fileStats = data?.stats ?? contextStats ?? undefined;
+    const stats = mergeSessionStats(fileStats, data?.context.messages ?? [], messages);
+    if (stats.tokens.total === 0 && messages.length === 0 && !fileStats) return null;
     return {
       sessionFile: data?.filePath || undefined,
       sessionId: sessionIdRef.current ?? session?.id ?? "",
       sessionName: session?.name,
-      userMessages,
-      assistantMessages,
-      toolCalls,
-      toolResults,
-      totalMessages: messages.length,
-      tokens,
-      cost,
+      ...stats,
       totalActiveMs: data?.totalActiveMs,
       ...(contextUsage ? { contextUsage } : {}),
     } satisfies SessionStatsInfo;
-  }, [messages, sessionStatsOverride, contextStats, contextPage?.hasEarlier, contextUsage, data?.filePath, data?.totalActiveMs, session?.id, session?.name]);
+  }, [messages, sessionStatsOverride, contextStats, contextUsage, data?.context.messages, data?.filePath, data?.totalActiveMs, data?.stats, session?.id, session?.name]);
 
   const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false) => {
     if (sessionIdRef.current !== sid) return null;
     const generation = sessionLoadGenerationRef.current + 1;
     sessionLoadGenerationRef.current = generation;
     sessionLoadControllerRef.current?.abort();
+    contextLoadGenerationRef.current += 1;
+    contextLoadControllerRef.current?.abort();
+    contextLoadControllerRef.current = null;
     historyLoadGenerationRef.current += 1;
     historyLoadControllerRef.current?.abort();
     historyLoadControllerRef.current = null;
@@ -533,6 +544,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           setActiveLeafId(null);
           setMessages([]);
           setEntryIds([]);
+          contextPageRef.current = null;
+          activeLeafIdRef.current = null;
           setContextPage(null);
           setContextStats(null);
           setServerInputHistory(null);
@@ -548,9 +561,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setActiveLeafId(d.leafId);
       setMessages(persistedMessages);
       setEntryIds(d.context.entryIds ?? []);
+      contextPageRef.current = d.contextPage ?? null;
+      activeLeafIdRef.current = d.leafId;
       setContextPage(d.contextPage ?? null);
       setContextStats(d.contextStats ?? null);
       setServerInputHistory(d.inputHistory ?? null);
+      setToolPresetState(d.toolNames !== undefined ? getPresetFromToolNames(d.toolNames) : "default");
       setCurrentModelOverride((current) => modelSwitchPendingRef.current ? current : null);
       setError(null);
       if (d.context.thinkingLevel && d.context.thinkingLevel !== "off") {
@@ -562,6 +578,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (!includeState) return null;
 
       try {
+        // Let rapid navigation cancel stale selections before they start
+        // secondary runtime/resource reconciliation.
+        await waitForAbortableDelay(SESSION_STATE_SETTLE_DELAY_MS, controller.signal);
+        if (!isCurrent()) return null;
         const stateRes = await fetch(`/api/sessions/${encodeURIComponent(sid)}/state`, {
           signal: controller.signal,
         });
@@ -594,10 +614,13 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       }
       if (showLoading && !messagesLoaded && isCurrent()) setLoading(false);
     }
-  }, []);
+  }, [setToolPresetState]);
 
   const loadContext = useCallback(async (sid: string, leafId: string | null) => {
     if (sessionIdRef.current !== sid) return;
+    sessionLoadGenerationRef.current += 1;
+    sessionLoadControllerRef.current?.abort();
+    sessionLoadControllerRef.current = null;
     const generation = contextLoadGenerationRef.current + 1;
     contextLoadGenerationRef.current = generation;
     contextLoadControllerRef.current?.abort();
@@ -614,26 +637,30 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         deferMedia: "1",
         tail: String(INITIAL_SESSION_CONTEXT_MESSAGES),
       });
-      if (leafId) params.set("leafId", leafId);
+      params.set("leafId", leafId ?? "");
+
       const url = `/api/sessions/${encodeURIComponent(sid)}/context?${params}`;
       const res = await fetch(url, { signal: controller.signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const d = await res.json() as {
-        context: { messages: AgentMessage[]; entryIds: string[] };
-        page?: SessionContextPage;
-        contextStats?: SessionContextStats;
-        inputHistory?: string[];
-      };
+      const d = await res.json() as ContextPageResponse;
       if (
         controller.signal.aborted
         || sessionIdRef.current !== sid
         || contextLoadGenerationRef.current !== generation
+        || !sessionHookMountedRef.current
       ) return;
+      activeLeafIdRef.current = leafId;
+      contextPageRef.current = d.page;
+      setActiveLeafId(leafId);
       setMessages(d.context.messages);
       setEntryIds(d.context.entryIds ?? []);
-      setContextPage(d.page ?? null);
+      setContextPage(d.page);
       setContextStats(d.contextStats ?? null);
       setServerInputHistory(d.inputHistory ?? null);
+      setData((previous) => previous?.sessionId === sid
+        ? { ...previous, context: d.context, contextPage: d.page, contextStats: d.contextStats, inputHistory: d.inputHistory }
+        : previous);
+      return d;
     } catch (e) {
       if (!controller.signal.aborted) console.error("Failed to load context:", e);
     } finally {
@@ -643,10 +670,11 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, []);
 
-  const loadEarlierMessages = useCallback(async (): Promise<number> => {
+  const loadEarlierMessages = useCallback(async (options?: { signal?: AbortSignal }): Promise<ContextPageResponse | null> => {
     const sid = sessionIdRef.current;
     const page = contextPageRef.current;
-    if (!sid || !page?.hasEarlier || historyLoadPendingRef.current) return 0;
+    if (historyLoadControllerRef.current?.signal.aborted) historyLoadPendingRef.current = false;
+    if (!sid || !page?.hasEarlier || historyLoadPendingRef.current || options?.signal?.aborted) return null;
 
     const requestedBefore = page.startIndex;
     const requestedLeafId = activeLeafIdRef.current;
@@ -657,6 +685,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     historyLoadControllerRef.current = controller;
     historyLoadPendingRef.current = true;
     setLoadingEarlierMessages(true);
+    const abort = () => controller.abort();
+    options?.signal?.addEventListener("abort", abort, { once: true });
     try {
       const params = new URLSearchParams({
         deferThinking: "1",
@@ -670,12 +700,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         { signal: controller.signal },
       );
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const result = await response.json() as {
-        context: { messages: AgentMessage[]; entryIds: string[] };
-        page: SessionContextPage;
-        contextStats?: SessionContextStats;
-        inputHistory?: string[];
-      };
+      const result = await response.json() as ContextPageResponse;
       if (
         controller.signal.aborted
         || sessionIdRef.current !== sid
@@ -683,18 +708,38 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         || historyLoadGenerationRef.current !== generation
         || contextPageRef.current?.startIndex !== requestedBefore
         || result.page.endIndex !== requestedBefore
-      ) return 0;
+        || result.page.startIndex >= requestedBefore
+        || result.context.messages.length !== result.context.entryIds.length
+        || !sessionHookMountedRef.current
+      ) return null;
 
+      const combinedPage = { ...result.page, endIndex: page.endIndex };
+      contextPageRef.current = combinedPage;
       setMessages((current) => [...result.context.messages, ...current]);
-      setEntryIds((current) => [...(result.context.entryIds ?? []), ...current]);
-      setContextPage(result.page);
+      setEntryIds((current) => [...result.context.entryIds, ...current]);
+      setContextPage(combinedPage);
       setContextStats(result.contextStats ?? null);
       setServerInputHistory(result.inputHistory ?? null);
-      return result.context.messages.length;
+      // Prepending old history changes both sides of the usage delta equally.
+      setData((previous) => previous?.sessionId === sid ? {
+        ...previous,
+        context: {
+          ...previous.context,
+          messages: [...result.context.messages, ...previous.context.messages],
+          entryIds: [...result.context.entryIds, ...previous.context.entryIds],
+          oldestEntryId: result.context.oldestEntryId,
+          hasMore: result.context.hasMore,
+        },
+        contextPage: combinedPage,
+        contextStats: result.contextStats,
+        inputHistory: result.inputHistory,
+      } : previous);
+      return result;
     } catch (error) {
       if (!controller.signal.aborted) console.error("Failed to load earlier messages:", error);
-      return 0;
+      return null;
     } finally {
+      options?.signal?.removeEventListener("abort", abort);
       if (historyLoadControllerRef.current === controller) {
         historyLoadControllerRef.current = null;
         historyLoadPendingRef.current = false;
@@ -706,14 +751,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const loadTools = useCallback(async (sid: string) => {
     try {
       const tools = await sendAgentCommand<ToolEntry[]>(sid, { type: "get_tools" });
-      if (tools) {
-        const { getPresetFromTools } = await import("@/lib/tool-presets");
-        setToolPresetState(getPresetFromTools(tools));
-      }
+      if (!tools || !sessionHookMountedRef.current || sessionIdRef.current !== sid) return null;
+      const { getPresetFromTools } = await import("@/lib/tool-presets");
+      setToolPresetState(getPresetFromTools(tools));
+      onSystemToolsChange?.(tools);
+      return tools;
     } catch (e) {
       console.error("Failed to load tools:", e);
+      return null;
     }
-  }, [setToolPresetState]);
+  }, [onSystemToolsChange, setToolPresetState]);
 
   const promoteNewSession = useCallback((messageCount = 0, firstMessage = "(no messages)") => {
     const sid = sessionIdRef.current;
@@ -794,17 +841,20 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
   }, [isNew, newSessionCwd, toolPreset]);
 
-  // Opening the System panel is also allowed to initialize an otherwise dormant
+  // Opening the System or Tools panel may initialize an otherwise dormant
   // session. This is deliberately a non-prompt command: it creates no message
   // or model run, but lets users inspect the exact prompt before sending one.
-  const loadSystemPrompt = useCallback(async () => {
+  const loadSystemInfo = useCallback(async () => {
     const sid = sessionIdRef.current ?? await ensureNewSession();
     if (!sid) return;
 
-    const state = await sendAgentCommand<AgentStateResponse>(sid, { type: "get_state" });
+    const [state] = await Promise.all([
+      sendAgentCommand<AgentStateResponse>(sid, { type: "get_state" }),
+      loadTools(sid),
+    ]);
     if (!sessionHookMountedRef.current || sessionIdRef.current !== sid) return;
     setSystemPrompt(state.systemPrompt ?? "");
-  }, [ensureNewSession]);
+  }, [ensureNewSession, loadTools]);
 
   const loadSlashCommands = useCallback(async () => {
     const sid = sessionIdRef.current ?? await ensureNewSession();
@@ -1411,6 +1461,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       case "extension_ui_request":
         handleExtensionUiRequest(event as ExtensionUiRequest);
         break;
+      case "extension_ui_closed":
+        setExtensionDialog((current) => current?.id === event.id ? null : current);
+        break;
     }
   }, [addNotice, cancelEventStreamGrace, handleExtensionUiRequest, loadSession, notifyPromptStage, onAgentEnd, scheduleEventStreamClose, scrollToBottom, settleUiStage]);
   handleAgentEventRef.current = handleAgentEvent;
@@ -1709,9 +1762,30 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const loadModels = useCallback(async (signal?: AbortSignal) => {
     const modelCwd = newSessionCwd ?? session?.cwd ?? "";
     const modelsUrl = modelCwd ? `/api/models?cwd=${encodeURIComponent(modelCwd)}` : "/api/models";
-    const res = await fetch(modelsUrl, signal ? { signal } : undefined);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const d = await res.json() as ModelsResponse;
+    let d: ModelsResponse;
+    try {
+      const res = await fetch(modelsUrl, signal ? { signal } : undefined);
+      if (!res.ok) {
+        let detail = "";
+        try {
+          const body: unknown = await res.json();
+          if (body && typeof body === "object" && "error" in body && typeof body.error === "string") {
+            detail = body.error;
+          }
+        } catch (e) {
+          if (e instanceof DOMException && e.name === "AbortError") throw e;
+          // Non-JSON error responses fall back to the HTTP status.
+        }
+        throw new Error(detail || `Failed to load models (HTTP ${res.status})`);
+      }
+      d = await res.json() as ModelsResponse;
+      signal?.throwIfAborted();
+    } catch (e) {
+      if (!signal?.aborted && !(e instanceof DOMException && e.name === "AbortError")) {
+        setModelError(e instanceof Error ? e.message : String(e));
+      }
+      throw e;
+    }
     setModelNames(d.models);
     setModelError(d.modelError ?? null);
     setModelScopeWarnings(d.modelScopeWarnings ?? []);
@@ -1720,10 +1794,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const nextModelList = d.modelList ?? [];
     setModelList(nextModelList);
     if (isNew && !sessionIdRef.current) {
-      const match = d.defaultModel
+      // The first listed model is not necessarily the runtime's automatic choice.
+      const displayModel = d.defaultModel
         ? nextModelList.find((m) => m.id === d.defaultModel?.modelId && m.provider === d.defaultModel?.provider)
         : undefined;
-      const displayModel = match ?? nextModelList[0];
       setNewSessionDefaultModel(displayModel ? { provider: displayModel.provider, modelId: displayModel.id } : null);
       // An `enabledModels` pattern may pin a thinking level (`anthropic/*:high`).
       // Like pi, apply it to the model a new session starts with.
@@ -1807,6 +1881,23 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           return complete({ handled: true, message: "Copied last assistant message" });
         }
 
+        case "clone": {
+          if (!sid) return complete({ handled: true, error: "No active session to clone" });
+          if (agentRunningRef.current || bashRunningRef.current) {
+            return complete({ handled: true, error: "Cannot clone while the session is running" });
+          }
+          const result = await sendAgentCommand<{ cancelled?: boolean; newSessionId?: string }>(sid, {
+            type: "clone",
+            leafId: activeLeafId,
+          });
+          if (result?.cancelled || !result?.newSessionId) {
+            return complete({ handled: true, error: "Cannot clone an empty or unsaved session" });
+          }
+          const completed = complete({ handled: true, message: "Cloned current session branch" });
+          onSessionForked?.(result.newSessionId);
+          return completed;
+        }
+
         default:
           return { handled: false };
       }
@@ -1815,7 +1906,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } finally {
       if (commandName === "compact") setIsCompacting(false);
     }
-  }, [addNotice, ensureNewSession, isCompacting, loadModels, loadSession, loadSlashCommands, loadTools, promoteNewSession, onSessionStatsPanelOpen]);
+  }, [activeLeafId, addNotice, ensureNewSession, isCompacting, loadModels, loadSession, loadSlashCommands, loadTools, promoteNewSession, onSessionForked, onSessionStatsPanelOpen]);
 
   // Let AgentSession.prompt decide atomically whether to queue against the
   // current run or start a new turn if it settled while the request was in
@@ -1919,11 +2010,48 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     const sid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
     if (!sid) return;
     try {
-      await sendAgentCommand(sid, { type: "set_tools", toolNames });
+      const result = await sendAgentCommand<{ sessionId?: string; recreated?: boolean }>(sid, { type: "set_tools", toolNames });
+      const activeSessionId = result?.sessionId ?? sid;
+      if (activeSessionId !== sid) {
+        cancelEventStreamGrace();
+        closeEvents();
+        sessionIdRef.current = activeSessionId;
+      }
+      setSlashCommands([]);
+      setExtensionStatuses([]);
+      setExtensionWidgets([]);
+      const [state] = await Promise.all([
+        sendAgentCommand<AgentStateResponse>(activeSessionId, { type: "get_state" }),
+        loadTools(activeSessionId),
+      ]);
+      if (sessionHookMountedRef.current && sessionIdRef.current === activeSessionId) {
+        setSystemPrompt(state.systemPrompt ?? "");
+      }
     } catch (e) {
       console.error("Failed to set tools:", e);
     }
-  }, [setToolPresetState]);
+  }, [cancelEventStreamGrace, closeEvents, loadTools, setToolPresetState]);
+
+  const scrollToMessage = useCallback((element: HTMLElement, viewportOffset = 16) => {
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    if (liveFollowFrameRef.current !== null) {
+      cancelAnimationFrame(liveFollowFrameRef.current);
+      liveFollowFrameRef.current = null;
+    }
+    initialScrollDoneRef.current = true;
+    pendingScrollToUserRef.current = false;
+    isNearBottomRef.current = false;
+    setPromptAnchorActive(false);
+    container.scrollTo({
+      top: element.getBoundingClientRect().top
+        - container.getBoundingClientRect().top
+        + container.scrollTop
+        - viewportOffset,
+      behavior: "instant",
+    });
+    previousScrollTopRef.current = container.scrollTop;
+  }, []);
 
   const scrollUserMsgToTop = useCallback(() => {
     const container = scrollContainerRef.current;
@@ -2030,7 +2158,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     rpcPromptPendingRef.current = false;
     bashRunningRef.current = false;
     bashRecoveryIdRef.current += 1;
-    initialScrollDoneRef.current = false;
+    initialScrollDoneRef.current = Boolean(opts.deferInitialScroll);
+    contextPageRef.current = null;
+    activeLeafIdRef.current = null;
     pendingScrollToUserRef.current = false;
     setData(null);
     setActiveLeafId(null);
@@ -2111,9 +2241,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [systemPrompt, onSystemPromptChange]);
 
   useEffect(() => {
-    onSystemPromptLoaderChange?.(loadSystemPrompt);
-    return () => onSystemPromptLoaderChange?.(null);
-  }, [loadSystemPrompt, onSystemPromptLoaderChange]);
+    onSystemInfoLoaderChange?.(loadSystemInfo);
+    return () => onSystemInfoLoaderChange?.(null);
+  }, [loadSystemInfo, onSystemInfoLoaderChange]);
 
   useEffect(() => {
     if (!onBranchDataChange) return;
@@ -2135,6 +2265,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   }, [agentRunning]);
 
   useLayoutEffect(() => {
+    if (opts.deferInitialScroll) return;
     if (messages.length > 0) {
       if (pendingScrollToUserRef.current) {
         pendingScrollToUserRef.current = false;
@@ -2147,14 +2278,25 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         scrollToBottom("auto");
       }
     }
-  }, [messages.length, agentRunning, scrollToBottom, scrollUserMsgToTop]);
+  }, [messages.length, agentRunning, opts.deferInitialScroll, scrollToBottom, scrollUserMsgToTop]);
 
-  // Load model list
+  // Load the model list with bounded retries; loadModels exposes each failure.
   useEffect(() => {
     const controller = new AbortController();
-    loadModels(controller.signal).catch((e) => {
-      if (e instanceof DOMException && e.name === "AbortError") return;
-    });
+    (async () => {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          await loadModels(controller.signal);
+          return;
+        } catch (e) {
+          if (controller.signal.aborted) return;
+          if (e instanceof DOMException && e.name === "AbortError") return;
+          if (attempt >= MODELS_RETRY_DELAYS_MS.length) return;
+          await delay(MODELS_RETRY_DELAYS_MS[attempt]);
+          if (controller.signal.aborted) return;
+        }
+      }
+    })();
     return () => controller.abort();
   }, [loadModels, modelsRefreshKey]);
 
@@ -2164,8 +2306,18 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     return () => clearTimeout(t);
   }, [compactResult]);
 
+  // Pause notice expiry while hovered or focused.
+  // The remainingMs/startedAt/oldestId refs implement a true pause-and-resume instead of resetting the 5s timer.
+  const [pausedNoticeId, setPausedNoticeId] = useState<string | null>(null);
+  const noticeRemainingMsRef = useRef(NOTICE_VISIBLE_MS);
+  const noticeTimerStartedAtRef = useRef<number | null>(null);
+  const noticeOldestIdRef = useRef<string | null>(null);
+
   useEffect(() => {
-    if (noticeState.visible.length === 0) return;
+    if (noticeState.visible.length === 0) {
+      noticeOldestIdRef.current = null;
+      return;
+    }
     const exiting = noticeState.visible.find((notice) => notice.exiting);
     if (exiting) {
       const t = setTimeout(() => {
@@ -2175,11 +2327,28 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     }
     const oldest = noticeState.visible[0];
     if (!oldest) return;
+    // Oldest visible notice changed; restart the countdown
+    if (noticeOldestIdRef.current !== oldest.id) {
+      noticeOldestIdRef.current = oldest.id;
+      noticeRemainingMsRef.current = NOTICE_VISIBLE_MS;
+    }
+    if (noticeState.visible.some((notice) => notice.id === pausedNoticeId)) return;
+    noticeTimerStartedAtRef.current = Date.now();
     const t = setTimeout(() => {
       dispatchNotice({ type: "mark_oldest_exiting" });
-    }, NOTICE_VISIBLE_MS);
-    return () => clearTimeout(t);
-  }, [noticeState.visible]);
+    }, noticeRemainingMsRef.current);
+    return () => {
+      clearTimeout(t);
+      // Accrue the elapsed time so the countdown resumes from the remaining time
+      if (noticeTimerStartedAtRef.current !== null) {
+        noticeRemainingMsRef.current = Math.max(
+          0,
+          noticeRemainingMsRef.current - (Date.now() - noticeTimerStartedAtRef.current),
+        );
+        noticeTimerStartedAtRef.current = null;
+      }
+    };
+  }, [noticeState.visible, pausedNoticeId]);
 
   useEffect(() => {
     setSessionStatsOverride(null);
@@ -2208,15 +2377,16 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     isNew,
     promptAnchorActive,
     // Refs
-    sessionIdRef, messagesEndRef, scrollContainerRef,
+    sessionIdRef, scrollContainerRef,
     lastUserMsgRef, pendingScrollToUserRef, initialScrollDoneRef,
     // Actions
     handleSend, handleAbort, handleFork, handleNavigate, handleModelChange,
     handleCompact, handleSteer, handleFollowUp, handlePromptWithStreamingBehavior, handleAbortCompaction,
     handleRecallQueue,
     handleBuiltinSlashCommand,
-    handleToolPresetChange, handleThinkingLevelChange, loadTools, loadSlashCommands, loadEarlierMessages, setActiveLeafId, setData, setMessages,
-    scrollToBottom, scrollUserMsgToTop,
+    setNoticePaused: setPausedNoticeId,
+    handleToolPresetChange, handleThinkingLevelChange, loadTools, loadSlashCommands, loadEarlierMessages, setActiveLeafId, setData, setMessages, loadContext,
+    scrollToBottom, scrollUserMsgToTop, scrollToMessage,
     dispatch, setAgentRunning, setForkingEntryId,
     bashRunning, pendingBash,
     // Subscriptions

@@ -55,7 +55,12 @@ function validMetadata(value: unknown): value is IndexedSessionMetadata {
     && Number.isSafeInteger(value.messageCount)
     && value.messageCount >= 0
     && typeof value.firstMessage === "string"
-    && (value.parentSessionPath === undefined || typeof value.parentSessionPath === "string");
+    && (value.parentSessionPath === undefined || typeof value.parentSessionPath === "string")
+    && (value.subagent === undefined || (isRecord(value.subagent)
+      && typeof value.subagent.parentSessionId === "string"
+      && typeof value.subagent.profile === "string"
+      && typeof value.subagent.description === "string"
+      && ["completed", "failed", "aborted", "interrupted"].includes(value.subagent.status as string)));
 }
 
 function validEntry(value: unknown): value is SessionIndexEntry {

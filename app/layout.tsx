@@ -3,6 +3,7 @@ import { Geist, Geist_Mono, Noto_Sans_SC } from "next/font/google";
 import { PwaRegistration } from "@/components/PwaRegistration";
 import "katex/dist/katex.min.css";
 import "./globals.css";
+import "./settings.css";
 
 const geistSans = Geist({
   subsets: ["latin"],

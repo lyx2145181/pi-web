@@ -2,6 +2,7 @@ import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { stat } from "node:fs/promises";
 import { normalize } from "node:path";
 import { projectTreeForResponse } from "./project-tree";
+import { computeSessionStats, type SessionFileStats } from "./session-stats";
 import type { SessionContext, SessionEntry, SessionHeader, SessionTreeNode } from "./types";
 
 interface SessionFingerprint {
@@ -21,6 +22,7 @@ export interface ParsedSessionSnapshot {
   leafId: string | null;
   sessionName?: string;
   tree: SessionTreeNode[];
+  stats: SessionFileStats;
 }
 
 interface CacheEntry {
@@ -124,8 +126,10 @@ async function parseStableSession(filePath: string): Promise<ParsedSessionSnapsh
   let before = await fingerprint(filePath);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const manager = SessionManager.open(filePath);
+    const entries = manager.getEntries() as unknown as SessionEntry[];
     const snapshot: ParsedSessionSnapshot = {
-      entries: manager.getEntries() as unknown as SessionEntry[],
+      entries,
+      stats: computeSessionStats(entries),
       filePath: manager.getSessionFile() || filePath,
       fingerprint: "",
       header: manager.getHeader() as SessionHeader | null,
@@ -164,16 +168,18 @@ export async function getParsedSessionSnapshot(filePath: string): Promise<Parsed
 
 export function getSessionContextFromSnapshot(
   snapshot: ParsedSessionSnapshot,
-  leafId: string | undefined,
-  options: { deferThinking: boolean; deferToolResultImages: boolean },
+  leafId: string | null | undefined,
+  options: { deferThinking: boolean; deferToolResultImages: boolean; sessionId?: string },
   build: () => SessionContext,
 ): SessionContext {
   const key = [
     normalize(snapshot.filePath),
     snapshot.fingerprint,
-    leafId ?? "",
+    "history-v2",
+    JSON.stringify(leafId === undefined ? { defaultLeaf: true } : leafId),
     options.deferThinking ? "1" : "0",
     options.deferToolResultImages ? "1" : "0",
+    options.sessionId ?? "",
   ].join("\0");
   const cache = state();
   const existing = cache.contextEntries.get(key);
