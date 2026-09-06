@@ -242,6 +242,7 @@ Newer pi emits `compaction_start` / `compaction_end`; older versions emitted `au
 - Order preferences live in the private Pi Web preference file under the agent directory, not in session `.jsonl` files or the derived session index. Pinning must never change session activity timestamps.
 
 ### Session-list refresh, index, and request ordering
+- Successful `/api/sessions` responses larger than 1 KiB use gzip level 6 when the client accepts it. Keep the uncompressed negotiation path and `Vary: Accept-Encoding`; do not apply this route-specific compression to errors, SSE, or already-compressed content.
 - The sidebar's initial list effect is idempotent under React Strict Effects. Lifecycle refreshes and background completion discovery use the normal cached endpoint; only explicit user refresh uses `force=1`.
 - `listAllSessions({ force: true })` coalesces concurrent callers into one refresh that remains pending across generation invalidation retries. Browser list, file-tree, Git, Worktrees, and workspace-restore requests abort predecessors and guard against stale responses. Workspace restore resolves its remembered id through `/api/sessions/[id]/meta`, not a full session-list response; the meta route waits for a current-process verified index snapshot before confirming presence.
 - Session list metadata is a derived, versioned index under the agent cache directory. A worker enumerates SDK-compatible session paths and reparses only files whose size/nanosecond times/device/inode fingerprint changed; session details and context remain SDK-authoritative.
