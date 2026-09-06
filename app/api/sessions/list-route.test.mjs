@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after } from "node:test";
+import { gunzipSync } from "node:zlib";
 import { createJiti } from "jiti";
 
 // Isolate the runtime registry so this read-only route test never creates a real agent.
@@ -63,10 +64,33 @@ test("列表请求只加载一次，保留计时、版本和通知字段", async
   assert.equal(state.calls[0].force, true);
   assert.match(response.headers.get("Server-Timing"), /session-scan;dur=/);
   assert.equal(response.headers.get("Cache-Control"), "no-store");
+  assert.equal(response.headers.get("Vary"), "Accept-Encoding");
   assert.deepEqual(await response.json(), {
     sessions: [], sessionListVersion: 7,
     runningSessionIds: ["running"], completionNotificationSuppressedSessionIds: ["child"],
   });
+});
+
+test("客户端支持 gzip 时压缩大响应并保持 JSON 内容一致", async () => {
+  const state = setup();
+  state.load = async () => [{ id: "large", name: "x".repeat(4096) }];
+  state.merge = disk => disk;
+
+  const compressed = await GET(new Request("http://localhost/api/sessions", {
+    headers: { "Accept-Encoding": "br, gzip" },
+  }));
+  assert.equal(compressed.status, 200);
+  assert.equal(compressed.headers.get("Content-Encoding"), "gzip");
+  assert.equal(compressed.headers.get("Vary"), "Accept-Encoding");
+  assert.match(compressed.headers.get("Server-Timing"), /compress;dur=/);
+  const decoded = JSON.parse(gunzipSync(Buffer.from(await compressed.arrayBuffer())).toString("utf8"));
+  assert.equal(decoded.sessions[0].name.length, 4096);
+
+  const uncompressed = await GET(new Request("http://localhost/api/sessions", {
+    headers: { "Accept-Encoding": "gzip;q=0, *;q=1" },
+  }));
+  assert.equal(uncompressed.headers.get("Content-Encoding"), null);
+  assert.equal((await uncompressed.json()).sessions[0].name.length, 4096);
 });
 
 test("扫描期间发生变化时不把旧结果标记成新版本", async () => {
