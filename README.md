@@ -153,7 +153,7 @@ npm install
 npm run dev
 ```
 
-The development server runs at [http://127.0.0.1:30141](http://127.0.0.1:30141). Run the common checks with:
+The development server listens on all interfaces at port `30141`; open [http://127.0.0.1:30141](http://127.0.0.1:30141) locally or use the host's LAN IP from another device. Use `npm run dev:local` to restrict it to loopback. Run the common checks with:
 
 ```bash
 npm test

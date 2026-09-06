@@ -3,7 +3,7 @@
 ## Quick Start
 
 ```bash
-npm run dev   # port 30141
+npm run dev   # port 30141, listens on 0.0.0.0; use npm run dev:local for loopback only
 ```
 
 - Typecheck: `node_modules/.bin/tsc --noEmit`
