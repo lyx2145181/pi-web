@@ -5,6 +5,7 @@ import { randomUUID } from "crypto";
 import { allowFileRoot } from "@/lib/file-access";
 import { invalidateSessionListCache } from "@/lib/session-reader";
 import { startRpcSession } from "@/lib/rpc-manager";
+import { validateToolActivationPolicy } from "@/lib/tool-activation";
 
 const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
@@ -45,11 +46,19 @@ export async function POST(req: Request) {
     }
 
     // Use a one-time key so startRpcSession's lock doesn't conflict with real session ids
-    const { provider, modelId, toolNames, thinkingLevel, ...promptCommand } = command as { provider?: string; modelId?: string; toolNames?: string[]; thinkingLevel?: unknown; [key: string]: unknown };
+    const { provider, modelId, toolNames, toolPolicy, thinkingLevel, ...promptCommand } = command as {
+      provider?: string;
+      modelId?: string;
+      toolNames?: string[];
+      toolPolicy?: unknown;
+      thinkingLevel?: unknown;
+      [key: string]: unknown;
+    };
     if ((provider && !modelId) || (!provider && modelId)) {
       throw new Error("provider and modelId must be provided together");
     }
     const explicitThinkingLevel = parseThinkingLevel(thinkingLevel);
+    const explicitToolPolicy = validateToolActivationPolicy(toolPolicy);
 
     // Must be unique per request: startRpcSession coalesces concurrent callers
     // that share a key onto one session. Date.now() (ms resolution) collides for
@@ -57,6 +66,7 @@ export async function POST(req: Request) {
     const tempKey = `__new__${randomUUID()}`;
     const { session, realSessionId } = await startRpcSession(tempKey, "", cwd, {
       ...(toolNames ? { toolNames } : {}),
+      ...(toolPolicy !== undefined ? { toolPolicy: explicitToolPolicy } : {}),
       ...(provider && modelId ? { initialModel: { provider, modelId } } : {}),
       ...(explicitThinkingLevel ? { thinkingLevel: explicitThinkingLevel } : {}),
     });

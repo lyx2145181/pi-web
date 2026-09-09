@@ -90,8 +90,10 @@ export async function GET(
     const inputHistory = computeSessionInputHistory(fullContext);
 
     const stats = diskSnapshot?.stats ?? computeSessionStats(entries as unknown as SessionEntry[]);
-    const toolNames = readSubagentSessionResources(entries as never)?.tools
-      ?? readSessionToolSelection(entries as never);
+    const subagentResources = readSubagentSessionResources(entries as never);
+    const toolSelection = subagentResources
+      ? { mode: "exact" as const, tools: subagentResources.tools }
+      : readSessionToolSelection(entries as never);
     const info = await timing.time("metadata", async () => {
       const header = sm?.getHeader() ?? diskSnapshot?.header ?? null;
       if (!header) return null;
@@ -138,7 +140,9 @@ export async function GET(
       inputHistory,
       stats,
       totalActiveMs,
-      ...(toolNames !== undefined ? { toolNames } : {}),
+      ...(toolSelection !== undefined
+        ? { toolNames: toolSelection.tools, toolPolicy: toolSelection.mode }
+        : {}),
     }));
     return timing.finish(response);
   } catch (error) {

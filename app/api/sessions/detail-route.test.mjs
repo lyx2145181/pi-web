@@ -23,7 +23,7 @@ const timestamp = "2026-01-01T00:00:00.000Z";
 const usage = (input, output, cost) => ({ input, output, cacheRead: 0, cacheWrite: 0, cost: { input: cost, output: 0, cacheRead: 0, cacheWrite: 0, total: cost } });
 const entries = [
   { type: "session", version: 3, id, timestamp, cwd: directory },
-  { type: "custom", id: "tools", parentId: null, timestamp, customType: "pi-web:tool-selection", data: { version: 1, tools: [] } },
+  { type: "custom", id: "tools", parentId: null, timestamp, customType: "pi-web:tool-selection", data: { version: 2, mode: "exact", tools: ["read", "browser_snapshot"] } },
 ];
 for (let i = 0; i < 300; i++) {
   entries.push({ type: "message", id: `e${i}`, parentId: i ? `e${i - 1}` : "tools", timestamp,
@@ -67,7 +67,8 @@ test("详情首屏保持 60 条，累计用量与压缩前输入历史不随窗�
   assert.equal(body.inputHistory.at(-1), "after compaction");
   assert.equal(body.info.firstMessage, "m0");
   assert.equal(body.info.messageCount, 301);
-  assert.deepEqual(body.toolNames, []);
+  assert.deepEqual(body.toolNames, ["read", "browser_snapshot"]);
+  assert.equal(body.toolPolicy, "exact");
 });
 
 test("context 使用数字 before 和 120 条窗口，上翻覆盖压缩前历史且不重复", async () => {

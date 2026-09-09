@@ -44,8 +44,13 @@ import {
 } from "./subagents";
 import { createSubagentController } from "./subagent-runtime";
 import { isBuiltInSubagentsEnabled } from "./subagent-settings";
-import { resolveShellTools } from "./powershell-settings";
 import { CHAT_ONLY_RESOURCE_LOADER_OPTIONS, contextFilesSystemPrompt } from "./chat-only";
+import {
+  resolveActiveToolNames,
+  type ToolActivationPolicy,
+  validateExactToolNames,
+  validateToolActivationPolicy,
+} from "./tool-activation";
 import {
   appendSessionToolSelection,
   readSessionToolSelection,
@@ -117,6 +122,7 @@ type ExtensionCommandContextActionsLike = {
 type AgentSessionWrapperOptions = {
   exactSystemPrompt?: () => string;
   chatOnly?: boolean;
+  toolPolicy?: ToolActivationPolicy;
   onAgentRunComplete?: AgentRunCompleteListener;
   suppressCompletionNotifications?: boolean;
   backgroundWorkProbe?: BackgroundWorkProbe;
@@ -167,12 +173,12 @@ const COMMANDS_ALLOWED_DURING_SESSION_REPLACEMENT = new Set([
 
 export interface RpcSessionStartOptions {
   toolNames?: string[];
+  toolPolicy?: ToolActivationPolicy;
   initialModel?: { provider: string; modelId: string };
   allowInitialModelFallback?: boolean;
   thinkingLevel?: ThinkingLevel;
 }
 
-const CODING_TOOL_NAMES = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"];
 const THINKING_LEVEL_NAMES = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 // Extensions require a complete Theme, while the web UI applies its own styling.
@@ -203,19 +209,6 @@ class PlainTextTheme extends Theme {
 const PLAIN_TEXT_THEME = new PlainTextTheme();
 const CUSTOM_UI_KEYBINDINGS = new TuiKeybindingsManager(TUI_KEYBINDINGS);
 
-function withExtensionTools(session: AgentSessionLike, toolNames: string[]): string[] {
-  if (toolNames.length === 0) return [];
-
-  const codingToolNames = new Set(CODING_TOOL_NAMES);
-  const selectedToolNames = resolveShellTools(toolNames, session.settingsManager.getDefaultTools());
-  const extensionToolNames = session
-    .getAllTools()
-    .map((t) => t.name)
-    .filter((name) => !codingToolNames.has(name));
-
-  return [...new Set([...selectedToolNames, ...extensionToolNames])];
-}
-
 // ============================================================================
 // AgentSessionWrapper
 // Wraps AgentSession with the same interface the rest of the app expects
@@ -242,6 +235,7 @@ export class AgentSessionWrapper {
   private extensionBindingError: unknown = null;
   private readonly exactSystemPrompt?: () => string;
   private readonly chatOnly: boolean;
+  private toolPolicy: ToolActivationPolicy;
   private readonly onAgentRunComplete?: AgentRunCompleteListener;
   private readonly suppressCompletionNotifications: boolean;
   private unsubscribe: (() => void) | null = null;
@@ -261,6 +255,7 @@ export class AgentSessionWrapper {
   ) {
     this.exactSystemPrompt = options.exactSystemPrompt;
     this.chatOnly = options.chatOnly ?? false;
+    this.toolPolicy = options.toolPolicy ?? "inclusive";
     this.onAgentRunComplete = options.onAgentRunComplete;
     this.suppressCompletionNotifications = options.suppressCompletionNotifications ?? false;
     this.backgroundWorkProbe = options.backgroundWorkProbe;
@@ -446,8 +441,12 @@ export class AgentSessionWrapper {
     };
   }
 
-  setActiveToolSelection(toolNames: string[]): void {
-    this.inner.setActiveToolsByName(withExtensionTools(this.inner, toolNames));
+  setActiveToolSelection(
+    toolNames: string[],
+    toolPolicy: ToolActivationPolicy = this.toolPolicy,
+  ): void {
+    this.inner.setActiveToolsByName(resolveActiveToolNames(this.inner, toolNames, toolPolicy));
+    this.toolPolicy = toolPolicy;
     this.applyExactSystemPrompt();
   }
 
@@ -978,7 +977,9 @@ export class AgentSessionWrapper {
         this.extensionStatuses.clear();
         this.resetExtensionWidgetsForReload();
         this.syncProjectTrust();
-        await this.inner.reload();
+        await this.inner.reload({
+          beforeSessionStart: () => this.setActiveToolSelection(activeToolNames),
+        });
         this.setActiveToolSelection(activeToolNames);
         if (typeof this.inner.bindExtensions !== "function") {
           this.inner.extensionRunner.setUIContext?.(this.createExtensionUiContext(), "rpc");
@@ -1807,7 +1808,7 @@ export async function setRpcSessionTools(
     if (readSubagentSessionResources(manager.getEntries() as unknown as SessionEntry[])) {
       throw new Error("Subagent tool selection is fixed by its profile");
     }
-    appendSessionToolSelection(manager, toolNames);
+    appendSessionToolSelection(manager, toolNames, "inclusive");
     invalidateSessionListCache();
     const started = await startRpcSession(sessionId, sessionFile, undefined);
     return { session: started.session, sessionId: started.realSessionId, recreated: false };
@@ -1822,11 +1823,11 @@ export async function setRpcSessionTools(
     && typeof existing.setActiveToolSelection === "function";
   const crossesChatOnlyBoundary = !hasCurrentResourcePolicy
     || existing.isChatOnly() !== (toolNames.length === 0);
-  appendSessionToolSelection(existing.inner.sessionManager, toolNames);
+  appendSessionToolSelection(existing.inner.sessionManager, toolNames, "inclusive");
   invalidateSessionListCache();
 
   if (!crossesChatOnlyBoundary) {
-    existing.setActiveToolSelection(toolNames);
+    existing.setActiveToolSelection(toolNames, "inclusive");
     return { session: existing, sessionId, recreated: false };
   }
 
@@ -1980,9 +1981,15 @@ export async function startRpcSession(
   options: RpcSessionStartOptions = {},
 ): Promise<{ session: AgentSessionWrapper; realSessionId: string }> {
   const { initialModel, allowInitialModelFallback, thinkingLevel } = options;
+  const requestedToolPolicy = validateToolActivationPolicy(options.toolPolicy);
+  if (options.toolPolicy === "exact" && options.toolNames === undefined) {
+    throw new Error("toolNames are required for exact tool policy");
+  }
   const requestedToolNames = options.toolNames === undefined
     ? undefined
-    : validateSessionToolSelection(options.toolNames);
+    : requestedToolPolicy === "exact"
+      ? validateExactToolNames(options.toolNames)
+      : validateSessionToolSelection(options.toolNames);
   const registry = getRegistry();
   const locks = getLocks();
 
@@ -2005,13 +2012,20 @@ export async function startRpcSession(
         sessionManager.getEntries() as unknown as SessionEntry[],
       )
     : null;
-  const persistedToolNames = subagentResources
+  const persistedToolSelection = subagentResources
     ? undefined
     : readSessionToolSelection(sessionManager.getEntries() as unknown as SessionEntry[]);
-  const selectedToolNames = subagentResources?.tools ?? persistedToolNames ?? requestedToolNames;
-  if (!subagentResources && persistedToolNames === undefined && requestedToolNames !== undefined) {
-    appendSessionToolSelection(sessionManager, requestedToolNames);
-  }
+  const toolPolicy = subagentResources
+    ? "exact"
+    : persistedToolSelection?.mode ?? requestedToolPolicy;
+  const selectedToolNames = subagentResources?.tools
+    ?? persistedToolSelection?.tools
+    ?? requestedToolNames;
+  const requestedToolSelectionToPersist = !subagentResources
+    && persistedToolSelection === undefined
+    && requestedToolNames !== undefined
+    ? { mode: requestedToolPolicy, tools: requestedToolNames }
+    : undefined;
   const subagentLoadsResources = Boolean(
     subagentResources?.loadExtensions || subagentResources?.loadSkills,
   );
@@ -2121,6 +2135,31 @@ export async function startRpcSession(
       ...(subagentResources ? { excludeTools: [...SUBAGENT_CONTROL_TOOL_NAMES] } : {}),
     });
 
+    // Extension tools are registered by createAgentSessionFromServices. Apply the
+    // selected policy now, before extension binding and before any prompt can run.
+    if (!subagentResources && !chatOnly) {
+      try {
+        inner.setActiveToolsByName(resolveActiveToolNames(
+          inner,
+          selectedToolNames ?? inner.getActiveToolNames(),
+          toolPolicy,
+        ));
+      } catch (error) {
+        inner.dispose();
+        throw error;
+      }
+    }
+
+    // Persist only after exact names have been validated against the registered
+    // catalog, so a rejected request cannot append an unusable resource policy.
+    if (requestedToolSelectionToPersist) {
+      appendSessionToolSelection(
+        sessionManager,
+        requestedToolSelectionToPersist.tools,
+        requestedToolSelectionToPersist.mode,
+      );
+    }
+
     const persistedPreferences = await persistExplicitStartupPreferences(
       services.settingsManager,
       {
@@ -2137,13 +2176,6 @@ export async function startRpcSession(
     );
     if (persistedPreferences.modelDefaultChanged) invalidateModelsCache();
 
-    // If specific tool names were requested (non-empty), set the active tools to the
-    // requested builtin coding tools PLUS all extension/package tools, so installed
-    // extensions stay usable in Pi Web just like in the `pi` CLI.
-    if (!subagentResources && !chatOnly) {
-      inner.setActiveToolsByName(withExtensionTools(inner, selectedToolNames ?? inner.getActiveToolNames()));
-    }
-
     const exactSystemPrompt = chatOnly
       ? subagentResources
         ? () => subagentResources.appendSystemPrompt[0] ?? ""
@@ -2152,6 +2184,7 @@ export async function startRpcSession(
     const wrapper = new AgentSessionWrapper(inner, {
       exactSystemPrompt,
       chatOnly,
+      toolPolicy,
       backgroundWorkProbe,
       onAgentRunComplete: (completedSessionId) => {
         void notifySessionComplete(completedSessionId).catch((error) => {

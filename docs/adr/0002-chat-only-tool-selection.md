@@ -30,22 +30,42 @@ sessions therefore append versioned `pi-web:tool-selection` custom entries:
 {
   "type": "custom",
   "customType": "pi-web:tool-selection",
-  "data": { "version": 1, "tools": [] }
+  "data": {
+    "version": 2,
+    "mode": "exact",
+    "tools": ["read", "browser_snapshot"]
+  }
 }
 ```
 
 The latest valid entry is authoritative. No entry means a legacy session and
-retains Pi's default behavior; an empty `tools` array means Chat only; a nonempty
-array restores the selected built-in tools. The stored array is the user's
-selection before extension tools are added. Subagents keep using
-`resourceSnapshot` in their own metadata instead of duplicating this entry. The
-snapshot records their active tools and the profile's skill and extension
-loading switches so reopened sessions retain the same resource policy.
+retains Pi's default behavior; an empty `tools` array means Chat only. Version 1
+entries remain valid and restore as `inclusive`, preserving their historical
+"selected built-in tools plus every extension tool" behavior. Version 2 stores
+both `inclusive` or `exact` mode and its tool list. Exact entries may contain
+registered extension tool names; if a named tool is no longer registered,
+session restoration fails instead of silently widening or shrinking access.
+Subagents keep using `resourceSnapshot` in their own metadata instead of
+duplicating this entry. The snapshot records their active tools and the
+profile's skill and extension loading switches so reopened sessions retain the
+same resource policy.
+
+`POST /api/agent/new` accepts `toolPolicy: "exact"` with an explicit
+`toolNames` array. This opt-in policy activates only the resolved names after
+extension registration but before extension binding or the first prompt.
+Unknown names fail session startup instead of being silently dropped. Omitting
+`toolPolicy` preserves the extension-inclusive behavior above. Session detail
+responses expose the restored selection as `toolNames` and `toolPolicy`.
 
 The persisted selection must be resolved before `createAgentSessionServices()`
-so Chat only never imports or executes session extensions. The exact system
-prompt must also be reapplied after Pi's `before_agent_start` phase, because the
-SDK rebuilds its base prompt immediately before the model call.
+so Chat only never imports or executes session extensions. For nonempty exact
+selections, extensions must first register their tools; Pi Web then validates
+and activates the exact set before exposing the wrapper to any command. Reload
+must restore the selected set through the SDK's `beforeSessionStart` hook before
+extensions receive their new `session_start` event. The exact system prompt must
+also be reapplied after Pi's `before_agent_start`
+phase, because the SDK rebuilds its base prompt immediately before the model
+call.
 
 Changing among nonempty tool presets can update an existing wrapper. Crossing
 the Chat-only boundary must append the new selection and rebuild the wrapper:

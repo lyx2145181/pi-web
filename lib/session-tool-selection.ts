@@ -1,40 +1,70 @@
 import type { SessionManager } from "@earendil-works/pi-coding-agent";
 import { PRESET_FULL } from "./tool-presets";
 import type { SessionEntry } from "./types";
+import {
+  type ToolActivationPolicy,
+  validateExactToolNames,
+} from "./tool-activation";
 
 export const TOOL_SELECTION_TYPE = "pi-web:tool-selection";
 
-export interface SessionToolSelectionData {
-  version: 1;
+export interface SessionToolSelection {
+  mode: ToolActivationPolicy;
   tools: string[];
 }
 
+export type SessionToolSelectionData =
+  | { version: 1; tools: string[] }
+  | { version: 2; mode: ToolActivationPolicy; tools: string[] };
+
 const BUILTIN_TOOL_NAMES = new Set(PRESET_FULL);
 
-function parseToolSelectionData(data: unknown): string[] | undefined {
-  if (typeof data !== "object" || data === null || Array.isArray(data)) return undefined;
-  const candidate = data as { version?: unknown; tools?: unknown };
+function parseInclusiveToolNames(value: unknown): string[] | undefined {
   if (
-    candidate.version !== 1
-    || !Array.isArray(candidate.tools)
-    || candidate.tools.some((tool) => typeof tool !== "string" || !BUILTIN_TOOL_NAMES.has(tool))
+    !Array.isArray(value)
+    || value.some((tool) => typeof tool !== "string" || !BUILTIN_TOOL_NAMES.has(tool))
   ) return undefined;
-  return [...new Set(candidate.tools as string[])];
+  return [...new Set(value as string[])];
+}
+
+function parseToolSelectionData(data: unknown): SessionToolSelection | undefined {
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return undefined;
+  const candidate = data as { version?: unknown; mode?: unknown; tools?: unknown };
+
+  if (candidate.version === 1) {
+    const tools = parseInclusiveToolNames(candidate.tools);
+    return tools === undefined ? undefined : { mode: "inclusive", tools };
+  }
+
+  if (candidate.version !== 2 || (candidate.mode !== "inclusive" && candidate.mode !== "exact")) {
+    return undefined;
+  }
+
+  try {
+    const tools = candidate.mode === "exact"
+      ? validateExactToolNames(candidate.tools)
+      : parseInclusiveToolNames(candidate.tools);
+    return tools === undefined ? undefined : { mode: candidate.mode, tools };
+  } catch {
+    return undefined;
+  }
 }
 
 /** Return the newest valid persisted selection. Undefined identifies legacy sessions. */
-export function readSessionToolSelection(entries: readonly SessionEntry[]): string[] | undefined {
+export function readSessionToolSelection(
+  entries: readonly SessionEntry[],
+): SessionToolSelection | undefined {
   for (let index = entries.length - 1; index >= 0; index -= 1) {
     const entry = entries[index];
     if (entry.type !== "custom" || entry.customType !== TOOL_SELECTION_TYPE) continue;
-    const tools = parseToolSelectionData(entry.data);
-    if (tools !== undefined) return tools;
+    const selection = parseToolSelectionData(entry.data);
+    if (selection !== undefined) return selection;
   }
   return undefined;
 }
 
 export function validateSessionToolSelection(tools: unknown): string[] {
-  const parsed = parseToolSelectionData({ version: 1, tools });
+  const parsed = parseInclusiveToolNames(tools);
   if (parsed === undefined) {
     throw new Error("toolNames must contain only built-in tool names");
   }
@@ -44,9 +74,11 @@ export function validateSessionToolSelection(tools: unknown): string[] {
 export function appendSessionToolSelection(
   sessionManager: SessionManager,
   tools: readonly string[],
+  mode: ToolActivationPolicy = "inclusive",
 ): void {
   sessionManager.appendCustomEntry(TOOL_SELECTION_TYPE, {
-    version: 1,
+    version: 2,
+    mode,
     tools: [...tools],
   } satisfies SessionToolSelectionData);
 }

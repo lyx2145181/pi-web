@@ -46,6 +46,7 @@ export interface SessionData {
   tree: SessionTreeNode[];
   leafId: string | null;
   toolNames?: string[];
+  toolPolicy?: "inclusive" | "exact";
   context: {
     messages: AgentMessage[];
     entryIds: string[];
