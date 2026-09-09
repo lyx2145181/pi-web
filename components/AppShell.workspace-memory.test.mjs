@@ -69,6 +69,44 @@ test("workspace restoration remains inside the cross-project branch", () => {
   );
 });
 
+test("project switching skips only redundant empty URL navigation", () => {
+  const callback = callbackBody("handleCwdChange", "handleSelectSession");
+  for (const [search, hash, selectedSession, expected] of [
+    ["", "", null, 0],
+    ["?session=old", "", { id: "old", cwd: "/old" }, 1],
+    ["?cwd=old", "", null, 1],
+    ["", "#old", null, 1],
+    // The selected session can precede its pending router navigation.
+    ["", "", { id: "pending", cwd: "/old" }, 1],
+  ]) {
+    const replacements = [];
+    const restores = [];
+    const context = vm.createContext({
+      crypto: globalThis.crypto,
+      useCallback: (fn) => fn,
+      invalidateWorkspaceRestore() {},
+      newSessionCwd: null, activeCwd: "/old", activeFileTabId: null,
+      activeProjectKeyRef: { current: "/old" },
+      activeNewSessionDraftKeyRef: { current: null },
+      suppressCwdBumpRef: { current: false },
+      selectedSession,
+      workspaceKeyOf: (s) => s.cwd,
+      rekeyDraft() {},
+      parkedNewSessionDraftKey: (cwd) => `parked:${cwd}`,
+      restoreWorkspaceContext: (...args) => restores.push(args),
+      window: { location: { pathname: "/", search, hash } },
+      router: { replace: (...args) => replacements.push(args) },
+    });
+    for (const [setter] of callback.matchAll(/\bset[A-Z]\w*(?=\()/g)) {
+      context[setter] = () => {};
+    }
+    vm.runInContext(stripTypeScriptTypes(`${callback}\nhandleCwdChange('/new', '/new', '/new');`), context);
+    assert.equal(replacements.length, expected, JSON.stringify({ search, hash, selectedSession }));
+    assert.deepEqual(restores, [["/new", "/new"]]);
+    if (expected) assert.equal(replacements[0][0], "/");
+  }
+});
+
 test("New restores the draft after session navigation and workspace auto-restore", async (t) => {
   const callbacks = [
     callbackBody("restoreWorkspaceContext", "handleCwdChange"),

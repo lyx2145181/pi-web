@@ -2285,6 +2285,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   useEffect(() => {
     const controller = new AbortController();
     (async () => {
+      // Let Strict Effects cleanup cancel the discarded setup before fetching.
+      await Promise.resolve();
+      if (controller.signal.aborted) return;
       for (let attempt = 0; ; attempt++) {
         try {
           await loadModels(controller.signal);

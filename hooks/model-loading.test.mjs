@@ -79,6 +79,27 @@ test("model-load failures stay visible through bounded retries and clear on reco
   assert.ok(recovered.writes.some(([name, value]) => name === "ThinkingLevel" && value === "high"));
 });
 
+test("Strict Effects cleanup cancels model loading before a request starts", async () => {
+  let requests = 0;
+  const fetchModels = async () => {
+    requests++;
+    return Response.json({ models: {}, modelList: [] });
+  };
+  const discarded = setup(fetchModels);
+  const first = discarded.run();
+  discarded.context.controller.abort();
+  const active = setup(fetchModels);
+  await Promise.all([first, active.run()]);
+  assert.equal(requests, 1);
+  assert.deepEqual(discarded.writes, []);
+  assert.deepEqual(discarded.delays, []);
+  assert.ok(active.writes.some(([name]) => name === "ModelList"));
+
+  // A later refresh must still fetch current configuration, not reuse UI data.
+  await setup(fetchModels).run();
+  assert.equal(requests, 2);
+});
+
 test("cancelling model loads prevents state writes and further retries", async () => {
   for (const status of [200, 403]) {
     const reading = Promise.withResolvers();
