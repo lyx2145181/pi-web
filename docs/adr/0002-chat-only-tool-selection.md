@@ -51,13 +51,25 @@ profile's skill and extension loading switches so reopened sessions retain the
 same resource policy.
 
 `POST /api/agent/new` accepts `toolPolicy: "exact"` with an explicit
-`toolNames` array. Extensions may register tools lazily from `session_start`,
+`toolNames` array. It also accepts `skillPolicy: "exact"` with an explicit
+`skillNames` array. Exact skills filter Pi's discovered catalog before the
+system prompt and skill commands are built; an empty array exposes no skills,
+and an unknown or removed name fails startup. Omitting `skillPolicy` preserves
+Pi's normal inclusive skill discovery. Exact selections append a version 1
+`pi-web:skill-selection` entry and restore across reload and JSONL reopen;
+session detail responses expose `skillNames` and `skillPolicy`. Skill selection
+is a context and workflow-discovery boundary, not a filesystem permission:
+`read` or `bash` access remains governed by the separate exact tool contract.
+
+Extensions may register tools lazily from `session_start`,
 so Pi Web activates the registered subset before binding, then validates and
 activates the complete exact set after `session_start` and before returning the
 session or accepting the first prompt. Unknown names fail session startup
 instead of being silently dropped. Omitting
 `toolPolicy` preserves the extension-inclusive behavior above. Session detail
 responses expose the restored selection as `toolNames` and `toolPolicy`.
+The RPC `get_skills` command exposes the effective filtered skill catalog so
+launchers can require strict equality before sending a task.
 
 The persisted selection must be resolved before `createAgentSessionServices()`
 so Chat only never imports or executes session extensions. For nonempty exact

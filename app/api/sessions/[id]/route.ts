@@ -32,6 +32,7 @@ import { computeSessionStats } from "@/lib/session-stats";
 import type { SessionEntry } from "@/lib/types";
 import { readSubagentRun, readSubagentSessionResources, SUBAGENT_META_TYPE } from "@/lib/subagents";
 import { readSessionToolSelection } from "@/lib/session-tool-selection";
+import { readSessionSkillSelection } from "@/lib/session-skill-selection";
 
 export async function GET(
   req: Request,
@@ -94,6 +95,11 @@ export async function GET(
     const toolSelection = subagentResources
       ? { mode: "exact" as const, tools: subagentResources.tools }
       : readSessionToolSelection(entries as never);
+    const skillSelection = subagentResources
+      ? subagentResources.loadSkills
+        ? undefined
+        : { mode: "exact" as const, skills: [] }
+      : readSessionSkillSelection(entries as never);
     const info = await timing.time("metadata", async () => {
       const header = sm?.getHeader() ?? diskSnapshot?.header ?? null;
       if (!header) return null;
@@ -142,6 +148,9 @@ export async function GET(
       totalActiveMs,
       ...(toolSelection !== undefined
         ? { toolNames: toolSelection.tools, toolPolicy: toolSelection.mode }
+        : {}),
+      ...(skillSelection !== undefined
+        ? { skillNames: skillSelection.skills, skillPolicy: skillSelection.mode }
         : {}),
     }));
     return timing.finish(response);

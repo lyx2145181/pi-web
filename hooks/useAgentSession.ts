@@ -47,6 +47,8 @@ export interface SessionData {
   leafId: string | null;
   toolNames?: string[];
   toolPolicy?: "inclusive" | "exact";
+  skillNames?: string[];
+  skillPolicy?: "exact";
   context: {
     messages: AgentMessage[];
     entryIds: string[];

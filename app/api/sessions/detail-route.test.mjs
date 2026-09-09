@@ -24,9 +24,10 @@ const usage = (input, output, cost) => ({ input, output, cacheRead: 0, cacheWrit
 const entries = [
   { type: "session", version: 3, id, timestamp, cwd: directory },
   { type: "custom", id: "tools", parentId: null, timestamp, customType: "pi-web:tool-selection", data: { version: 2, mode: "exact", tools: ["read", "browser_snapshot"] } },
+  { type: "custom", id: "skills", parentId: "tools", timestamp, customType: "pi-web:skill-selection", data: { version: 1, mode: "exact", skills: ["verify-project"] } },
 ];
 for (let i = 0; i < 300; i++) {
-  entries.push({ type: "message", id: `e${i}`, parentId: i ? `e${i - 1}` : "tools", timestamp,
+  entries.push({ type: "message", id: `e${i}`, parentId: i ? `e${i - 1}` : "skills", timestamp,
     message: i % 2
       ? { role: "assistant", provider: "fixture", model: "fixture", content: [{ type: "text", text: `m${i}` }], ...(i === 1 ? { usage: usage(100, 10, 0.25) } : {}) }
       : { role: "user", content: `m${i}` },
@@ -69,6 +70,8 @@ test("详情首屏保持 60 条，累计用量与压缩前输入历史不随窗�
   assert.equal(body.info.messageCount, 301);
   assert.deepEqual(body.toolNames, ["read", "browser_snapshot"]);
   assert.equal(body.toolPolicy, "exact");
+  assert.deepEqual(body.skillNames, ["verify-project"]);
+  assert.equal(body.skillPolicy, "exact");
 });
 
 test("context 使用数字 before 和 120 条窗口，上翻覆盖压缩前历史且不重复", async () => {

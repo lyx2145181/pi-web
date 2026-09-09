@@ -6,6 +6,7 @@ import { allowFileRoot } from "@/lib/file-access";
 import { invalidateSessionListCache } from "@/lib/session-reader";
 import { startRpcSession } from "@/lib/rpc-manager";
 import { validateToolActivationPolicy } from "@/lib/tool-activation";
+import { validateSkillActivationPolicy } from "@/lib/session-skill-selection";
 
 const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
@@ -46,11 +47,22 @@ export async function POST(req: Request) {
     }
 
     // Use a one-time key so startRpcSession's lock doesn't conflict with real session ids
-    const { provider, modelId, toolNames, toolPolicy, thinkingLevel, ...promptCommand } = command as {
+    const {
+      provider,
+      modelId,
+      toolNames,
+      toolPolicy,
+      skillNames,
+      skillPolicy,
+      thinkingLevel,
+      ...promptCommand
+    } = command as {
       provider?: string;
       modelId?: string;
       toolNames?: string[];
       toolPolicy?: unknown;
+      skillNames?: string[];
+      skillPolicy?: unknown;
       thinkingLevel?: unknown;
       [key: string]: unknown;
     };
@@ -59,6 +71,7 @@ export async function POST(req: Request) {
     }
     const explicitThinkingLevel = parseThinkingLevel(thinkingLevel);
     const explicitToolPolicy = validateToolActivationPolicy(toolPolicy);
+    const explicitSkillPolicy = validateSkillActivationPolicy(skillPolicy);
 
     // Must be unique per request: startRpcSession coalesces concurrent callers
     // that share a key onto one session. Date.now() (ms resolution) collides for
@@ -67,6 +80,8 @@ export async function POST(req: Request) {
     const { session, realSessionId } = await startRpcSession(tempKey, "", cwd, {
       ...(toolNames ? { toolNames } : {}),
       ...(toolPolicy !== undefined ? { toolPolicy: explicitToolPolicy } : {}),
+      ...(skillNames !== undefined ? { skillNames } : {}),
+      ...(skillPolicy !== undefined ? { skillPolicy: explicitSkillPolicy } : {}),
       ...(provider && modelId ? { initialModel: { provider, modelId } } : {}),
       ...(explicitThinkingLevel ? { thinkingLevel: explicitThinkingLevel } : {}),
     });

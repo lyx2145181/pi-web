@@ -57,6 +57,15 @@ import {
   readSessionToolSelection,
   validateSessionToolSelection,
 } from "./session-tool-selection";
+import {
+  appendSessionSkillSelection,
+  filterExactSkills,
+  readSessionSkillSelection,
+  validateExactSkillNames,
+  validateSkillActivationPolicy,
+  verifyExactSkillNames,
+  type SkillActivationPolicy,
+} from "./session-skill-selection";
 
 // ============================================================================
 // Types
@@ -168,6 +177,7 @@ const COMMANDS_ALLOWED_DURING_SESSION_REPLACEMENT = new Set([
   "get_session_stats",
   "get_last_assistant_text",
   "get_tools",
+  "get_skills",
   "get_commands",
   "extension_ui_response",
   "extension_ui_input",
@@ -176,6 +186,8 @@ const COMMANDS_ALLOWED_DURING_SESSION_REPLACEMENT = new Set([
 export interface RpcSessionStartOptions {
   toolNames?: string[];
   toolPolicy?: ToolActivationPolicy;
+  skillNames?: string[];
+  skillPolicy?: SkillActivationPolicy;
   initialModel?: { provider: string; modelId: string };
   allowInitialModelFallback?: boolean;
   thinkingLevel?: ThinkingLevel;
@@ -937,6 +949,13 @@ export class AgentSessionWrapper {
         return all.map((t) => ({
           ...t,
           active: active.has(t.name),
+        }));
+      }
+
+      case "get_skills": {
+        return this.inner.resourceLoader.getSkills().skills.map((skill) => ({
+          name: skill.name,
+          description: skill.description,
         }));
       }
 
@@ -2002,6 +2021,16 @@ export async function startRpcSession(
     : requestedToolPolicy === "exact"
       ? validateExactToolNames(options.toolNames)
       : validateSessionToolSelection(options.toolNames);
+  const requestedSkillPolicy = validateSkillActivationPolicy(options.skillPolicy);
+  if (options.skillPolicy === "exact" && options.skillNames === undefined) {
+    throw new Error("skillNames are required for exact skill policy");
+  }
+  if (requestedSkillPolicy === "inclusive" && options.skillNames !== undefined) {
+    throw new Error("skillNames require exact skill policy");
+  }
+  const requestedSkillNames = options.skillNames === undefined
+    ? undefined
+    : validateExactSkillNames(options.skillNames);
   const registry = getRegistry();
   const locks = getLocks();
 
@@ -2038,10 +2067,27 @@ export async function startRpcSession(
     && requestedToolNames !== undefined
     ? { mode: requestedToolPolicy, tools: requestedToolNames }
     : undefined;
+  const persistedSkillSelection = subagentResources
+    ? undefined
+    : readSessionSkillSelection(sessionManager.getEntries() as unknown as SessionEntry[]);
+  const skillPolicy: SkillActivationPolicy = subagentResources
+    ? subagentResources.loadSkills ? "inclusive" : "exact"
+    : persistedSkillSelection?.mode ?? requestedSkillPolicy;
+  const selectedSkillNames = subagentResources
+    ? subagentResources.loadSkills ? undefined : []
+    : persistedSkillSelection?.skills ?? requestedSkillNames;
+  const requestedSkillSelectionToPersist = !subagentResources
+    && persistedSkillSelection === undefined
+    && requestedSkillPolicy === "exact"
+    ? { skills: requestedSkillNames ?? [] }
+    : undefined;
   const subagentLoadsResources = Boolean(
     subagentResources?.loadExtensions || subagentResources?.loadSkills,
   );
-  const chatOnly = selectedToolNames?.length === 0 && !subagentLoadsResources;
+  const exactSkillsLoadResources = skillPolicy === "exact" && (selectedSkillNames?.length ?? 0) > 0;
+  const chatOnly = selectedToolNames?.length === 0
+    && !subagentLoadsResources
+    && !exactSkillsLoadResources;
   const finishStartingSession = trackStartingSession(sessionCwd);
   const starting = (async () => {
     // Some extensions access the SDK's global theme even outside the terminal UI.
@@ -2112,9 +2158,20 @@ export async function startRpcSession(
                 ),
               ],
               extensionsOverride: (base) => preferUserBashExtension(preferPiWebSubagentExtension(base)),
+              ...(skillPolicy === "exact"
+                ? {
+                    skillsOverride: (base) => filterExactSkills(base, selectedSkillNames ?? []),
+                  }
+                : {}),
             },
       ...(trustReloadOptions ? { resourceLoaderReloadOptions: trustReloadOptions } : {}),
     });
+    if (!subagentResources && skillPolicy === "exact") {
+      verifyExactSkillNames(
+        services.resourceLoader.getSkills().skills.map((skill) => skill.name),
+        selectedSkillNames ?? [],
+      );
+    }
     const scope = await resolveVisibleModels(
       services.modelRuntime,
       services.settingsManager.getEnabledModels(),
@@ -2206,6 +2263,12 @@ export async function startRpcSession(
           sessionManager,
           requestedToolSelectionToPersist.tools,
           requestedToolSelectionToPersist.mode,
+        );
+      }
+      if (requestedSkillSelectionToPersist) {
+        appendSessionSkillSelection(
+          sessionManager,
+          requestedSkillSelectionToPersist.skills,
         );
       }
     } catch (error) {

@@ -86,7 +86,7 @@ app/api/
   sessions/[id]/context/route.ts  GET ?leafId= — context for a specific leaf
   sessions/[id]/export/route.ts   GET exported HTML for a session
   session-order/route.ts          GET/PUT project-scoped pinned session order
-  agent/new/route.ts              POST { cwd, message, toolNames?, provider?, modelId? }
+  agent/new/route.ts              POST { cwd, message, toolNames?, toolPolicy?, skillNames?, skillPolicy?, provider?, modelId? }
   agent/[id]/route.ts             GET state | POST any command
   agent/[id]/events/route.ts      GET SSE stream
   agent/running/route.ts          GET currently-running session ids
@@ -209,6 +209,9 @@ For in-flight assistant messages, `lib/agent-event-wire.ts` removes heavy partia
 Tool names are passed at session creation (`POST /api/agent/new` -> `toolNames[]`) and persisted in versioned `pi-web:tool-selection` custom entries. No entry means a legacy session and keeps Pi's default behavior; an empty array means Chat only. Version 1 entries restore as extension-inclusive selections; version 2 persists both `inclusive` or `exact` mode and the complete selected tool list. Omitting `toolPolicy` keeps the normal extension-inclusive behavior. New sessions may opt into `toolPolicy: "exact"`. Because extensions may register tools lazily from `session_start`, Pi Web activates the currently registered subset before binding, then validates and activates the complete requested built-in and extension tool set before startup returns or a prompt is accepted; reload follows the same pre-binding-subset and post-binding-validation sequence. Unknown or no-longer-registered exact names fail startup. Chat only resolves before services are created, loads no extensions/skills/prompts/themes, and replaces Pi's base prompt with the ordered contents of Pi's discovered context files. Crossing the Chat-only boundary rebuilds the wrapper; changing between nonempty presets updates it in place. Subagents persist their active tools plus profile-level skill and extension loading switches in `resourceSnapshot`; loaded extensions cannot expose the reserved `Agent`, `get_subagent_result`, or `steer_subagent` tools to a subagent. See `docs/adr/0002-chat-only-tool-selection.md`.
 
 The last preset explicitly selected by the user is stored in browser `localStorage` and initializes fresh-session composers only. Existing sessions never trust that preference; they use their live `get_tools` state or pi's default when no wrapper exists.
+
+### Exact skill selection
+Normal user sessions keep Pi's inclusive skill discovery unless creation explicitly supplies `skillPolicy: "exact"` with `skillNames`. Exact mode filters the discovered catalog before system-prompt and slash-command construction, persists in `pi-web:skill-selection`, survives reload/reopen, and fails startup for unknown or removed names. An empty exact list exposes no skills. `get_skills` and session detail expose the effective contract for launcher verification. This is not a file-access boundary: tool policy still governs whether a model can read arbitrary skill paths.
 
 ### Model defaults for new sessions
 `GET /api/models` returns `defaultModel` read from `~/.pi/agent/settings.json`. `ChatWindow` pre-selects this on mount for new sessions. Explicit browser model/thinking selections are applied atomically during AgentSession construction, then `lib/startup-preferences.ts` persists their effective values without replaying `set_model`/`set_thinking_level`; implicit `enabledModels` fallbacks and thinking pins are not persisted.
