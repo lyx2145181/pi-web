@@ -26,6 +26,24 @@ function renderMarkdown(markdown, props = {}) {
   );
 }
 
+test("unchanged Markdown uses React's full-prop memo comparison", () => {
+  assert.equal(MarkdownBody.$$typeof, Symbol.for("react.memo"));
+  // No custom comparator may ignore cwd, file callbacks, className or streaming state.
+  assert.equal(MarkdownBody.compare, null);
+});
+
+test("Markdown projection still honors changed text, directory and styling", () => {
+  const first = renderMarkdown("旧内容 ![图片](images/a.png)", { cwd: "/first", className: "first-style" });
+  const second = renderMarkdown("新内容 ![图片](images/a.png)", { cwd: "/second", className: "second-style" });
+  assert.match(first, /旧内容/);
+  assert.match(first, /\/api\/files\/first\/images\/a\.png/);
+  assert.match(first, /first-style/);
+  assert.match(second, /新内容/);
+  assert.doesNotMatch(second, /旧内容/);
+  assert.match(second, /\/api\/files\/second\/images\/a\.png/);
+  assert.match(second, /second-style/);
+});
+
 test("opens non-file markdown links in a safe new tab", () => {
   const html = renderMarkdown("[docs](https://example.com/docs)");
 

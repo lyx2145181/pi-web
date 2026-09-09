@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, type MouseEvent } from "react";
+import { memo, useMemo, type MouseEvent } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import { resolveLocalFileHref, shouldOpenLocalFileInApp } from "@/lib/file-links";
 import { encodeFilePathForApi } from "@/lib/file-paths";
@@ -15,7 +15,7 @@ interface MarkdownBodyProps {
   onOpenFile?: (filePath: string) => void;
 }
 
-export function MarkdownBody({ children, className, isStreaming, cwd, onOpenFile }: MarkdownBodyProps) {
+export const MarkdownBody = memo(function MarkdownBody({ children, className, isStreaming, cwd, onOpenFile }: MarkdownBodyProps) {
   const normalizedMarkdown = useMemo(() => normalizeDisplayMath(children), [children]);
   // Stable renderer identities keep stateful blocks mounted across message hover updates.
   const components = useMemo<Components>(() => ({
@@ -105,4 +105,4 @@ export function MarkdownBody({ children, className, isStreaming, cwd, onOpenFile
       </ReactMarkdown>
     </div>
   );
-}
+});

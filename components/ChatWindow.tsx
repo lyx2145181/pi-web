@@ -96,13 +96,18 @@ function NewSessionUpdateLink({
 
   useEffect(() => {
     const controller = new AbortController();
-    void fetch("/api/app-update", { signal: controller.signal })
+    // Avoid starting a request for the setup discarded by Strict Effects.
+    void Promise.resolve()
+      .then(() => {
+        controller.signal.throwIfAborted();
+        return fetch("/api/app-update", { signal: controller.signal });
+      })
       .then(async (response) => {
         if (!response.ok) return null;
         return response.json() as Promise<AppUpdateResponse>;
       })
       .then((result) => {
-        if (result?.updateAvailable && result.latestVersion && result.releaseUrl) {
+        if (!controller.signal.aborted && result?.updateAvailable && result.latestVersion && result.releaseUrl) {
           setUpdate(result);
         }
       })
@@ -191,6 +196,53 @@ function withAssistantBlocks(
   const next = { ...message, content };
   if (options.omitUsage) next.usage = undefined;
   return next;
+}
+
+interface CompletedTurn {
+  finalAssistantIdx: number;
+  finalAnswerMessage: AssistantMessage | null;
+  finalProcessMessage: AssistantMessage;
+  writtenFiles: WrittenFile[];
+}
+
+function prepareHistoryTurns(messages: AgentMessage[], toolResults: Map<string, ToolResultMessage>, cwd?: string): Map<number, CompletedTurn> {
+  const turns = new Map<number, CompletedTurn>();
+  for (let userIdx = 0; userIdx < messages.length;) {
+    if (!isMessageGroupAnchor(messages[userIdx])) {
+      userIdx += 1;
+      continue;
+    }
+    let endIdx = userIdx + 1;
+    while (endIdx < messages.length && !isMessageGroupAnchor(messages[endIdx])) endIdx += 1;
+    const finalAssistantIdx = findFinalAssistantIndex(messages, userIdx, endIdx);
+    if (finalAssistantIdx !== -1) {
+      const finalAssistant = messages[finalAssistantIdx] as AssistantMessage;
+      const finalSplit = splitFinalAssistantBlocks(finalAssistant);
+      const finalAnswerMessage = finalSplit.answerBlocks.length > 0 || getAssistantErrorMessage(finalAssistant)
+        ? withAssistantBlocks(finalAssistant, finalSplit.answerBlocks)
+        : null;
+      const finalProcessEnd = finalAssistant.content.indexOf(finalSplit.answerBlocks[0]);
+      // Keep the original prefix so deferred thinking retains its stored block indices.
+      const finalProcessBlocks = finalAssistant.content.slice(0, finalProcessEnd < 0 ? undefined : finalProcessEnd);
+      const turnContent: AssistantContentBlock[] = [];
+      if (finalAnswerMessage) {
+        for (let i = userIdx + 1; i <= finalAssistantIdx; i++) {
+          const message = messages[i];
+          if (message.role === "assistant") {
+            for (const block of message.content ?? []) turnContent.push(block);
+          }
+        }
+      }
+      turns.set(userIdx, {
+        finalAssistantIdx,
+        finalAnswerMessage,
+        finalProcessMessage: withAssistantBlocks(finalAssistant, finalProcessBlocks, { omitUsage: Boolean(finalAnswerMessage) }),
+        writtenFiles: extractTurnWrittenFiles(turnContent, toolResults, cwd),
+      });
+    }
+    userIdx = endIdx;
+  }
+  return turns;
 }
 
 function ProcessDetailsGroup({ messageCount, toolCallCount, defaultExpanded = false, reveal = false, children, t }: { messageCount: number; toolCallCount: number; defaultExpanded?: boolean; reveal?: boolean; children: ReactNode; t: (key: string, params?: Record<string, string | number>) => string }) {
@@ -802,6 +854,11 @@ export const ChatWindow = memo(function ChatWindow({ session, searchTarget, onSe
   const isEmptyNew = isNew && messages.length === 0 && !streamState.isStreaming && !sessionBusy;
   const hasStreamingContent = Boolean(streamState.streamingMessage?.content.length);
   const messageCwd = session?.cwd ?? newSessionCwd ?? undefined;
+  // Stable projected messages/file lists let MessageView's memo survive status updates.
+  const historyTurns = useMemo(
+    () => prepareHistoryTurns(messages, toolResultsMap, messageCwd),
+    [messages, toolResultsMap, messageCwd],
+  );
   const promptAnchorSpacerRef = useRef<HTMLDivElement | null>(null);
   const promptAnchorSpacerHeightRef = useRef(0);
   const promptAnchorMeasureFrameRef = useRef<number | null>(null);
@@ -1171,9 +1228,9 @@ export const ChatWindow = memo(function ChatWindow({ session, searchTarget, onSe
                 let endIdx = userIdx + 1;
                 while (endIdx < messages.length && !isMessageGroupAnchor(messages[endIdx])) endIdx += 1;
 
-                const finalAssistantIdx = findFinalAssistantIndex(messages, userIdx, endIdx);
+                const completedTurn = historyTurns.get(userIdx);
 
-                if (finalAssistantIdx === -1) {
+                if (!completedTurn) {
                   for (let renderIdx = userIdx; renderIdx < endIdx; renderIdx++) {
                     rendered.push(renderMessage(renderIdx));
                   }
@@ -1181,6 +1238,7 @@ export const ChatWindow = memo(function ChatWindow({ session, searchTarget, onSe
                   continue;
                 }
 
+                const { finalAssistantIdx, finalAnswerMessage, finalProcessMessage, writtenFiles } = completedTurn;
                 const isLiveTail = (sessionBusy || streamState.isStreaming) && endIdx === messages.length && userIdx === lastAnchorIdx;
                 if (isLiveTail) {
                   for (let renderIdx = userIdx; renderIdx < endIdx; renderIdx++) {
@@ -1191,16 +1249,6 @@ export const ChatWindow = memo(function ChatWindow({ session, searchTarget, onSe
                 }
 
                 rendered.push(renderMessage(userIdx));
-
-                const finalAssistant = messages[finalAssistantIdx] as AssistantMessage;
-                const finalSplit = splitFinalAssistantBlocks(finalAssistant);
-                const finalAnswerMessage = finalSplit.answerBlocks.length > 0 || getAssistantErrorMessage(finalAssistant)
-                  ? withAssistantBlocks(finalAssistant, finalSplit.answerBlocks)
-                  : null;
-
-                const finalProcessEnd = finalAssistant.content.indexOf(finalSplit.answerBlocks[0]);
-                // Keep the original prefix so deferred thinking retains its stored block indices.
-                const finalProcessBlocks = finalAssistant.content.slice(0, finalProcessEnd < 0 ? undefined : finalProcessEnd);
 
                 const processViews: ReactNode[] = [];
                 let processToolCount = 0;
@@ -1216,7 +1264,7 @@ export const ChatWindow = memo(function ChatWindow({ session, searchTarget, onSe
                   }
                   if (processMessage.role !== "assistant") continue;
                   const message = processIdx === finalAssistantIdx
-                    ? withAssistantBlocks(processMessage, finalProcessBlocks, { omitUsage: Boolean(finalAnswerMessage) })
+                    ? finalProcessMessage
                     : processMessage;
                   const blocks = getDisplayableAssistantBlocks(message);
                   if (blocks.length === 0) continue;
@@ -1245,18 +1293,6 @@ export const ChatWindow = memo(function ChatWindow({ session, searchTarget, onSe
                 }
 
                 if (finalAnswerMessage) {
-                  // Each tool call is stored as its own assistant entry, so the
-                  // final answer alone carries no record of what the turn wrote.
-                  // Gather the turn's assistant blocks and derive the file list
-                  // from the write/edit calls among them.
-                  const turnContent: AssistantContentBlock[] = [];
-                  for (let i = userIdx + 1; i <= finalAssistantIdx; i++) {
-                    const m = messages[i];
-                    if (m?.role === "assistant") {
-                      for (const b of (m as AssistantMessage).content ?? []) turnContent.push(b);
-                    }
-                  }
-                  const writtenFiles = extractTurnWrittenFiles(turnContent, toolResultsMap, messageCwd);
                   rendered.push(renderMessage(finalAssistantIdx, {
                     messageOverride: finalAnswerMessage,
                     writtenFiles,

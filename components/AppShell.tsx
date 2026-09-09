@@ -703,7 +703,11 @@ export function AppShell() {
       // the default welcome page when none is remembered.
       restoreWorkspaceContext(newProject, cwd);
     }
-    router.replace(typeof window !== "undefined" ? window.location.pathname : "/", { scroll: false });
+    // An empty composer already at the bare path needs no server navigation.
+    // Still replace when a selected session's navigation may be in flight.
+    if (selectedSession || window.location.search || window.location.hash) {
+      router.replace(window.location.pathname, { scroll: false });
+    }
   }, [activeCwd, activeFileTabId, invalidateWorkspaceRestore, newSessionCwd, router, selectedSession, restoreWorkspaceContext]);
 
   const handleSelectSession = useCallback((session: SessionInfo, isRestore = false, entryId?: string, blockIndex?: number) => {
