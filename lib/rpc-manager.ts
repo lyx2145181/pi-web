@@ -47,6 +47,7 @@ import { isBuiltInSubagentsEnabled } from "./subagent-settings";
 import { CHAT_ONLY_RESOURCE_LOADER_OPTIONS, contextFilesSystemPrompt } from "./chat-only";
 import {
   resolveActiveToolNames,
+  resolveRegisteredExactToolNames,
   type ToolActivationPolicy,
   validateExactToolNames,
   validateToolActivationPolicy,
@@ -123,6 +124,7 @@ type AgentSessionWrapperOptions = {
   exactSystemPrompt?: () => string;
   chatOnly?: boolean;
   toolPolicy?: ToolActivationPolicy;
+  toolNames?: string[];
   onAgentRunComplete?: AgentRunCompleteListener;
   suppressCompletionNotifications?: boolean;
   backgroundWorkProbe?: BackgroundWorkProbe;
@@ -236,6 +238,7 @@ export class AgentSessionWrapper {
   private readonly exactSystemPrompt?: () => string;
   private readonly chatOnly: boolean;
   private toolPolicy: ToolActivationPolicy;
+  private toolNames: string[];
   private readonly onAgentRunComplete?: AgentRunCompleteListener;
   private readonly suppressCompletionNotifications: boolean;
   private unsubscribe: (() => void) | null = null;
@@ -256,6 +259,8 @@ export class AgentSessionWrapper {
     this.exactSystemPrompt = options.exactSystemPrompt;
     this.chatOnly = options.chatOnly ?? false;
     this.toolPolicy = options.toolPolicy ?? "inclusive";
+    this.toolNames = [...(options.toolNames
+      ?? (typeof this.inner.getActiveToolNames === "function" ? this.inner.getActiveToolNames() : []))];
     this.onAgentRunComplete = options.onAgentRunComplete;
     this.suppressCompletionNotifications = options.suppressCompletionNotifications ?? false;
     this.backgroundWorkProbe = options.backgroundWorkProbe;
@@ -381,6 +386,7 @@ export class AgentSessionWrapper {
       } else {
         this.inner.extensionRunner.setUIContext?.(uiContext, "rpc");
       }
+      this.setActiveToolSelection(this.toolNames, this.toolPolicy);
       this.extensionsBound = true;
       this.applyExactSystemPrompt();
       console.log(`[pi-web] session_start dispatched to extensions for session ${this.inner.sessionId}`);
@@ -446,6 +452,7 @@ export class AgentSessionWrapper {
     toolPolicy: ToolActivationPolicy = this.toolPolicy,
   ): void {
     this.inner.setActiveToolsByName(resolveActiveToolNames(this.inner, toolNames, toolPolicy));
+    this.toolNames = [...toolNames];
     this.toolPolicy = toolPolicy;
     this.applyExactSystemPrompt();
   }
@@ -978,7 +985,12 @@ export class AgentSessionWrapper {
         this.resetExtensionWidgetsForReload();
         this.syncProjectTrust();
         await this.inner.reload({
-          beforeSessionStart: () => this.setActiveToolSelection(activeToolNames),
+          beforeSessionStart: () => {
+            const preBindingToolNames = this.toolPolicy === "exact"
+              ? resolveRegisteredExactToolNames(this.inner, activeToolNames)
+              : resolveActiveToolNames(this.inner, activeToolNames, this.toolPolicy);
+            this.inner.setActiveToolsByName(preBindingToolNames);
+          },
         });
         this.setActiveToolSelection(activeToolNames);
         if (typeof this.inner.bindExtensions !== "function") {
@@ -2135,29 +2147,18 @@ export async function startRpcSession(
       ...(subagentResources ? { excludeTools: [...SUBAGENT_CONTROL_TOOL_NAMES] } : {}),
     });
 
-    // Extension tools are registered by createAgentSessionFromServices. Apply the
-    // selected policy now, before extension binding and before any prompt can run.
+    // Some extensions register tools only from session_start. Before binding,
+    // activate only the requested exact names that already exist; the wrapper
+    // applies and validates the complete policy after session_start finishes.
     if (!subagentResources && !chatOnly) {
-      try {
-        inner.setActiveToolsByName(resolveActiveToolNames(
-          inner,
-          selectedToolNames ?? inner.getActiveToolNames(),
-          toolPolicy,
-        ));
-      } catch (error) {
-        inner.dispose();
-        throw error;
-      }
-    }
-
-    // Persist only after exact names have been validated against the registered
-    // catalog, so a rejected request cannot append an unusable resource policy.
-    if (requestedToolSelectionToPersist) {
-      appendSessionToolSelection(
-        sessionManager,
-        requestedToolSelectionToPersist.tools,
-        requestedToolSelectionToPersist.mode,
-      );
+      const initialActiveToolNames = toolPolicy === "exact"
+        ? resolveRegisteredExactToolNames(inner, selectedToolNames ?? [])
+        : resolveActiveToolNames(
+            inner,
+            selectedToolNames ?? inner.getActiveToolNames(),
+            toolPolicy,
+          );
+      inner.setActiveToolsByName(initialActiveToolNames);
     }
 
     const persistedPreferences = await persistExplicitStartupPreferences(
@@ -2185,6 +2186,7 @@ export async function startRpcSession(
       exactSystemPrompt,
       chatOnly,
       toolPolicy,
+      toolNames: selectedToolNames,
       backgroundWorkProbe,
       onAgentRunComplete: (completedSessionId) => {
         void notifySessionComplete(completedSessionId).catch((error) => {
@@ -2195,6 +2197,21 @@ export async function startRpcSession(
     });
     const realSessionId = inner.sessionId as string;
     registerRpcWrapper(wrapper);
+    try {
+      await wrapper.waitUntilReady();
+      // Persist only after lazy extension tools have been registered and exact
+      // names validated, so rejected requests cannot save an unusable policy.
+      if (requestedToolSelectionToPersist) {
+        appendSessionToolSelection(
+          sessionManager,
+          requestedToolSelectionToPersist.tools,
+          requestedToolSelectionToPersist.mode,
+        );
+      }
+    } catch (error) {
+      await wrapper.shutdown();
+      throw error;
+    }
 
     return { session: wrapper, realSessionId };
   })().finally(() => {

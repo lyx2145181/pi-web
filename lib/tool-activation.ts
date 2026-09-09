@@ -31,6 +31,17 @@ export function validateExactToolNames(value: unknown): string[] {
   return [...new Set(value as string[])];
 }
 
+export function resolveRegisteredExactToolNames(
+  session: Pick<AgentSessionLike, "getAllTools" | "settingsManager">,
+  requestedToolNames: readonly string[],
+): string[] {
+  const availableToolNames = new Set(session.getAllTools().map((tool) => tool.name));
+  return resolveShellTools(
+    requestedToolNames,
+    session.settingsManager.getDefaultTools(),
+  ).filter((name) => availableToolNames.has(name));
+}
+
 /** Resolve the effective active set after every extension has registered its tools. */
 export function resolveActiveToolNames(
   session: Pick<AgentSessionLike, "getAllTools" | "settingsManager">,

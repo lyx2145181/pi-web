@@ -51,21 +51,23 @@ profile's skill and extension loading switches so reopened sessions retain the
 same resource policy.
 
 `POST /api/agent/new` accepts `toolPolicy: "exact"` with an explicit
-`toolNames` array. This opt-in policy activates only the resolved names after
-extension registration but before extension binding or the first prompt.
-Unknown names fail session startup instead of being silently dropped. Omitting
+`toolNames` array. Extensions may register tools lazily from `session_start`,
+so Pi Web activates the registered subset before binding, then validates and
+activates the complete exact set after `session_start` and before returning the
+session or accepting the first prompt. Unknown names fail session startup
+instead of being silently dropped. Omitting
 `toolPolicy` preserves the extension-inclusive behavior above. Session detail
 responses expose the restored selection as `toolNames` and `toolPolicy`.
 
 The persisted selection must be resolved before `createAgentSessionServices()`
 so Chat only never imports or executes session extensions. For nonempty exact
-selections, extensions must first register their tools; Pi Web then validates
-and activates the exact set before exposing the wrapper to any command. Reload
-must restore the selected set through the SDK's `beforeSessionStart` hook before
-extensions receive their new `session_start` event. The exact system prompt must
-also be reapplied after Pi's `before_agent_start`
-phase, because the SDK rebuilds its base prompt immediately before the model
-call.
+selections, Pi Web carries the requested names across extension binding and
+validates the complete set after `session_start`; session startup does not
+return until that validation succeeds. Reload applies the currently registered
+subset through the SDK's `beforeSessionStart` hook, then reapplies and validates
+the complete exact set after lazy registration finishes. The exact system
+prompt must also be reapplied after Pi's `before_agent_start` phase, because the
+SDK rebuilds its base prompt immediately before the model call.
 
 Changing among nonempty tool presets can update an existing wrapper. Crossing
 the Chat-only boundary must append the new selection and rebuild the wrapper:
