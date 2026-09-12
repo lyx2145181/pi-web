@@ -194,8 +194,8 @@ hooks/
 `AgentSession.fork()` mutates its session state in place, so a registry wrapper must never remain under the old id after a replacing fork. Pi Web creates the child through a separate `SessionManager`, records the child path, then gracefully shuts down the source wrapper before returning its id; reopening the original creates clean state. `fork_branch` is different: it copies the selected assistant branch without replacing or shutting down the source wrapper.
 
 ### Two kinds of branching — don't confuse them
-- **Fork** (Fork button on user message): creates a new independent `.jsonl` file. Shown as a child in the sidebar tree via `parentSession` header field.
-- **In-session branch** (Continue button / BranchNavigator): calls `navigate_tree` within the same file. Multiple entries share the same `parentId`. Switching between them calls `/api/sessions/[id]/context?leafId=`.
+- **Fork** ("New session" on user message): creates a new independent `.jsonl` file. Shown as a child in the sidebar tree via `parentSession` header field.
+- **In-session branch** ("Edit from here" / BranchNavigator): calls `navigate_tree` within the same file. Multiple entries share the same `parentId`. Switching between them calls `/api/sessions/[id]/context?leafId=`.
 
 ### Session files can be fully rewritten
 `parentSession` in the header is **display metadata only** — has zero effect on chat content. Safe to `writeFileSync` the entire file (pi does this itself during migrations). Used when cascade-reparenting children on delete.
@@ -296,6 +296,8 @@ Newer pi emits `compaction_start` / `compaction_end`; older versions emitted `au
 - When enabled, only a recognized legacy `pi-subagents` extension that registers any reserved tool (`Agent`, `get_subagent_result`, or `steer_subagent`) is removed. Unrelated extensions remain loaded, and resolved conflict diagnostics are discarded.
 - Runtime `Agent` dispatch checks the setting again so a stale tool call cannot start a subagent after the feature is switched off.
 - See `docs/adr/0003-built-in-subagent-toggle.md` for the precedence and persistence rationale.
+- Agent profile files (`~/.pi/agent/agents/*.md`, project `.pi/agents/*.md`) are shared with other runtimes, so a save round-trips the frontmatter keys this app does not own (`name`, `allowed_subagents`, `exclude_extensions`, `disallowed_tools`, …) and carries foreign `ext:` tool selectors through. Managed keys are exactly `description`, `display_name`, `tools`, `load_skills`, `load_extensions`, `enabled`, `inherit_context`, `run_in_background`, `model`, `thinking`, `max_turns`.
+- The `skills` / `extensions` spellings pi-subagents reads are seeded on first save and kept in step while they are booleans; a hand-authored whitelist such as `extensions: pi-advisor-flow` is never rewritten, and the two flags fall back to those aliases when `load_skills` / `load_extensions` are absent.
 
 ### Auth and model config
 - `ModelsConfig` combines models from `~/.pi/agent/models.json` with provider auth status from pi's `AuthStorage`/`ModelRegistry`.

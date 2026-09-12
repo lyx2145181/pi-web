@@ -5,6 +5,8 @@ export interface CachedTextFileData {
   content: string;
   language: string;
   size: number;
+  nextOffset: number;
+  truncated: boolean;
   version: FileVersion;
 }
 

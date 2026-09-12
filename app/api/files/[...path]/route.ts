@@ -9,7 +9,6 @@ import {
 import {
   DOCX_PREVIEW_MAX_BYTES,
   IMAGE_PREVIEW_MAX_BYTES,
-  TEXT_PREVIEW_MAX_BYTES,
   documentPreviewKind,
   getAudioMime,
   getDocumentMime,
@@ -39,6 +38,7 @@ import {
   documentPreviewCacheKey,
   getOrCreateDocumentPreview,
 } from "@/lib/document-preview-cache";
+import { readTextPreviewChunk } from "@/lib/text-preview";
 
 const IGNORED_NAMES = new Set([
   "node_modules", ".git", ".next", "dist", "build", "__pycache__",
@@ -574,15 +574,20 @@ export async function GET(
         if (notModified) return notModified;
         return streamFile(filePath, stat, version, documentMime, request.headers.get("range"));
       }
-      if (stat.size > TEXT_PREVIEW_MAX_BYTES) {
-        return NextResponse.json({ error: "File too large for preview (>256KB)" }, { status: 413 });
+      const rawOffset = request.nextUrl.searchParams.get("offset");
+      if (rawOffset !== null && !/^\d+$/.test(rawOffset)) {
+        return NextResponse.json({ error: "Invalid text preview offset" }, { status: 400 });
+      }
+      const offset = Number(rawOffset ?? 0);
+      if (!Number.isSafeInteger(offset) || offset > stat.size) {
+        return NextResponse.json({ error: "Invalid text preview offset" }, { status: 400 });
       }
       const notModified = notModifiedResponse(request, version);
       if (notModified) return notModified;
-      const content = timing.timeSync("file-read", () => fs.readFileSync(filePath, "utf-8"));
+      const chunk = timing.timeSync("file-read", () => readTextPreviewChunk(filePath, stat.size, offset));
       const language = getLanguage(filePath);
       return timing.timeSync("serialize", () => NextResponse.json(
-        { content, language, size: stat.size, version },
+        { ...chunk, language, size: stat.size, version },
         { headers: fileVersionHeaders(version) },
       ));
     }
