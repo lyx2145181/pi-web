@@ -60,6 +60,16 @@ test("uses the full pinned card as the drag surface with visible motion feedback
   assert.match(source, /transition: "transform 140ms ease, box-shadow 140ms ease, background 140ms ease"/);
 });
 
+test("persists and exposes a vertical session/explorer resize handle", () => {
+  assert.match(source, /axis: "vertical"/);
+  assert.match(source, /storageKey: "pi-web:sidebar-session-pane-height"/);
+  assert.match(source, /Math\.round\(\(listHeight \+ explorerHeight\) \/ 2\)/);
+  assert.match(source, /data-resize-handle="sidebar-sections"/);
+  assert.match(source, /sidebar-section-resize-handle/);
+  assert.match(source, /var\(--sidebar-session-pane-height, 320px\)/);
+  assert.match(source, /minHeight: explorerOpen \? EXPLORER_PANE_MIN_HEIGHT : 0/);
+});
+
 test("does not register row-level session deletion shortcuts", () => {
   assert.doesNotMatch(sessionItemSource, /const handleKeyDown/);
   assert.doesNotMatch(sessionItemSource, /onKeyDown=\{handleKeyDown\}/);
