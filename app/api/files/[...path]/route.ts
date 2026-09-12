@@ -132,6 +132,23 @@ function directoryVersion(stat: fs.Stats): string {
   return [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].join(":");
 }
 
+function isMissingFilePathAllowed(target: string, allowedRoots: Set<string>): boolean {
+  let current = target;
+  while (true) {
+    try {
+      fs.lstatSync(current);
+      return current !== target && isExistingFilePathAllowed(current, allowedRoots);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") return false;
+    }
+
+    const parent = path.dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
+}
+
 export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ path: string[] }> }
@@ -162,13 +179,18 @@ export async function POST(
         if (!isFilePathAllowed(candidate, root)) {
           return NextResponse.json({ error: "Access denied" }, { status: 403 });
         }
-        try {
-          if (!isExistingFilePathAllowed(candidate, root)) {
-            return NextResponse.json({ error: "Access denied" }, { status: 403 });
+        if (!isExistingFilePathAllowed(candidate, root)) {
+          if (isMissingFilePathAllowed(candidate, root)) {
+            versions[candidate] = null;
+            continue;
           }
+          return NextResponse.json({ error: "Access denied" }, { status: 403 });
+        }
+        try {
           const stat = fs.statSync(candidate);
           versions[candidate] = stat.isDirectory() ? directoryVersion(stat) : null;
         } catch {
+          // The path may disappear after authorization but before stat.
           versions[candidate] = null;
         }
       }

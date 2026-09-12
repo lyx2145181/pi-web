@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -69,8 +69,23 @@ test("directory listings and bounded batch validation expose change-only version
   assert.equal(changed.status, 200);
   assert.notEqual((await changed.json()).versions[nested], firstVersion);
 
+  rmSync(nested, { recursive: true });
+  const missing = await POST(postVersions(root, [nested]), routeContext(root));
+  assert.equal(missing.status, 200);
+  assert.equal((await missing.json()).versions[nested], null);
+
   const denied = await POST(postVersions(root, [outside]), routeContext(root));
   assert.equal(denied.status, 403);
+
+  const linkedOutside = join(root, "linked-outside");
+  symlinkSync(outside, linkedOutside, "dir");
+  const deniedSymlink = await POST(postVersions(root, [linkedOutside]), routeContext(root));
+  assert.equal(deniedSymlink.status, 403);
+  const deniedMissingBelowSymlink = await POST(
+    postVersions(root, [join(linkedOutside, "missing")]),
+    routeContext(root),
+  );
+  assert.equal(deniedMissingBelowSymlink.status, 403);
 
   const oversized = await POST(
     postVersions(root, Array.from({ length: 129 }, () => nested)),
