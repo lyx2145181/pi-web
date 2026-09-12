@@ -11,7 +11,7 @@ import {
   saveCollapsedSessionIds,
   setSessionTreeCollapsed,
 } from "@/lib/session-tree-collapse";
-import { getProjectActivity, getRecentProjects, sessionsForProject } from "@/lib/project-groups";
+import { getProjectActivity, getRecentProjects, sessionsForProject, sessionsForWorktree } from "@/lib/project-groups";
 import {
   compareSessionRootOrder,
   emptySessionOrderPreferences,
@@ -501,6 +501,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   const [wtError, setWtError] = useState<string | null>(null);
   const [wtBusy, setWtBusy] = useState(false);
   const [wtConfirmRemove, setWtConfirmRemove] = useState<string | null>(null);
+  const [showAllWorktreeSessions, setShowAllWorktreeSessions] = useState(false);
   const [worktreeLoadingCwd, setWorktreeLoadingCwd] = useState<string | null>(null);
   const wtDropdownRef = useRef<HTMLDivElement>(null);
   const wtNewInputRef = useRef<HTMLInputElement>(null);
@@ -1047,6 +1048,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
       });
       saveLastCustomCwd(data.cwd);
       setCustomPathValue(data.cwd);
+      setShowAllWorktreeSessions(false);
       setSelectedCwd(data.cwd);
       setCustomPathOpen(false);
       setDropdownOpen(false);
@@ -1067,6 +1069,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
       const res = await fetch("/api/default-cwd", { method: "POST" });
       const data = await res.json() as { cwd?: string; error?: string };
       if (data.cwd) {
+        setShowAllWorktreeSessions(false);
         setSelectedCwd(data.cwd);
         setCustomPathOpen(false);
         setCustomPathError(null);
@@ -1105,6 +1108,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
         currentWorktreePath: data.path!,
         worktrees: [...prev.worktrees, { path: data.path!, branch, isMain: false }],
       } : prev);
+      setShowAllWorktreeSessions(false);
       setSelectedCwd(data.path);
       setWtRefreshKey((k) => k + 1);
     } catch (e) {
@@ -1135,7 +1139,10 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
         return;
       }
       setWtConfirmRemove(null);
-      if (currentWorktreePath === path) setSelectedCwd(worktreeState.projectRoot);
+      if (currentWorktreePath === path) {
+        setShowAllWorktreeSessions(false);
+        setSelectedCwd(worktreeState.projectRoot);
+      }
       setWtRefreshKey((k) => k + 1);
     } catch (e) {
       setWtError(e instanceof Error ? e.message : String(e));
@@ -1170,7 +1177,10 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   // open session after manually switching worktrees.
   const handleSelectSessionFromList = useCallback((s: SessionInfo, entryId?: string, blockIndex?: number) => {
     setAllSessions((current) => current.some((session) => session.id === s.id) ? current : [s, ...current]);
-    if (s.cwd) setSelectedCwd(s.cwd);
+    if (s.cwd) {
+      setShowAllWorktreeSessions(false);
+      setSelectedCwd(s.cwd);
+    }
     onSelectSession(s, false, entryId, blockIndex);
   }, [onSelectSession]);
 
@@ -1212,7 +1222,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     return total;
   }, [projectActivity]);
 
-  const filteredSessions = selectedProject
+  const projectSessions = selectedProject
     ? sessionsForProject(allSessions, selectedProject.key)
     : allSessions;
   const showWorktreeSwitcher = Boolean(
@@ -1221,6 +1231,11 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     && selectedCwd
     && selectedProject?.key === worktreeState.projectKey
   );
+  const filteredSessions = showWorktreeSwitcher
+    && !showAllWorktreeSessions
+    && currentWorktreePath
+    ? sessionsForWorktree(projectSessions, currentWorktreePath)
+    : projectSessions;
   const worktreeGuide = selectedCwd
     && worktreeState
     && selectedProject?.key === worktreeState.projectKey
@@ -1570,6 +1585,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
                   <button
                     key={project.key}
                     onClick={() => {
+                      setShowAllWorktreeSessions(false);
                       setSelectedCwd(project.root);
                       setProjectFilter("");
                       setCustomPathOpen(false);
@@ -1746,6 +1762,97 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
                 </svg>
               </button>
 
+              {worktreeState.worktrees.length > 1 && (
+                <div
+                  aria-label={t("sidebar.quickWorktreeSwitch")}
+                  style={{
+                    display: "flex",
+                    gap: 5,
+                    marginTop: 5,
+                    paddingBottom: 1,
+                    overflowX: "auto",
+                    scrollbarWidth: "thin",
+                  }}
+                >
+                  <button
+                    type="button"
+                    aria-pressed={showAllWorktreeSessions}
+                    title={t("sidebar.showAllWorktrees")}
+                    onClick={() => setShowAllWorktreeSessions(true)}
+                    style={{
+                      position: "relative",
+                      width: 24,
+                      height: 24,
+                      padding: 0,
+                      flex: "0 0 24px",
+                      borderRadius: 5,
+                      border: showAllWorktreeSessions ? "1px solid var(--accent)" : "1px solid var(--border)",
+                      background: showAllWorktreeSessions ? "var(--bg-selected)" : "var(--bg)",
+                      color: showAllWorktreeSessions ? "var(--accent)" : "var(--text-muted)",
+                      cursor: "pointer",
+                      fontSize: 10,
+                      fontWeight: 650,
+                    }}
+                  >
+                    {t("sidebar.allWorktreesShort")}
+                  </button>
+                  {worktreeState.worktrees.map((wt, index) => {
+                    const isCurrent = !showAllWorktreeSessions && wt.path === currentWorktreePath;
+                    const worktreeSessions = sessionsForWorktree(projectSessions, wt.path);
+                    const hasRunning = worktreeSessions.some((session) => runningSessionIds.has(session.id));
+                    const hasUnread = worktreeSessions.some((session) => unreadSessionIds.has(session.id));
+                    const label = wt.branch ?? displayCwd(wt.path, homeDir);
+                    return (
+                      <button
+                        key={wt.path}
+                        type="button"
+                        aria-pressed={isCurrent}
+                        aria-label={`${index + 1}: ${label}`}
+                        title={`${index + 1} · ${label}\n${wt.path}`}
+                        onClick={() => {
+                          setShowAllWorktreeSessions(false);
+                          setSelectedCwd(wt.path);
+                          setWtDropdownOpen(false);
+                          setWtError(null);
+                          setWtFilter("");
+                        }}
+                        style={{
+                          position: "relative",
+                          width: 24,
+                          height: 24,
+                          padding: 0,
+                          flex: "0 0 24px",
+                          borderRadius: 5,
+                          border: isCurrent ? "1px solid var(--accent)" : "1px solid var(--border)",
+                          background: isCurrent ? "var(--bg-selected)" : "var(--bg)",
+                          color: isCurrent ? "var(--accent)" : "var(--text-muted)",
+                          cursor: "pointer",
+                          fontFamily: "var(--font-mono)",
+                          fontSize: 10,
+                          fontWeight: isCurrent ? 700 : 550,
+                        }}
+                      >
+                        {index + 1}
+                        {(hasRunning || hasUnread) && (
+                          <span
+                            aria-hidden="true"
+                            style={{
+                              position: "absolute",
+                              top: 2,
+                              right: 2,
+                              width: 4,
+                              height: 4,
+                              borderRadius: "50%",
+                              background: hasRunning ? "var(--accent)" : "#0891b2",
+                            }}
+                          />
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
               <AnimatedDropdown
                 open={wtDropdownOpen}
                 style={{
@@ -1822,6 +1929,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
                         >
                           <button
                             onClick={() => {
+                              setShowAllWorktreeSessions(false);
                               setSelectedCwd(wt.path);
                               setWtDropdownOpen(false);
                               setWtError(null);
