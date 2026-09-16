@@ -1129,6 +1129,7 @@ function TextFileViewer({
   const [gitDiffLoading, setGitDiffLoading] = useState(false);
   const [gitDiffResolved, setGitDiffResolved] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const fileExtension = getFileExt(filePath);
   const extensionDefaultDisplayMode: DisplayMode | undefined =
@@ -1212,7 +1213,7 @@ function TextFileViewer({
     initialScrollLeft,
   ]);
 
-  const fetchContent = useCallback(async (targetPath: string) => {
+  const fetchContent = useCallback(async (targetPath: string, offset = 0) => {
     const requestId = ++contentRequestRef.current;
     contentAbortRef.current?.abort();
     const controller = new AbortController();
@@ -1220,12 +1221,15 @@ function TextFileViewer({
     const current = dataRef.current;
 
     try {
-      const response = await fetch(getFileApiUrl(targetPath, "read", sourceSessionId), {
-        signal: controller.signal,
-        headers: current ? { "If-None-Match": current.version.etag } : undefined,
-      });
+      const response = await fetch(
+        getFileApiUrl(targetPath, "read", sourceSessionId, { offset: offset || undefined }),
+        {
+          signal: controller.signal,
+          headers: offset === 0 && current ? { "If-None-Match": current.version.etag } : undefined,
+        },
+      );
       if (requestId !== contentRequestRef.current) return null;
-      if (response.status === 304 && current) {
+      if (response.status === 304 && offset === 0 && current) {
         setError(null);
         setData(current);
         return current;
@@ -1235,11 +1239,24 @@ function TextFileViewer({
         setError(next.error);
         return null;
       }
+      if (
+        offset > 0
+        && (!current || current.nextOffset !== offset || current.version.etag !== next.version.etag)
+      ) {
+        invalidateCachedTextFile(cacheKey);
+        dataRef.current = null;
+        setData(null);
+        queueMicrotask(() => void fetchContent(targetPath));
+        return null;
+      }
+      const combined = offset > 0 && current
+        ? { ...next, content: current.content + next.content }
+        : next;
       setError(null);
-      dataRef.current = next;
-      setCachedTextFile(cacheKey, next);
-      setData(next);
-      return next;
+      dataRef.current = combined;
+      setCachedTextFile(cacheKey, combined);
+      setData(combined);
+      return combined;
     } catch (nextError) {
       if (
         requestId !== contentRequestRef.current
@@ -1427,12 +1444,13 @@ function TextFileViewer({
     // explicit mode hint always wins over this default.
     if (
       defaultPreviewEligibleRef.current
+      && !data?.truncated
       && (data?.language === "markdown" || data?.language === "html")
     ) {
       defaultPreviewEligibleRef.current = false;
       updateDisplayMode("preview");
     }
-  }, [data?.language, updateDisplayMode]);
+  }, [data?.language, data?.truncated, updateDisplayMode]);
 
   const hasGitDiff = gitDiff?.supported === true && typeof gitDiff.patch === "string";
   const canShowGitDiff = gitDiffAvailable || hasGitDiff;
@@ -1456,7 +1474,7 @@ function TextFileViewer({
   const language = data?.language ?? "text";
   const isHtml = language === "html";
   const isMarkdown = language === "markdown";
-  const hasPreview = isHtml || isMarkdown;
+  const hasPreview = !data?.truncated && (isHtml || isMarkdown);
   const effectiveDisplayMode = isDeletedDiff ? "diff" : displayMode;
 
   useEffect(() => {
@@ -1568,7 +1586,7 @@ function TextFileViewer({
     : `${language} · ${lines.length} lines · ${formatSize(data!.size)}`;
 
   return (
-    <div className="file-viewer-shell" style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
+    <div className="file-viewer-shell" style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden", position: "relative" }}>
       <div
         className="file-viewer-toolbar"
         style={{
@@ -1681,6 +1699,36 @@ function TextFileViewer({
         </div>
       </div>
 
+      {data?.truncated && (
+        <div
+          className="file-viewer-load-more"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 10,
+            padding: "5px 8px",
+            border: "1px solid var(--border)",
+            borderRadius: 6,
+            color: "var(--text-dim)",
+            fontSize: 11,
+          }}
+        >
+          <span>{formatSize(data.nextOffset)} / {formatSize(data.size)}</span>
+          <button
+            type="button"
+            className="file-viewer-mode-button"
+            disabled={loadingMore}
+            onClick={() => {
+              setLoadingMore(true);
+              void fetchContent(filePath, data.nextOffset).finally(() => setLoadingMore(false));
+            }}
+          >
+            {loadingMore ? t("i18n.loading") : t("i18n.loadMore")}
+          </button>
+        </div>
+      )}
+
       {/* Content area */}
       <div
         ref={contentRef}
@@ -1689,7 +1737,7 @@ function TextFileViewer({
           viewerStateRef.current.scrollTop = event.currentTarget.scrollTop;
           viewerStateRef.current.scrollLeft = event.currentTarget.scrollLeft;
         }}
-        style={{ flex: 1, overflow: "auto", background: "var(--bg)" }}
+        style={{ flex: 1, overflow: "auto", background: "var(--bg)", paddingBottom: data?.truncated ? 48 : undefined }}
       >
         {effectiveDisplayMode === "diff" && hasGitDiff ? (
           <DiffView patch={gitDiff.patch!} />

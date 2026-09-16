@@ -66,8 +66,10 @@ test("TextFileViewer uses one watcher-owned initial content snapshot", () => {
   assert.equal(block.match(/addEventListener\("error", markDisconnected\)/g)?.length, 1);
   assert.doesNotMatch(block, /es\.onerror|consecutiveWatchFailures/);
   assert.match(block, /dataRef\.current = getCachedTextFile\(cacheKey\) \?\? null;[\s\S]*setData\(null\)/);
-  assert.match(block, /setCachedTextFile\(cacheKey, next\)/);
-  assert.match(block, /response\.status === 304 && current[\s\S]*setData\(current\)/);
+  assert.match(block, /setCachedTextFile\(cacheKey, combined\)/);
+  assert.match(block, /response\.status === 304 && offset === 0 && current[\s\S]*setData\(current\)/);
+  assert.match(block, /current\.nextOffset !== offset \|\| current\.version\.etag !== next\.version\.etag/);
+  assert.match(block, /content: current\.content \+ next\.content/);
 
   const connected = block.slice(
     block.indexOf('es.addEventListener("connected"'),

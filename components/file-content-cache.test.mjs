@@ -10,6 +10,8 @@ function data(content, etag) {
     content,
     language: "text",
     size: content.length,
+    nextOffset: content.length,
+    truncated: false,
     version: {
       exists: true,
       size: content.length,

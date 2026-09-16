@@ -9,7 +9,6 @@ import {
 import {
   DOCX_PREVIEW_MAX_BYTES,
   IMAGE_PREVIEW_MAX_BYTES,
-  TEXT_PREVIEW_MAX_BYTES,
   documentPreviewKind,
   getAudioMime,
   getDocumentMime,
@@ -39,6 +38,7 @@ import {
   documentPreviewCacheKey,
   getOrCreateDocumentPreview,
 } from "@/lib/document-preview-cache";
+import { readTextPreviewChunk } from "@/lib/text-preview";
 
 const IGNORED_NAMES = new Set([
   "node_modules", ".git", ".next", "dist", "build", "__pycache__",
@@ -132,6 +132,23 @@ function directoryVersion(stat: fs.Stats): string {
   return [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].join(":");
 }
 
+function isMissingFilePathAllowed(target: string, allowedRoots: Set<string>): boolean {
+  let current = target;
+  while (true) {
+    try {
+      fs.lstatSync(current);
+      return current !== target && isExistingFilePathAllowed(current, allowedRoots);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") return false;
+    }
+
+    const parent = path.dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
+}
+
 export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ path: string[] }> }
@@ -162,13 +179,18 @@ export async function POST(
         if (!isFilePathAllowed(candidate, root)) {
           return NextResponse.json({ error: "Access denied" }, { status: 403 });
         }
-        try {
-          if (!isExistingFilePathAllowed(candidate, root)) {
-            return NextResponse.json({ error: "Access denied" }, { status: 403 });
+        if (!isExistingFilePathAllowed(candidate, root)) {
+          if (isMissingFilePathAllowed(candidate, root)) {
+            versions[candidate] = null;
+            continue;
           }
+          return NextResponse.json({ error: "Access denied" }, { status: 403 });
+        }
+        try {
           const stat = fs.statSync(candidate);
           versions[candidate] = stat.isDirectory() ? directoryVersion(stat) : null;
         } catch {
+          // The path may disappear after authorization but before stat.
           versions[candidate] = null;
         }
       }
@@ -552,15 +574,20 @@ export async function GET(
         if (notModified) return notModified;
         return streamFile(filePath, stat, version, documentMime, request.headers.get("range"));
       }
-      if (stat.size > TEXT_PREVIEW_MAX_BYTES) {
-        return NextResponse.json({ error: "File too large for preview (>256KB)" }, { status: 413 });
+      const rawOffset = request.nextUrl.searchParams.get("offset");
+      if (rawOffset !== null && !/^\d+$/.test(rawOffset)) {
+        return NextResponse.json({ error: "Invalid text preview offset" }, { status: 400 });
+      }
+      const offset = Number(rawOffset ?? 0);
+      if (!Number.isSafeInteger(offset) || offset > stat.size) {
+        return NextResponse.json({ error: "Invalid text preview offset" }, { status: 400 });
       }
       const notModified = notModifiedResponse(request, version);
       if (notModified) return notModified;
-      const content = timing.timeSync("file-read", () => fs.readFileSync(filePath, "utf-8"));
+      const chunk = timing.timeSync("file-read", () => readTextPreviewChunk(filePath, stat.size, offset));
       const language = getLanguage(filePath);
       return timing.timeSync("serialize", () => NextResponse.json(
-        { content, language, size: stat.size, version },
+        { ...chunk, language, size: stat.size, version },
         { headers: fileVersionHeaders(version) },
       ));
     }

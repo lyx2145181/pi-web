@@ -13,7 +13,7 @@ import { clampPanelWidth } from "@/lib/panel-layout";
 
 interface DragState {
   pointerId: number;
-  startX: number;
+  startPosition: number;
   startWidth: number;
   target: HTMLDivElement;
   previousCursor: string;
@@ -22,11 +22,12 @@ interface DragState {
 
 interface UseResizablePanelOptions {
   ariaLabel: string;
+  axis?: "horizontal" | "vertical";
   cssVariable: `--${string}`;
   defaultWidth: number;
   getDefaultWidth?: () => number;
   getMaxWidth: () => number;
-  growthDirection: "left" | "right";
+  growthDirection: "left" | "right" | "up" | "down";
   maxWidth: number;
   minWidth: number;
   storageKey: string;
@@ -60,6 +61,7 @@ function writeStoredWidth(storageKey: string, width: number): void {
 export function useResizablePanel(options: UseResizablePanelOptions) {
   const {
     ariaLabel,
+    axis = "horizontal",
     cssVariable,
     defaultWidth,
     getDefaultWidth,
@@ -72,6 +74,8 @@ export function useResizablePanel(options: UseResizablePanelOptions) {
   } = options;
   const panelRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<DragState | null>(null);
+  const liveWidthRef = useRef<number | null>(null);
+  const liveWidthFrameRef = useRef<number | null>(null);
   const restoredRef = useRef(false);
   const [width, setWidth] = useState(defaultWidth);
   const [isResizing, setIsResizing] = useState(false);
@@ -93,6 +97,35 @@ export function useResizablePanel(options: UseResizablePanelOptions) {
     panelRef.current?.style.setProperty(cssVariable, `${nextWidth}px`);
   }, [cssVariable, widthRef]);
 
+  const flushLiveWidth = useCallback(() => {
+    if (liveWidthFrameRef.current !== null) {
+      cancelAnimationFrame(liveWidthFrameRef.current);
+      liveWidthFrameRef.current = null;
+    }
+    const nextWidth = liveWidthRef.current;
+    liveWidthRef.current = null;
+    const drag = dragRef.current;
+    if (nextWidth === null || !drag) return;
+    applyLiveWidth(nextWidth);
+    drag.target.setAttribute("aria-valuenow", String(nextWidth));
+    drag.target.setAttribute("aria-valuetext", `${nextWidth} px`);
+  }, [applyLiveWidth]);
+
+  const scheduleLiveWidth = useCallback((nextWidth: number) => {
+    liveWidthRef.current = nextWidth;
+    if (liveWidthFrameRef.current !== null) return;
+    liveWidthFrameRef.current = requestAnimationFrame(() => {
+      liveWidthFrameRef.current = null;
+      const widthToApply = liveWidthRef.current;
+      liveWidthRef.current = null;
+      const drag = dragRef.current;
+      if (widthToApply === null || !drag) return;
+      applyLiveWidth(widthToApply);
+      drag.target.setAttribute("aria-valuenow", String(widthToApply));
+      drag.target.setAttribute("aria-valuetext", `${widthToApply} px`);
+    });
+  }, [applyLiveWidth]);
+
   const commitWidth = useCallback((candidate: number, commitOptions: CommitOptions = {}) => {
     const { forcePersist = false, persist = true } = commitOptions;
     const nextWidth = clampWidth(candidate);
@@ -111,6 +144,7 @@ export function useResizablePanel(options: UseResizablePanelOptions) {
   const finishResize = useCallback((pointerId: number) => {
     const drag = dragRef.current;
     if (!drag || drag.pointerId !== pointerId) return;
+    flushLiveWidth();
     dragRef.current = null;
     restoreBodyState(drag);
     setIsResizing(false);
@@ -123,7 +157,7 @@ export function useResizablePanel(options: UseResizablePanelOptions) {
     } catch {
       // The browser may have already released capture after pointer cancellation.
     }
-  }, [commitWidth, restoreBodyState, widthRef]);
+  }, [commitWidth, flushLiveWidth, restoreBodyState, widthRef]);
 
   const onPointerDown = useCallback((event: PointerEvent<HTMLDivElement>) => {
     if (event.pointerType === "mouse" && event.button !== 0) return;
@@ -138,16 +172,16 @@ export function useResizablePanel(options: UseResizablePanelOptions) {
     target.setPointerCapture(event.pointerId);
     dragRef.current = {
       pointerId: event.pointerId,
-      startX: event.clientX,
+      startPosition: axis === "vertical" ? event.clientY : event.clientX,
       startWidth: widthRef.current,
       target,
       previousCursor: document.body.style.cursor,
       previousUserSelect: document.body.style.userSelect,
     };
-    document.body.style.cursor = "col-resize";
+    document.body.style.cursor = axis === "vertical" ? "row-resize" : "col-resize";
     document.body.style.userSelect = "none";
     setIsResizing(true);
-  }, [finishResize, widthRef]);
+  }, [axis, finishResize, widthRef]);
 
   const onPointerMove = useCallback((event: PointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current;
@@ -158,12 +192,11 @@ export function useResizablePanel(options: UseResizablePanelOptions) {
     }
     event.preventDefault();
 
-    const direction = growthDirection === "right" ? 1 : -1;
-    const nextWidth = clampWidth(drag.startWidth + ((event.clientX - drag.startX) * direction));
-    applyLiveWidth(nextWidth);
-    event.currentTarget.setAttribute("aria-valuenow", String(nextWidth));
-    event.currentTarget.setAttribute("aria-valuetext", `${nextWidth} px`);
-  }, [applyLiveWidth, clampWidth, finishResize, growthDirection]);
+    const direction = growthDirection === "right" || growthDirection === "down" ? 1 : -1;
+    const position = axis === "vertical" ? event.clientY : event.clientX;
+    const nextWidth = clampWidth(drag.startWidth + ((position - drag.startPosition) * direction));
+    scheduleLiveWidth(nextWidth);
+  }, [axis, clampWidth, finishResize, growthDirection, scheduleLiveWidth]);
 
   const onPointerUp = useCallback((event: PointerEvent<HTMLDivElement>) => {
     finishResize(event.pointerId);
@@ -188,8 +221,11 @@ export function useResizablePanel(options: UseResizablePanelOptions) {
 
   const onKeyDown = useCallback((event: KeyboardEvent<HTMLDivElement>) => {
     const step = event.shiftKey ? 32 : 12;
-    const growKey = growthDirection === "right" ? "ArrowRight" : "ArrowLeft";
-    const shrinkKey = growthDirection === "right" ? "ArrowLeft" : "ArrowRight";
+    const positiveDirection = growthDirection === "right" || growthDirection === "down";
+    const positiveKey = axis === "vertical" ? "ArrowDown" : "ArrowRight";
+    const negativeKey = axis === "vertical" ? "ArrowUp" : "ArrowLeft";
+    const growKey = positiveDirection ? positiveKey : negativeKey;
+    const shrinkKey = positiveDirection ? negativeKey : positiveKey;
 
     if (event.key === growKey) {
       event.preventDefault();
@@ -207,7 +243,7 @@ export function useResizablePanel(options: UseResizablePanelOptions) {
       event.preventDefault();
       resetWidth();
     }
-  }, [commitWidth, effectiveMaxWidth, growthDirection, minWidth, resetWidth, widthRef]);
+  }, [axis, commitWidth, effectiveMaxWidth, growthDirection, minWidth, resetWidth, widthRef]);
 
   useEffect(() => {
     if (restoredRef.current) return;
@@ -251,6 +287,11 @@ export function useResizablePanel(options: UseResizablePanelOptions) {
 
   useEffect(() => {
     return () => {
+      if (liveWidthFrameRef.current !== null) {
+        cancelAnimationFrame(liveWidthFrameRef.current);
+        liveWidthFrameRef.current = null;
+      }
+      liveWidthRef.current = null;
       const drag = dragRef.current;
       if (!drag) return;
       dragRef.current = null;
@@ -265,7 +306,7 @@ export function useResizablePanel(options: UseResizablePanelOptions) {
     resetWidth,
     separatorProps: {
       "aria-label": ariaLabel,
-      "aria-orientation": "vertical" as const,
+      "aria-orientation": axis === "vertical" ? "horizontal" as const : "vertical" as const,
       "aria-valuemax": mounted ? effectiveMaxWidth() : maxWidth,
       "aria-valuemin": minWidth,
       "aria-valuenow": width,

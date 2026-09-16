@@ -64,7 +64,7 @@ test("列表请求只加载一次，保留计时、版本和通知字段", async
   assert.equal(state.calls[0].force, true);
   assert.match(response.headers.get("Server-Timing"), /session-scan;dur=/);
   assert.equal(response.headers.get("Cache-Control"), "no-store");
-  assert.equal(response.headers.get("Vary"), "Accept-Encoding");
+  assert.equal(response.headers.get("Vary"), null);
   assert.deepEqual(await response.json(), {
     sessions: [], sessionListVersion: 7,
     runningSessionIds: ["running"], completionNotificationSuppressedSessionIds: ["child"],
@@ -82,7 +82,7 @@ test("客户端支持 gzip 时压缩大响应并保持 JSON 内容一致", async
   assert.equal(compressed.status, 200);
   assert.equal(compressed.headers.get("Content-Encoding"), "gzip");
   assert.equal(compressed.headers.get("Vary"), "Accept-Encoding");
-  assert.match(compressed.headers.get("Server-Timing"), /compress;dur=/);
+  assert.match(compressed.headers.get("Server-Timing"), /serialize;dur=/);
   const decoded = JSON.parse(gunzipSync(Buffer.from(await compressed.arrayBuffer())).toString("utf8"));
   assert.equal(decoded.sessions[0].name.length, 4096);
 
