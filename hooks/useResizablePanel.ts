@@ -74,6 +74,8 @@ export function useResizablePanel(options: UseResizablePanelOptions) {
   } = options;
   const panelRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<DragState | null>(null);
+  const liveWidthRef = useRef<number | null>(null);
+  const liveWidthFrameRef = useRef<number | null>(null);
   const restoredRef = useRef(false);
   const [width, setWidth] = useState(defaultWidth);
   const [isResizing, setIsResizing] = useState(false);
@@ -95,6 +97,35 @@ export function useResizablePanel(options: UseResizablePanelOptions) {
     panelRef.current?.style.setProperty(cssVariable, `${nextWidth}px`);
   }, [cssVariable, widthRef]);
 
+  const flushLiveWidth = useCallback(() => {
+    if (liveWidthFrameRef.current !== null) {
+      cancelAnimationFrame(liveWidthFrameRef.current);
+      liveWidthFrameRef.current = null;
+    }
+    const nextWidth = liveWidthRef.current;
+    liveWidthRef.current = null;
+    const drag = dragRef.current;
+    if (nextWidth === null || !drag) return;
+    applyLiveWidth(nextWidth);
+    drag.target.setAttribute("aria-valuenow", String(nextWidth));
+    drag.target.setAttribute("aria-valuetext", `${nextWidth} px`);
+  }, [applyLiveWidth]);
+
+  const scheduleLiveWidth = useCallback((nextWidth: number) => {
+    liveWidthRef.current = nextWidth;
+    if (liveWidthFrameRef.current !== null) return;
+    liveWidthFrameRef.current = requestAnimationFrame(() => {
+      liveWidthFrameRef.current = null;
+      const widthToApply = liveWidthRef.current;
+      liveWidthRef.current = null;
+      const drag = dragRef.current;
+      if (widthToApply === null || !drag) return;
+      applyLiveWidth(widthToApply);
+      drag.target.setAttribute("aria-valuenow", String(widthToApply));
+      drag.target.setAttribute("aria-valuetext", `${widthToApply} px`);
+    });
+  }, [applyLiveWidth]);
+
   const commitWidth = useCallback((candidate: number, commitOptions: CommitOptions = {}) => {
     const { forcePersist = false, persist = true } = commitOptions;
     const nextWidth = clampWidth(candidate);
@@ -113,6 +144,7 @@ export function useResizablePanel(options: UseResizablePanelOptions) {
   const finishResize = useCallback((pointerId: number) => {
     const drag = dragRef.current;
     if (!drag || drag.pointerId !== pointerId) return;
+    flushLiveWidth();
     dragRef.current = null;
     restoreBodyState(drag);
     setIsResizing(false);
@@ -125,7 +157,7 @@ export function useResizablePanel(options: UseResizablePanelOptions) {
     } catch {
       // The browser may have already released capture after pointer cancellation.
     }
-  }, [commitWidth, restoreBodyState, widthRef]);
+  }, [commitWidth, flushLiveWidth, restoreBodyState, widthRef]);
 
   const onPointerDown = useCallback((event: PointerEvent<HTMLDivElement>) => {
     if (event.pointerType === "mouse" && event.button !== 0) return;
@@ -163,10 +195,8 @@ export function useResizablePanel(options: UseResizablePanelOptions) {
     const direction = growthDirection === "right" || growthDirection === "down" ? 1 : -1;
     const position = axis === "vertical" ? event.clientY : event.clientX;
     const nextWidth = clampWidth(drag.startWidth + ((position - drag.startPosition) * direction));
-    applyLiveWidth(nextWidth);
-    event.currentTarget.setAttribute("aria-valuenow", String(nextWidth));
-    event.currentTarget.setAttribute("aria-valuetext", `${nextWidth} px`);
-  }, [applyLiveWidth, axis, clampWidth, finishResize, growthDirection]);
+    scheduleLiveWidth(nextWidth);
+  }, [axis, clampWidth, finishResize, growthDirection, scheduleLiveWidth]);
 
   const onPointerUp = useCallback((event: PointerEvent<HTMLDivElement>) => {
     finishResize(event.pointerId);
@@ -257,6 +287,11 @@ export function useResizablePanel(options: UseResizablePanelOptions) {
 
   useEffect(() => {
     return () => {
+      if (liveWidthFrameRef.current !== null) {
+        cancelAnimationFrame(liveWidthFrameRef.current);
+        liveWidthFrameRef.current = null;
+      }
+      liveWidthRef.current = null;
       const drag = dragRef.current;
       if (!drag) return;
       dragRef.current = null;
