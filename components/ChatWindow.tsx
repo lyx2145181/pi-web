@@ -5,7 +5,7 @@ import { createPortal } from "react-dom";
 import type { AgentMessage, AssistantContentBlock, AssistantMessage, BashExecutionMessage, BlockingExtensionUiRequest, ExtensionUiRequest, SessionInfo, SessionTreeNode, ToolResultMessage, UserMessage } from "@/lib/types";
 import { normalizeCustomPanelLines } from "@/lib/ansi";
 import { asBracketedPaste, toTerminalKeyData } from "@/lib/terminal-input";
-import { countToolCallBlocks, getAssistantErrorMessage, getDisplayableAssistantBlocks, isMessageGroupAnchor, splitFinalAssistantBlocks } from "@/lib/message-display";
+import { countToolCallBlocks, getAssistantErrorMessage, getDisplayableAssistantBlocks, isAssistantTruncated, isMessageGroupAnchor, splitFinalAssistantBlocks } from "@/lib/message-display";
 import { extractTurnWrittenFiles, type WrittenFile } from "@/lib/turn-written-files";
 import { buildQuotedSelection } from "@/lib/quoted-selection";
 import { MessageView } from "./MessageView";
@@ -219,7 +219,7 @@ function prepareHistoryTurns(messages: AgentMessage[], toolResults: Map<string, 
     if (finalAssistantIdx !== -1) {
       const finalAssistant = messages[finalAssistantIdx] as AssistantMessage;
       const finalSplit = splitFinalAssistantBlocks(finalAssistant);
-      const finalAnswerMessage = finalSplit.answerBlocks.length > 0 || getAssistantErrorMessage(finalAssistant)
+      const finalAnswerMessage = finalSplit.answerBlocks.length > 0 || getAssistantErrorMessage(finalAssistant) || isAssistantTruncated(finalAssistant)
         ? withAssistantBlocks(finalAssistant, finalSplit.answerBlocks)
         : null;
       const finalProcessEnd = finalAssistant.content.indexOf(finalSplit.answerBlocks[0]);
@@ -342,8 +342,10 @@ export const ChatWindow = memo(function ChatWindow({ session, searchTarget, onSe
     slashCommands, slashCommandsLoading, queuedMessages,
     notices, extensionDialog, extensionCustomUi, extensionStatuses, extensionWidgets, respondToExtensionUi, sendExtensionCustomInput, setNoticePaused,
     isAutoModelSelection,
+    isAutoThinkingSelection,
     agentPhase,
     isNew,
+    showScrollToBottom,
     sessionIdRef, scrollContainerRef,
     lastUserMsgRef, promptAnchorActive,
     handleSend, handleAbort, handleFork, handleNavigate, handleModelChange,
@@ -991,6 +993,7 @@ export const ChatWindow = memo(function ChatWindow({ session, searchTarget, onSe
       toolPreset={toolPreset}
       onToolPresetChange={session || isNew ? handleToolPresetChange : undefined}
       thinkingLevel={thinkingLevel}
+      isAutoThinkingSelection={isAutoThinkingSelection}
       onThinkingLevelChange={session || isNew ? handleThinkingLevelChange : undefined}
       availableThinkingLevels={availableThinkingLevels}
       thinkingLevelMap={currentThinkingLevelMap}
@@ -1445,6 +1448,33 @@ export const ChatWindow = memo(function ChatWindow({ session, searchTarget, onSe
       )}
 
       <div className="relative shrink-0">
+        {!isEmptyNew && (
+          <div
+            style={{
+              position: "absolute",
+              bottom: "100%",
+              left: 0,
+              right: isMobile ? 0 : CHAT_MINIMAP_WIDTH,
+              display: "flex",
+              justifyContent: "center",
+              paddingBottom: 10,
+              pointerEvents: "none",
+              zIndex: 20,
+            }}
+          >
+            <button
+              type="button"
+              className={`chat-scroll-to-bottom${showScrollToBottom && !pendingScrollRestore ? " is-visible" : ""}`}
+              title={t("chat.scrollToLatest")}
+              aria-label={t("chat.scrollToLatest")}
+              onClick={() => scrollToBottom("smooth")}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M12 5v14M5 12l7 7 7-7" />
+              </svg>
+            </button>
+          </div>
+        )}
         {chatInputElement}
         <ExtensionStatusBar statuses={extensionStatuses} widgets={extensionWidgets} />
       </div>
@@ -1677,9 +1707,11 @@ function ExtensionDialog({
           overflow: "hidden",
         }}
       >
-        <div style={{ flexShrink: 0, display: "flex", alignItems: "flex-start", gap: 8, padding: "12px 14px", borderBottom: "1px solid var(--border)" }}>
+        <div style={{ flexShrink: 0, display: "flex", alignItems: "flex-start", gap: 8, padding: "12px 14px", borderBottom: "1px solid var(--border)", maxHeight: "50%", overflowY: "auto" }}>
           <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ color: "var(--text)", fontSize: 14, fontWeight: 650 }}>{request.title}</div>
+            {/* Pi's TUI shows the title verbatim, newlines included; select/input have no
+                separate message field, so extensions put multi-line text here. */}
+            <div style={{ color: "var(--text)", fontSize: 14, fontWeight: 650, lineHeight: 1.45, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>{request.title}</div>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 3, color: "var(--text-dim)", fontSize: 11, fontFamily: "var(--font-mono)" }}>
               <span>{t("chat.extensionRequest")}</span>
               {countdown}
@@ -1760,6 +1792,10 @@ function ExtensionDialog({
                     textAlign: "left",
                     fontSize: 13,
                     overflowWrap: "anywhere",
+                    // Match the scroller's padding so keyboard navigation never parks the
+                    // option flush against the edge, where whole-pixel scroll snapping and
+                    // overflow clipping cut off its focus ring.
+                    scrollMargin: 14,
                   }}
                 >
                   <div inert>
