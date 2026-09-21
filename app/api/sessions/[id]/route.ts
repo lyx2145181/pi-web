@@ -45,7 +45,21 @@ export async function GET(
   const { id } = await params;
   try {
     const rpc = getRpcSession(id);
-    const liveRpc = rpc?.isAlive() ? rpc : undefined;
+    const searchParams = new URL(req.url).searchParams;
+    const force = searchParams.get("force") === "1";
+
+    // A live wrapper only reflects the appends pi-web itself made. When another
+    // pi process (the TUI) writes the same session file, the in-memory index
+    // stays stale. Only probe on ?force=1 (session mount / page refresh): two
+    // processes writing one JSONL is unsupported, so post-turn reads must not
+    // scan disk. Eviction is idle-only; mid-run the wrapper owns the write path.
+    let liveWrapper = rpc?.isAlive() ? rpc : undefined;
+    let wrapperRebuilt = false;
+    if (force && liveWrapper?.evictIfDiskAhead()) {
+      wrapperRebuilt = true;
+      liveWrapper = undefined;
+    }
+    const liveRpc = liveWrapper;
     const resolvedPath = liveRpc
       ? null
       : await timing.time("resolve", () => resolveSessionPath(id));
@@ -63,7 +77,6 @@ export async function GET(
       leafId: sm ? sm.getLeafId() : diskSnapshot!.leafId,
       tree: sm ? projectTreeForResponse(sm.getTree()) : diskSnapshot!.tree,
     }));
-    const searchParams = new URL(req.url).searchParams;
     const deferThinking = searchParams.has("deferThinking");
     const deferToolResultImages = searchParams.has("deferMedia");
     const pageRequest = parseSessionContextPageRequest(searchParams);
@@ -157,6 +170,7 @@ export async function GET(
         ...(skillSelection !== undefined
           ? { skillNames: skillSelection.skills, skillPolicy: skillSelection.mode }
           : {}),
+        ...(wrapperRebuilt ? { wrapperRebuilt: true } : {}),
       },
     ));
     return timing.finish(response);

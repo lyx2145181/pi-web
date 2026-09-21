@@ -34,3 +34,8 @@ test("diff and preview branches win before the memoized source fallback", () => 
   assert.ok(diff >= 0 && html > diff && markdown > html && sourceFallback > markdown);
   assert.match(block.slice(sourceFallback), /content=\{deferredSourceContent\}/);
 });
+
+test("markdown preview links carry PDF page fragments", () => {
+  assert.match(source, /parsePdfPageFragment/);
+  assert.match(source, /onOpenFile\(linkedFile, parsePdfPageFragment\(href\) \?\? undefined\)/);
+});

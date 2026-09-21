@@ -63,6 +63,8 @@ export interface SessionData {
   inputHistory?: string[];
   /** Cumulative usage over ALL session-file entries (incl. compacted history). */
   stats?: SessionFileStats;
+  /** True when GET ?force=1 dropped a stale live wrapper and rebuilt from disk. */
+  wrapperRebuilt?: boolean;
 }
 
 interface ContextPageResponse {
@@ -519,7 +521,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     } satisfies SessionStatsInfo;
   }, [messages, sessionStatsOverride, contextStats, contextUsage, data?.context.messages, data?.filePath, data?.totalActiveMs, data?.stats, session?.id, session?.name]);
 
-  const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false) => {
+  const loadSession = useCallback(async (sid: string, showLoading = false, includeState = false, options?: { force?: boolean }) => {
     if (sessionIdRef.current !== sid) return null;
     const generation = sessionLoadGenerationRef.current + 1;
     sessionLoadGenerationRef.current = generation;
@@ -548,6 +550,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         deferMedia: "1",
         tail: String(INITIAL_SESSION_CONTEXT_MESSAGES),
       });
+      if (options?.force) params.set("force", "1");
       const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}?${params}`, {
         signal: controller.signal,
       });
@@ -583,6 +586,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       setToolPresetState(d.toolNames !== undefined ? getPresetFromToolNames(d.toolNames) : "default");
       setCurrentModelOverride((current) => modelSwitchPendingRef.current ? current : null);
       setError(null);
+      if (d.wrapperRebuilt) {
+        eventConnectionRef.current?.close();
+        eventConnectionRef.current?.maintain(sid);
+      }
       if (d.context.thinkingLevel && d.context.thinkingLevel !== "off") {
         setThinkingLevel(d.context.thinkingLevel as ThinkingLevelOption);
       }
@@ -2300,7 +2307,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     setQueuedMessages({ steering: [], followUp: [] });
     dispatch({ type: "end" });
 
-    void loadSession(sid, true, true).then((agentState) => {
+    void loadSession(sid, true, true, { force: true }).then((agentState) => {
       if (sessionIdRef.current !== sid || !agentState) return;
       if (agentState.running) {
         void loadTools(sid);

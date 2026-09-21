@@ -112,6 +112,10 @@ app/api/
 
 bin/
   process-lifecycle.js forwards shutdown signals to the spawned Next.js child
+  pi-web-node-args.js adds the RISC-V Wasm startup flag without changing other platforms
+
+instrumentation.ts / instrumentation-node.ts
+  keep Node-only HTTP/SSE shutdown hooks out of the Edge instrumentation graph
 
 scripts/
   interaction-browser-baseline.mjs measures local navigation, ordinary/rapid session switching, paged history loading, Viewer and Explorer refresh interactions, API request counts, and browser long tasks through a temporary headless Chrome profile
@@ -119,6 +123,7 @@ scripts/
 
 lib/
   agent-client.ts      typed fetch helper for /api/agent commands
+  auth-throttle.ts     process-wide backoff for failed web-password attempts
   agent-event-wire.ts  filters/projects SDK events into SSE-safe client deltas
   agent-session-services.ts serialized extension-aware SDK service creation
   draft-store.ts       local draft persistence helpers
@@ -129,11 +134,14 @@ lib/
   git-changes.ts       bounded checkout/CWD status snapshots and on-demand file diff helpers
   git-process.ts       shared bounded-concurrency Git subprocess runner
   markdown.ts          shared markdown helpers
+  model-runtime.ts     runtime adapter for provider models and auth capabilities
+  node-cli.ts          locate npm/npx CLI scripts for shell-free child processes
   npx.ts               npx runner used by skill install
   pi-types.ts          local structural types for pi SDK objects
   project-command-env.ts sanitized built-in project shell operations
   project-groups.ts    stable-key project grouping and activity aggregation
   project-identity.ts  platform-aware internal project identity
+  provider-usage.ts    provider quota/usage lookup helpers
   rpc-manager.ts      AgentSessionWrapper + registry + startRpcSession
   server-timing.ts    request-local, non-sensitive Server-Timing metric collector
   session-context-page.ts bounded tail/earlier context paging plus full-context stats/history summaries
@@ -259,7 +267,7 @@ Newer pi emits `compaction_start` / `compaction_end`; older versions emitted `au
 - `lib/worktree.ts` resolves linked worktree top-levels back to the main repo `projectRoot`; `listAllSessions()` attaches both that display/filesystem path and a stable server-computed `projectKey` to each `SessionInfo` so all worktrees for one repo are grouped together in the sidebar.
 - Grouping and equality use `projectKey` through `workspaceKeyOf()` / `lib/project-groups.ts`; keep `projectRoot` or `cwd` for display and filesystem operations. This is required on Windows, where project identity is case- and separator-insensitive.
 - Worktree operations are served by `/api/worktrees` and guarded by the same allowed-root rules as `/api/files`. Canonical CWD project discovery uses a 60-second/256-entry LRU; `ProjectInfo.repositoryRoot` identifies the current checkout while `gitCommonRoot` identifies the main repo shared by linked worktrees. Worktree lists use a 5-second/64-project LRU plus common-root in-flight coalescing.
-- New worktrees are created under `<repoRoot>-worktrees/<sanitized-branch>`. Existing branches are reused; otherwise `git worktree add -b` creates the branch.
+- New worktrees are created under `<repoRoot>-worktrees/<sanitized-branch>`. Existing branches are reused; otherwise `git worktree add -b` creates the branch from an already-fetched `origin/<branch>` ref when available, falling back to local `HEAD`; creation uses a five-minute Git timeout and does not fetch implicitly.
 - Removing a dirty worktree returns `409` with `{ dirty: true }` so the UI can ask before retrying with `force`.
 - Sessions whose cwd points at a removed worktree are inferred back into the main project instead of becoming a phantom project row.
 - All Git callers share `lib/git-process.ts`'s eight-process global pool. Git status uses 1.5-second, 32-entry checkout/CWD LRUs: porcelain is shared per checkout, cwd-scoped line stats and untracked counts are stored in the response snapshot, and file Diff reuses porcelain while fetching the patch only on demand. Agent/Bash completion invalidates the affected checkout; explicit refresh uses `force=1`.
@@ -281,7 +289,7 @@ Newer pi emits `compaction_start` / `compaction_end`; older versions emitted `au
 
 ### File viewer versioning and cache
 - File `read`, `meta`, media/download streams, and DOCX preview expose one opaque metadata-derived version through `ETag`/`Last-Modified`; conditional checks happen only after lexical, session-reference, and realpath authorization.
-- File watchers re-stat after `fs.watch` is established and send the same full version on `connected` and `change`, including explicit missing-file identity. Text, image, audio, video, PDF, and DOCX viewers start their only initial snapshot from that shared handshake; media URLs use its ETag as their identity. Cached text is bounded by requested path plus `sourceSessionId` and is not rendered until the current watcher or conditional request has re-authorized and validated it. Each EventSource owns one error listener and retains browser auto-reconnect after transient post-connect failures.
+- File watchers re-stat after `fs.watch` is established and send the same full version on `connected` and `change`, including explicit missing-file identity. Text, image, audio, video, PDF, and DOCX viewers start their only initial snapshot from that shared handshake; media URLs use its ETag as their identity. Cached text is bounded by requested path plus `sourceSessionId` and is not rendered until the current watcher or conditional request has re-authorized and validated it. Each EventSource owns one error listener and retains browser auto-reconnect after transient post-connect failures. Markdown local links preserve a valid PDF `#page=N` fragment through tab state and the versioned PDF URL.
 - DOCX conversion output uses a separate bounded server LRU keyed by path and file ETag. Equal conversions share in-flight work, and route authorization still runs before every cache lookup or 304 response.
 
 ### Plugins and skills
@@ -294,7 +302,7 @@ Newer pi emits `compaction_start` / `compaction_end`; older versions emitted `au
 - The global `builtInEnabled` switch is persisted in `~/.pi/agent/agents/settings.json` and defaults to `false` when the file or field is absent. Malformed settings fail closed; atomic updates preserve unknown fields.
 - The inline built-in extension factory is always present so reloading an existing wrapper can apply setting changes, but it registers no tools while disabled. After changing the switch, the user must explicitly reload the current session.
 - When enabled, only a recognized legacy `pi-subagents` extension that registers any reserved tool (`Agent`, `get_subagent_result`, or `steer_subagent`) is removed. Unrelated extensions remain loaded, and resolved conflict diagnostics are discarded.
-- Runtime `Agent` dispatch checks the setting again so a stale tool call cannot start a subagent after the feature is switched off.
+- Runtime `Agent` dispatch checks the setting again so a stale tool call cannot start a subagent after the feature is switched off. Provider-stream failures are persisted as failed runs, not completed runs.
 - See `docs/adr/0003-built-in-subagent-toggle.md` for the precedence and persistence rationale.
 - Agent profile files (`~/.pi/agent/agents/*.md`, project `.pi/agents/*.md`) are shared with other runtimes, so a save round-trips the frontmatter keys this app does not own (`name`, `allowed_subagents`, `exclude_extensions`, `disallowed_tools`, …) and carries foreign `ext:` tool selectors through. Managed keys are exactly `description`, `display_name`, `tools`, `load_skills`, `load_extensions`, `enabled`, `inherit_context`, `run_in_background`, `model`, `thinking`, `max_turns`.
 - The `skills` / `extensions` spellings pi-subagents reads are seeded on first save and kept in step while they are booleans; a hand-authored whitelist such as `extensions: pi-advisor-flow` is never rewritten, and the two flags fall back to those aliases when `load_skills` / `load_extensions` are absent.
@@ -305,7 +313,12 @@ Newer pi emits `compaction_start` / `compaction_end`; older versions emitted `au
 - auth.json holds **one** credential per provider and `ModelRuntime.logout()` deletes whichever it is. The delete routes therefore use `removeStoredCredentialIfType()` to compare and delete under the same file lock used by pi's auth storage. `ModelsConfig` also refreshes *both* provider lists after any auth change — refreshing one leaves a dual-auth provider rendered twice.
 - OAuth/device-code/manual-code flows are streamed by `GET /api/auth/login/[provider]`; manual code responses POST back with a short-lived token stored in `globalThis.__piLoginCallbacks`.
 - API-key routes store and remove keys through `AuthStorage`. Status endpoints must never return the raw key.
+- Browser password auth uses a signed `pi_web_session` cookie with `SameSite=Lax`; the API keeps Basic Auth compatibility, while failed password attempts use process-wide backoff and return `Retry-After`.
+- Provider model/auth listings include extension-registered providers, and OpenCode Go quota is exposed through the provider-usage helper when available.
 - The model test route is `app/api/models-config/test/route.ts`; `app/api/models/test/` is not a real route.
+
+### Runtime and PWA safety
+- `next.config.ts` keeps the proxy request buffer above the 100 MiB upload route limit, and `public/sw.js` bounds navigation/static-asset fetches so a dead upstream cannot hang the app indefinitely.
 
 ### Completion sound
 - `hooks/useAudio.ts` stores the toggle in `localStorage` as `pi-sound-enabled` and reuses one `AudioContext`.

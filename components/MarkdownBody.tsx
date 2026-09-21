@@ -2,7 +2,7 @@
 
 import { memo, useMemo, type MouseEvent } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
-import { resolveLocalFileHref, shouldOpenLocalFileInApp } from "@/lib/file-links";
+import { parsePdfPageFragment, resolveLocalFileHref, shouldOpenLocalFileInApp } from "@/lib/file-links";
 import { encodeFilePathForApi } from "@/lib/file-paths";
 import { markdownRehypePlugins, markdownRemarkPlugins, markdownUrlTransform, normalizeDisplayMath } from "@/lib/markdown";
 import { MermaidBlock, CodeBlock } from "./MermaidBlock";
@@ -12,7 +12,7 @@ interface MarkdownBodyProps {
   className?: string;
   isStreaming?: boolean;
   cwd?: string;
-  onOpenFile?: (filePath: string) => void;
+  onOpenFile?: (filePath: string, page?: number) => void;
 }
 
 export const MarkdownBody = memo(function MarkdownBody({ children, className, isStreaming, cwd, onOpenFile }: MarkdownBodyProps) {
@@ -65,7 +65,7 @@ export const MarkdownBody = memo(function MarkdownBody({ children, className, is
         const target = event.currentTarget.getAttribute("target");
         if (target && target !== "_self") return;
         event.preventDefault();
-        openFile(filePath);
+        openFile(filePath, parsePdfPageFragment(href) ?? undefined);
       };
 
       return (

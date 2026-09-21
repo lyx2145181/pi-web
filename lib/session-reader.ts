@@ -2,7 +2,7 @@ import {
   SessionManager,
   getAgentDir,
 } from "@earendil-works/pi-coding-agent";
-import { closeSync, type Dirent, existsSync, openSync, readSync } from "fs";
+import { closeSync, fstatSync, type Dirent, existsSync, openSync, readSync } from "fs";
 import { readdir } from "fs/promises";
 import { isAbsolute, join, normalize as normalizePath, relative, resolve as resolvePath, sep } from "path";
 import type { AgentMessage, ImageContent, SessionEntry, SessionHeader, SessionInfo, SessionContext } from "./types";
@@ -22,6 +22,8 @@ import type { IndexedSessionMetadata } from "./session-index-core.mts";
 export { getAgentDir };
 
 const SESSION_HEADER_MAX_BYTES = 64 * 1024;
+// Bounded probe for the newest entry id; never reads a whole session file.
+const SESSION_TAIL_PROBE_MAX_BYTES = 64 * 1024;
 
 function readBoundedLines(filePath: string, maxBytes: number, maxLines: number): string[] {
   const fd = openSync(filePath, "r");
@@ -60,6 +62,69 @@ function readBoundedLines(filePath: string, maxBytes: number, maxLines: number):
   } finally {
     closeSync(fd);
   }
+}
+
+function readBoundedTailLines(filePath: string, maxBytes: number): string[] {
+  const fd = openSync(filePath, "r");
+  try {
+    const fileSize = fstatSync(fd).size;
+    const start = Math.max(0, fileSize - maxBytes);
+    const buffer = Buffer.allocUnsafe(fileSize - start);
+    const bytesRead = readSync(fd, buffer, 0, buffer.length, start);
+    if (bytesRead === 0) return [];
+
+    const lines = buffer.subarray(0, bytesRead).toString("utf8").split("\n");
+    if (start > 0) {
+      const previousByte = Buffer.allocUnsafe(1);
+      readSync(fd, previousByte, 0, 1, start - 1);
+      if (previousByte[0] !== 0x0a) lines.shift();
+    }
+    if (lines.at(-1) === "") lines.pop();
+    return lines.map((line) => line.endsWith("\r") ? line.slice(0, -1) : line);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Entry id carried by one serialized JSONL line, or undefined when the line is
+ * the session header, malformed, or a torn trailing write mid-append.
+ *
+ * The header carries the session id rather than an entry id, and the SDK's entry
+ * index excludes it — treating it as an entry would evict a fresh wrapper.
+ */
+function readEntryId(line: string): string | undefined {
+  try {
+    const entry = JSON.parse(line) as { type?: unknown; id?: unknown };
+    if (entry.type === "session") return undefined;
+    return typeof entry.id === "string" && entry.id ? entry.id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Newest entry id recorded on disk, read from a bounded tail so large sessions
+ * stay cheap. Undefined when the file is absent (a wrapper that has not flushed
+ * its first assistant turn yet) or unreadable.
+ *
+ * Used only on ?force=1 session reads (mount / page refresh). An id the
+ * in-memory wrapper never saw means another pi process appended to the file.
+ */
+export function readLatestSessionEntryId(filePath: string | undefined): string | undefined {
+  if (!filePath) return undefined;
+  let lines: string[];
+  try {
+    lines = readBoundedTailLines(filePath, SESSION_TAIL_PROBE_MAX_BYTES);
+  } catch {
+    return undefined;
+  }
+  // Walk backwards so a torn trailing line falls back to the previous entry.
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const entryId = readEntryId(lines[index]);
+    if (entryId) return entryId;
+  }
+  return undefined;
 }
 
 export async function attachSessionProjectInfo(sessions: SessionInfo[]): Promise<SessionInfo[]> {
@@ -531,11 +596,34 @@ export function buildSessionContext(
 }
 
 /**
+ * Entry that renders as a standalone visible message in the chat window:
+ * user / assistant messages plus the compaction divider. toolResult entries,
+ * hidden custom messages and session meta render as attachments or nothing,
+ * so they must not consume the `tail` budget — counting raw entries starves
+ * user messages out of the window in agent-heavy sessions (a 50-entry window
+ * over a tool-heavy session can hold a single user message).
+ */
+function countsTowardTail(entry: SessionEntry): boolean {
+  if (entry.type === "compaction") return true;
+  if (entry.type !== "message") return false;
+  const role = (entry as { message?: { role?: string } }).message?.role;
+  return role === "user" || role === "assistant";
+}
+
+/**
+ * Raw-entry ceiling for one page, so a span of tool traffic with few visible
+ * anchors cannot balloon the payload. Scaled with `tail`; older history still
+ * pages in via `before`.
+ */
+const MIN_RAW_WINDOW_ENTRIES = 200;
+const rawWindowCap = (tail: number) => Math.max(MIN_RAW_WINDOW_ENTRIES, tail * 6);
+
+/**
  * Extract the ancestor chain from `leafId` back toward the root, capped at
- * `tail` entries (most-recent first after the final reverse). Iterative: a
- * linear session's chain length equals its entry count, so a recursive walk
- * would overflow the stack. The result is still a valid prefix of the active
- * branch — older history is loaded on demand via pagination.
+ * `tail` visible entries (most-recent first after the final reverse).
+ * Iterative: a linear session's chain length equals its entry count, so a
+ * recursive walk would overflow the stack. The result is still a valid prefix
+ * of the active branch — older history is loaded on demand via pagination.
  */
 export function sliceActiveBranch(
   entries: SessionEntry[],
@@ -554,8 +642,12 @@ export function sliceActiveBranch(
   if (!leaf) return [];
   const chain: SessionEntry[] = [];
   let current: SessionEntry | undefined = leaf;
-  while (current && chain.length < tail) {
+  let visible = 0;
+  const rawCap = rawWindowCap(tail);
+  while (current) {
     chain.push(current);
+    if (countsTowardTail(current)) visible++;
+    if (visible >= tail || chain.length >= rawCap) break;
     current = current.parentId ? byId.get(current.parentId) : undefined;
   }
   chain.reverse();
