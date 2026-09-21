@@ -610,23 +610,24 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
 
   // Virtualized session list: only the visible window of rows is mounted.
   const listScrollRef = useRef<HTMLDivElement>(null);
+  const sessionPaneRef = useRef<HTMLDivElement>(null);
   const explorerSectionRef = useRef<HTMLDivElement>(null);
   const sessionPaneHeightRef = useRef(SESSION_PANE_DEFAULT_HEIGHT);
   const getDefaultSessionPaneHeight = useCallback(() => {
     if (!explorerOpen) return SESSION_PANE_DEFAULT_HEIGHT;
-    const listHeight = listScrollRef.current?.getBoundingClientRect().height;
+    const paneHeight = sessionPaneRef.current?.getBoundingClientRect().height;
     const explorerHeight = explorerSectionRef.current?.getBoundingClientRect().height;
-    return listHeight && explorerHeight
-      ? Math.round((listHeight + explorerHeight) / 2)
+    return paneHeight && explorerHeight
+      ? Math.round((paneHeight + explorerHeight) / 2)
       : SESSION_PANE_DEFAULT_HEIGHT;
   }, [explorerOpen]);
   const getMaxSessionPaneHeight = useCallback(() => {
     if (!explorerOpen || !(selectedCwdProp || selectedCwd)) return SESSION_PANE_MAX_HEIGHT;
-    const listHeight = listScrollRef.current?.getBoundingClientRect().height ?? SESSION_PANE_DEFAULT_HEIGHT;
+    const paneHeight = sessionPaneRef.current?.getBoundingClientRect().height ?? SESSION_PANE_DEFAULT_HEIGHT;
     const explorerHeight = explorerSectionRef.current?.getBoundingClientRect().height ?? EXPLORER_PANE_MIN_HEIGHT;
     return Math.max(
       SESSION_PANE_MIN_HEIGHT,
-      listHeight + explorerHeight - EXPLORER_PANE_MIN_HEIGHT,
+      paneHeight + explorerHeight - EXPLORER_PANE_MIN_HEIGHT,
     );
   }, [explorerOpen, selectedCwd, selectedCwdProp]);
   const sessionPaneResizer = useResizablePanel({
@@ -2195,17 +2196,27 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
       </div>
 
       {/* Session list */}
+      <div
+        ref={sessionPaneRef}
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          flex: explorerOpen && (selectedCwdProp || selectedCwd)
+            ? "0 1 var(--sidebar-session-pane-height, 320px)"
+            : "1 1 auto",
+          minHeight: SESSION_PANE_MIN_HEIGHT,
+          overflow: "hidden",
+        }}
+      >
       <SessionSearch open={sessionSearchOpen} query={sessionSearchQuery} refreshKey={sessionListVersion} selectedSessionId={selectedSessionId} onSelectSession={handleSelectSessionFromList}>
       <div
         ref={listScrollRef}
         onScroll={handleListScroll}
         style={{
-          flex: explorerOpen && (selectedCwdProp || selectedCwd)
-            ? "0 1 var(--sidebar-session-pane-height, 320px)"
-            : "1 1 auto",
+          flex: "1 1 auto",
+          minHeight: 0,
           overflowY: "auto",
           padding: "0",
-          minHeight: SESSION_PANE_MIN_HEIGHT,
         }}
       >
         {loading && (
@@ -2247,6 +2258,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
         )}
       </div>
       </SessionSearch>
+      </div>
 
       {explorerOpen && (selectedCwdProp || selectedCwd) && (
         <div
@@ -2262,8 +2274,6 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
             flex: "0 0 12px",
             cursor: "row-resize",
             touchAction: "none",
-            outline: "none",
-            background: `linear-gradient(to bottom, transparent 5px, ${sessionPaneResizer.isResizing ? "var(--text-muted)" : "color-mix(in srgb, var(--text-dim) 55%, var(--border))"} 5px, ${sessionPaneResizer.isResizing ? "var(--text-muted)" : "color-mix(in srgb, var(--text-dim) 55%, var(--border))"} 6px, transparent 6px)`,
           }}
           {...sessionPaneResizer.separatorProps}
         />

@@ -1377,7 +1377,7 @@ export const ChatWindow = memo(function ChatWindow({ session, searchTarget, onSe
             position: "fixed",
             top: quotedSelection.top,
             left: quotedSelection.left,
-            zIndex: 130,
+            zIndex: 260,
             display: "flex",
             flexWrap: "wrap",
             gap: 3,
