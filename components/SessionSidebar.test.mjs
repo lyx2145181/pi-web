@@ -71,7 +71,8 @@ test("persists and exposes a vertical session/explorer resize handle", () => {
   assert.match(globalStyles, /\.sidebar-section-resize-handle:focus-visible::after/);
   assert.doesNotMatch(globalStyles, /\.sidebar-section-resize-handle:focus-visible \{[^}]*outline: 2px solid var\(--accent\)/);
   assert.match(globalStyles, /\.sidebar-section-resize-handle::after[\s\S]*?background: transparent/);
-  assert.match(source, /borderTop: explorerOpen \? "none" : "1px solid var\(--border\)"/);
+  assert.match(source, /data-resize-handle="sidebar-sections"[\s\S]*?borderTop: "1px solid var\(--border\)"/);
+  assert.match(globalStyles, /\.sidebar-section-resize-handle::after[\s\S]*?top: 6px/);
   assert.match(source, /var\(--sidebar-session-pane-height, 320px\)/);
   assert.match(source, /minHeight: explorerOpen \? EXPLORER_PANE_MIN_HEIGHT : 0/);
 });

@@ -1699,7 +1699,8 @@ span.token.table {
   position: absolute;
   left: 0;
   right: 0;
-  top: 5px;
+  /* 对齐上下两区的常显分割线，hover 时只是把它点亮，避免出现双线 */
+  top: 6px;
   height: 1px;
   pointer-events: none;
   background: transparent;

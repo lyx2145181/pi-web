@@ -2284,7 +2284,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
         <div
           ref={explorerSectionRef}
           style={{
-            borderTop: explorerOpen ? "none" : "1px solid var(--border)",
+            borderTop: "1px solid var(--border)",
             display: "flex",
             flexDirection: "column",
             flex: explorerOpen ? "1 1 0" : "0 0 auto",
