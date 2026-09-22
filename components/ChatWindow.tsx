@@ -1132,7 +1132,11 @@ export const ChatWindow = memo(function ChatWindow({ session, searchTarget, onSe
         <div
           ref={scrollContainerRef}
           data-chat-scroll-container
-          className="min-w-0 flex-1 overflow-x-hidden overflow-y-auto pt-4 [scrollbar-width:none]"
+          // The message list is the one place long output has to be dragged through,
+          // so it shows its scrollbar instead of hiding it behind the minimap (#788).
+          // A stable gutter keeps the centred column from shifting when a short
+          // session grows past one screen.
+          className="min-w-0 flex-1 overflow-x-hidden overflow-y-auto pt-4 [scrollbar-gutter:stable]"
           style={{ visibility: pendingScrollRestore ? "hidden" : undefined }}
         >
           <div style={{ minWidth: 0, padding: `0 ${CHAT_COLUMN_PADDING}px` }}>
@@ -1142,11 +1146,9 @@ export const ChatWindow = memo(function ChatWindow({ session, searchTarget, onSe
               for (let i = messages.length - 1; i >= 0; i--) {
                 if (messages[i].role === "user") { lastUserIdx = i; break; }
               }
-              // Anchor for live-tail detection: the last user message, or a
-              // compaction summary when compaction has replaced it mid-turn.
-              // Computed independently from lastUserIdx (which is kept for the
-              // scroll-to-user ref) because a compaction summary can sit after
-              // the last user message and anchor the still-streaming segment.
+              // Anchor for live-tail detection. A compaction summary or subagent
+              // completion can sit after the last user message and own the
+              // still-streaming segment. lastUserIdx stays the scroll target.
               let lastAnchorIdx = -1;
               for (let i = messages.length - 1; i >= 0; i--) {
                 if (isMessageGroupAnchor(messages[i])) { lastAnchorIdx = i; break; }

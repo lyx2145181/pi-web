@@ -2,7 +2,7 @@ import { createReadStream } from "node:fs";
 import type { BigIntStats } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import { createInterface } from "node:readline";
-import { join, normalize as normalizePath } from "node:path";
+import { basename, join, normalize as normalizePath } from "node:path";
 
 export interface SessionFileFingerprint {
   size: string;
@@ -322,6 +322,14 @@ export function indexedSessionMetadata(
   entries: ReadonlyMap<string, SessionIndexEntry>,
 ): IndexedSessionMetadata[] {
   return [...entries.values()]
-    .flatMap((entry) => entry.metadata ? [entry.metadata] : [])
-    .sort((left, right) => right.modified.localeCompare(left.modified));
+    .flatMap((entry) => entry.metadata ? [{ metadata: entry.metadata, mtimeNs: entry.fingerprint.mtimeNs }] : [])
+    .sort((left, right) => {
+      const modifiedOrder = right.metadata.modified.localeCompare(left.metadata.modified);
+      if (modifiedOrder !== 0) return modifiedOrder;
+      const rightMtime = BigInt(right.mtimeNs);
+      const leftMtime = BigInt(left.mtimeNs);
+      if (rightMtime !== leftMtime) return rightMtime > leftMtime ? 1 : -1;
+      return basename(right.metadata.path).localeCompare(basename(left.metadata.path));
+    })
+    .map(({ metadata }) => metadata);
 }

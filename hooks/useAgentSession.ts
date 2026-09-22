@@ -15,9 +15,14 @@ import type {
 import { isBlockingExtensionUiRequest } from "@/lib/browser-notifications";
 import { normalizeToolCalls } from "@/lib/normalize";
 import { isPromptBusyError, isPromptRejectedError, sendAgentCommand } from "@/lib/agent-client";
+import {
+  deleteSessionViewSnapshot,
+  getSessionViewSnapshot,
+  setSessionViewSnapshot,
+} from "@/lib/session-view-cache";
 import { clearDraft, rekeyDraft, restoreDraftSubmission } from "@/lib/draft-store";
 import { getPreferredToolPreset, setPreferredToolPreset } from "@/lib/tool-preset-preference";
-import { getPresetFromToolNames, getToolNamesForPreset, type ToolEntry, type ToolPreset } from "@/lib/tool-presets";
+import { CONFIGURED_TOOL_PRESET, getPresetFromToolNames, getToolNamesForPreset, type ToolEntry, type ToolPreset } from "@/lib/tool-presets";
 import type { SessionStatsInfo } from "@/lib/pi-types";
 import {
   INITIAL_SESSION_CONTEXT_MESSAGES,
@@ -28,6 +33,7 @@ import {
 import { mergeSessionStats, type SessionFileStats } from "@/lib/session-stats";
 import { userMessageKey } from "@/lib/prompt-recovery";
 import { AgentEventConnection } from "@/lib/agent-event-connection";
+import { isSystemMessageEvent } from "@/lib/agent-event-wire";
 import { getToolExecutionProgress } from "@/lib/tool-execution-progress";
 import { updateExtensionWidgets } from "@/lib/extension-widgets";
 import {
@@ -52,6 +58,10 @@ export interface SessionData {
   toolPolicy?: "inclusive" | "exact";
   skillNames?: string[];
   skillPolicy?: "exact";
+  /** Opaque freshness token for the session view cache (summary tree reads). */
+  snapshotRevision?: string | null;
+  /** "summary" when `tree` carries the body-free navigation format. */
+  treeFormat?: "summary";
   context: {
     messages: AgentMessage[];
     entryIds: string[];
@@ -356,7 +366,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [modelThinkingLevelMaps, setModelThinkingLevelMaps] = useState<Record<string, Record<string, string | null>>>({});
   const [newSessionModel, setNewSessionModel] = useState<SelectedModel | null>(null);
   const [newSessionDefaultModel, setNewSessionDefaultModel] = useState<SelectedModel | null>(null);
-  const [toolPreset, setToolPreset] = useState<ToolPreset>("default");
+  const [toolPreset, setToolPreset] = useState<ToolPreset>(CONFIGURED_TOOL_PRESET);
   const [newSessionThinkingLevel, setNewSessionThinkingLevel] = useState<ConcreteThinkingLevel | null>(null);
   const [newSessionDefaultThinkingLevel, setNewSessionDefaultThinkingLevel] = useState<ConcreteThinkingLevel | null>(null);
   const [currentThinkingOverride, setCurrentThinkingOverride] = useState<ConcreteThinkingLevel | null>(null);
@@ -392,6 +402,10 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const eventStreamGraceActiveRef = useRef(false);
   const sessionIdRef = useRef<string | null>(session?.id ?? null);
   const sessionPropIdRef = useRef<string | null>(session?.id ?? null);
+  // False while the session carries no tool selection of its own, so its loadout
+  // follows settings.json defaultTools and the picker must say so rather than
+  // labelling it with whichever preset the resolved tools happen to match.
+  const sessionToolsPinnedRef = useRef(false);
   const agentRunningRef = useRef(false);
   const sdkAgentActiveRef = useRef(false);
   const rpcPromptPendingRef = useRef(false);
@@ -427,9 +441,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const historyLoadPendingRef = useRef(false);
   const contextPageRef = useRef<SessionContextPage | null>(null);
   const activeLeafIdRef = useRef<string | null>(null);
+  // Latest settled view state, readable from the unmount cleanup without
+  // re-subscribing it. Assigned every render like sessionPropIdRef below.
+  const dataRef = useRef<SessionData | null>(null);
+  const messagesRef = useRef<AgentMessage[]>([]);
+  const entryIdsRef = useRef<string[]>([]);
 
   sessionPropIdRef.current = session?.id ?? null;
   contextPageRef.current = contextPage;
+  dataRef.current = data;
+  messagesRef.current = messages;
+  entryIdsRef.current = entryIds;
   activeLeafIdRef.current = activeLeafId;
 
   if (!eventConnectionRef.current) {
@@ -578,6 +600,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         deferThinking: "1",
         deferMedia: "1",
         tail: String(INITIAL_SESSION_CONTEXT_MESSAGES),
+        tree: "summary",
       });
       if (options?.force) params.set("force", "1");
       const res = await fetch(`/api/sessions/${encodeURIComponent(sid)}?${params}`, {
@@ -597,22 +620,63 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           setServerInputHistory(null);
           setError(null);
         }
+        deleteSessionViewSnapshot(sid);
         return null;
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const d = await res.json() as SessionData;
       if (!isCurrent()) return null;
-      const persistedMessages = d.context.messages;
-      setData(d);
+      // When the server revision is unchanged, retain any earlier pages already
+      // loaded in this ChatWindow instead of collapsing back to the tail page.
+      const cached = getSessionViewSnapshot(sid);
+      const revisionUnchanged = Boolean(
+        d.snapshotRevision
+        && cached?.revision === d.snapshotRevision
+        && cached.entryIds.length >= (d.context.entryIds ?? []).length,
+      );
+      const persistedMessages = revisionUnchanged ? messagesRef.current : d.context.messages;
+      const persistedEntryIds = revisionUnchanged ? entryIdsRef.current : (d.context.entryIds ?? []);
+      const effectiveContext = revisionUnchanged
+        ? {
+            ...d.context,
+            messages: messagesRef.current,
+            entryIds: entryIdsRef.current,
+            oldestEntryId: contextPageRef.current?.startIndex
+              ? entryIdsRef.current[0] ?? null
+              : d.context.oldestEntryId,
+            hasMore: contextPageRef.current?.hasEarlier ?? d.context.hasMore,
+          }
+        : d.context;
+      setData(revisionUnchanged ? { ...d, context: effectiveContext } : d);
       setActiveLeafId(d.leafId);
-      setMessages(persistedMessages);
-      setEntryIds(d.context.entryIds ?? []);
-      contextPageRef.current = d.contextPage ?? null;
       activeLeafIdRef.current = d.leafId;
-      setContextPage(d.contextPage ?? null);
-      setContextStats(d.contextStats ?? null);
-      setServerInputHistory(d.inputHistory ?? null);
-      setToolPresetState(d.toolNames !== undefined ? getPresetFromToolNames(d.toolNames) : "default");
+      if (!revisionUnchanged) {
+        setMessages(persistedMessages);
+        setEntryIds(persistedEntryIds);
+        contextPageRef.current = d.contextPage ?? null;
+        setContextPage(d.contextPage ?? null);
+        setContextStats(d.contextStats ?? null);
+        setServerInputHistory(d.inputHistory ?? null);
+      }
+      if (d.snapshotRevision) {
+        setSessionViewSnapshot({
+          sessionId: sid,
+          revision: d.snapshotRevision,
+          messages: persistedMessages,
+          entryIds: persistedEntryIds,
+          leafId: d.leafId,
+          oldestEntryId: effectiveContext.oldestEntryId,
+          hasMore: effectiveContext.hasMore,
+          summaryTree: d.tree,
+          thinkingLevel: d.context.thinkingLevel,
+          model: d.context.model,
+          stats: d.stats,
+          totalActiveMs: d.totalActiveMs,
+          loadedEntryIds: persistedEntryIds,
+        });
+      }
+      sessionToolsPinnedRef.current = d.toolNames !== undefined;
+      setToolPresetState(d.toolNames !== undefined ? getPresetFromToolNames(d.toolNames) : CONFIGURED_TOOL_PRESET);
       setCurrentModelOverride((current) => modelSwitchPendingRef.current ? current : null);
       setCurrentThinkingOverride(null);
       setError(null);
@@ -805,7 +869,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       const tools = await sendAgentCommand<ToolEntry[]>(sid, { type: "get_tools" });
       if (!tools || !sessionHookMountedRef.current || sessionIdRef.current !== sid) return null;
       const { getPresetFromTools } = await import("@/lib/tool-presets");
-      setToolPresetState(getPresetFromTools(tools));
+      setToolPresetState(sessionToolsPinnedRef.current ? getPresetFromTools(tools) : CONFIGURED_TOOL_PRESET);
       onSystemToolsChange?.(tools);
       return tools;
     } catch (e) {
@@ -850,14 +914,17 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       const selectedModel = newSessionModelOverrideRef.current;
       const selectedThinkingLevel = thinkingLevelOverrideRef.current;
       if (selectedModel) setPendingModel(selectedModel);
+      // Undefined means the user never overrode the loadout: omit the field entirely
+      // so pi resolves settings.json defaultTools instead of being pinned to ours (#700).
       const toolNames = getToolNamesForPreset(toolPreset);
+      sessionToolsPinnedRef.current = toolNames !== undefined;
       const res = await fetch("/api/agent/new", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           cwd: newSessionCwd,
           type: "ensure_session",
-          toolNames,
+          ...(toolNames !== undefined ? { toolNames } : {}),
           ...(selectedModel ? { provider: selectedModel.provider, modelId: selectedModel.modelId } : {}),
           ...(selectedThinkingLevel
             ? { thinkingLevel: selectedThinkingLevel }
@@ -959,6 +1026,12 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   useEffect(() => {
     const sid = session?.id;
     if (!sid) return;
+    // React Strict Mode re-runs every effect after a simulated unmount, in
+    // declaration order. The mount-only effect below flips this ref to false
+    // in its cleanup and only restores it when it re-runs *after* this one,
+    // so without re-asserting it here shouldMaintain() refuses the connection
+    // and the selected session never opens its event stream.
+    sessionHookMountedRef.current = true;
     maintainEventsConnected(sid);
     return () => {
       if (sessionIdRef.current === sid) eventConnectionRef.current?.close();
@@ -1428,6 +1501,9 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         // (e.g. SSE data buffered while the tab was frozen, flushed after
         // reconcile) — they would resurrect a ghost streaming bubble.
         if (!agentRunningRef.current) break;
+        // Transcript system messages (prompt and tool loadout) are filtered
+        // server-side; keep them out of the chat should one arrive.
+        if (isSystemMessageEvent(event)) break;
         if (event.type === "message_start") {
           const msg = event.message as AgentMessage | undefined;
           if (msg?.role === "user") break;
@@ -1463,6 +1539,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         // loadSession already loaded this message from the session file —
         // appending it again would duplicate it.
         if (!agentRunningRef.current) break;
+        if (isSystemMessageEvent(event)) break;
         const completed = event.message as AgentMessage | undefined;
         if (completed && completed.role === "user") {
           // Delivered steering/follow-up messages surface here as user
@@ -2182,9 +2259,18 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     setPreferredToolPreset(preset);
     setToolPresetState(preset);
     const sid = sessionIdRef.current ?? await ensuringNewSessionRef.current;
-    if (!sid) return;
+    if (!sid) {
+      sessionToolsPinnedRef.current = toolNames !== undefined;
+      return;
+    }
     try {
-      const result = await sendAgentCommand<{ sessionId?: string; recreated?: boolean }>(sid, { type: "set_tools", toolNames });
+      // Omitting toolNames retracts the session's pin so it follows the configured
+      // defaults again; the server rebuilds the session to resolve them.
+      const result = await sendAgentCommand<{ sessionId?: string; recreated?: boolean }>(sid, {
+        type: "set_tools",
+        ...(toolNames !== undefined ? { toolNames } : {}),
+      });
+      sessionToolsPinnedRef.current = toolNames !== undefined;
       const activeSessionId = result?.sessionId ?? sid;
       if (activeSessionId !== sid || result?.recreated) {
         cancelEventStreamGrace();
@@ -2291,6 +2377,37 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
             clearDraft(abandonedDraftKey);
           }
         });
+      }
+      // Persist the settled view of the outgoing session so switching back can
+      // restore it instantly. Only when the cached window still covers every
+      // entry the UI has loaded (paged-in history included).
+      const sid = sessionIdRef.current;
+      const currentData = dataRef.current;
+      if (sid && currentData && currentData.sessionId === sid && currentData.snapshotRevision) {
+        const existing = getSessionViewSnapshot(sid);
+        const entryIds = entryIdsRef.current;
+        const coverable = !existing || entryIds.every((id) => existing.entryIds.includes(id) || (existing.loadedEntryIds ?? []).includes(id));
+        if (coverable) {
+          setSessionViewSnapshot({
+            sessionId: sid,
+            revision: currentData.snapshotRevision,
+            messages: messagesRef.current,
+            entryIds: entryIdsRef.current,
+            leafId: activeLeafIdRef.current,
+            oldestEntryId: contextPageRef.current?.startIndex
+              ? entryIdsRef.current[0] ?? null
+              : currentData.context.oldestEntryId,
+            hasMore: contextPageRef.current?.hasEarlier ?? currentData.context.hasMore,
+            summaryTree: currentData.tree,
+            thinkingLevel: currentData.context.thinkingLevel,
+            model: currentData.context.model,
+            stats: currentData.stats,
+            totalActiveMs: currentData.totalActiveMs,
+            loadedEntryIds: entryIdsRef.current,
+          });
+        } else {
+          deleteSessionViewSnapshot(sid);
+        }
       }
       if (liveFollowFrameRef.current !== null) {
         cancelAnimationFrame(liveFollowFrameRef.current);

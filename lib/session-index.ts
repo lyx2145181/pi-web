@@ -8,7 +8,7 @@ import {
   runSessionIndexWorker,
 } from "./session-index-worker-client";
 
-export const SESSION_INDEX_PROJECTION_VERSION = "pi-web-session-list-v2-sdk-0.85.1";
+export const SESSION_INDEX_PROJECTION_VERSION = "pi-web-session-list-v2-sdk-0.87.0";
 const SESSION_INDEX_COORDINATOR_VERSION = 10;
 const SESSION_INDEX_BACKGROUND_INTERVAL_MS = 30_000;
 

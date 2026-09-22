@@ -1,21 +1,22 @@
 import { NextResponse } from "next/server";
-import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { existsSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import {
   attachSessionProjectInfo,
   listAllSessions,
   mergeSessionLists,
+  openSessionManager,
   resolveSessionPath,
   resolveSessionIdByPath,
   invalidateSessionPathCache,
   invalidateSessionListCache,
+  invalidateSessionManagerCache,
   buildSessionContext,
   readSessionHeader,
 } from "@/lib/session-reader";
 import { sessionPathKey } from "@/lib/session-path";
 import { abortSubagent, getRpcSession, getRpcSessionInfos } from "@/lib/rpc-manager";
-import { projectTreeForResponse } from "@/lib/project-tree";
+import { projectTreeForResponse, toSummaryTree } from "@/lib/project-tree";
 import { computeSessionTotalActiveMs } from "@/lib/session-timing";
 import { createServerTiming } from "@/lib/server-timing";
 import {
@@ -31,6 +32,8 @@ import {
   SessionContextPageRequestError,
 } from "@/lib/session-context-page";
 import { computeSessionStats } from "@/lib/session-stats";
+import { startServerPerf } from "@/lib/perf";
+import { computeSessionRevision } from "@/lib/session-revision";
 import type { SessionEntry } from "@/lib/types";
 import { readSubagentRun, readSubagentSessionResources, SUBAGENT_META_TYPE } from "@/lib/subagents";
 import { readSessionToolSelection } from "@/lib/session-tool-selection";
@@ -43,7 +46,9 @@ export async function GET(
 ) {
   const timing = createServerTiming();
   const { id } = await params;
+  const perf = startServerPerf("GET /api/sessions/[id]");
   try {
+    perf?.span("resolve");
     const rpc = getRpcSession(id);
     const searchParams = new URL(req.url).searchParams;
     const force = searchParams.get("force") === "1";
@@ -71,12 +76,17 @@ export async function GET(
       ? null
       : await timing.time("parse", () => getParsedSessionSnapshot(resolvedPath!));
     const sm = liveRpc?.inner.sessionManager;
-    const { filePath, entries, leafId, tree } = timing.timeSync("session-read", () => ({
-      filePath: liveRpc?.sessionFile || diskSnapshot?.filePath || resolvedPath || "",
-      entries: sm?.getEntries() ?? diskSnapshot!.entries,
-      leafId: sm ? sm.getLeafId() : diskSnapshot!.leafId,
-      tree: sm ? projectTreeForResponse(sm.getTree()) : diskSnapshot!.tree,
-    }));
+    const summaryTree = searchParams.get("tree") === "summary";
+    const { filePath, entries, leafId, tree } = timing.timeSync("session-read", () => {
+      const fullTree = sm ? projectTreeForResponse(sm.getTree()) : diskSnapshot!.tree;
+      return {
+        filePath: liveRpc?.sessionFile || diskSnapshot?.filePath || resolvedPath || "",
+        entries: sm?.getEntries() ?? diskSnapshot!.entries,
+        leafId: sm ? sm.getLeafId() : diskSnapshot!.leafId,
+        tree: summaryTree ? toSummaryTree(fullTree) : fullTree,
+      };
+    });
+    perf?.span("open+tree");
     const deferThinking = searchParams.has("deferThinking");
     const deferToolResultImages = searchParams.has("deferMedia");
     const pageRequest = parseSessionContextPageRequest(searchParams);
@@ -149,7 +159,15 @@ export async function GET(
         transient: !filePath || !existsSync(filePath),
       }]))[0];
     });
-
+    const latestEntry = entries[entries.length - 1] as { id?: string } | undefined;
+    const snapshotRevision = computeSessionRevision({
+      filePath,
+      sourceId: liveRpc ? `runtime:${String(liveRpc.inner.sessionId)}` : "disk",
+      entryCount: entries.length,
+      latestEntryId: typeof latestEntry?.id === "string" ? latestEntry.id : null,
+      leafId: leafId ?? null,
+    });
+    perf?.span("context");
     const response = timing.timeSync("serialize", () => jsonResponse(
       req,
       {
@@ -158,6 +176,8 @@ export async function GET(
         info,
         leafId,
         tree,
+        ...(summaryTree ? { treeFormat: "summary" as const } : {}),
+        snapshotRevision,
         context,
         contextPage,
         contextStats,
@@ -173,7 +193,7 @@ export async function GET(
         ...(wrapperRebuilt ? { wrapperRebuilt: true } : {}),
       },
     ));
-    return timing.finish(response);
+    return timing.finish(perf?.attach(response) ?? response);
   } catch (error) {
     const status = error instanceof SessionContextPageRequestError ? 400 : 500;
     return timing.finish(NextResponse.json({ error: String(error) }, { status }));
@@ -195,8 +215,10 @@ export async function PATCH(
     if (!filePath) {
       return NextResponse.json({ error: "Session not found" }, { status: 404 });
     }
-    const manager = SessionManager.open(filePath);
+    // PATCH writes via appendSessionInfo — open fresh, bypassing the cache.
+    const manager = openSessionManager(filePath, { mutable: true });
     manager.appendSessionInfo(name.trim());
+    invalidateSessionManagerCache(filePath);
     invalidateParsedSession(filePath);
     invalidateSessionListCache([filePath]);
     return NextResponse.json({ ok: true });
@@ -367,6 +389,7 @@ export async function DELETE(
       }
       invalidateParsedSession(deletedPath);
       invalidateSessionPathCache(deletedId);
+      invalidateSessionManagerCache(deletedPath);
     }
     invalidateSessionListCache([...deletedPaths.values(), ...reparentedPaths]);
     return NextResponse.json({ ok: true });
