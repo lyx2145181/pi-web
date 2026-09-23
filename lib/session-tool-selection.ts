@@ -15,9 +15,18 @@ export interface SessionToolSelection {
 
 export type SessionToolSelectionData =
   | { version: 1; tools: string[] }
+  | { version: 1; cleared: true }
   | { version: 2; mode: ToolActivationPolicy; tools: string[] };
 
+/** Written when the user returns a session to pi's configured defaults. */
+export interface ClearedSessionToolSelectionData {
+  version: 1;
+  cleared: true;
+}
+
 const BUILTIN_TOOL_NAMES = new Set(PRESET_FULL);
+const CLEARED = Symbol("cleared-tool-selection");
+type ParsedToolSelection = SessionToolSelection | typeof CLEARED;
 
 function parseInclusiveToolNames(value: unknown): string[] | undefined {
   if (
@@ -27,11 +36,12 @@ function parseInclusiveToolNames(value: unknown): string[] | undefined {
   return [...new Set(value as string[])];
 }
 
-function parseToolSelectionData(data: unknown): SessionToolSelection | undefined {
+function parseToolSelectionData(data: unknown): ParsedToolSelection | undefined {
   if (typeof data !== "object" || data === null || Array.isArray(data)) return undefined;
-  const candidate = data as { version?: unknown; mode?: unknown; tools?: unknown };
+  const candidate = data as { version?: unknown; mode?: unknown; tools?: unknown; cleared?: unknown };
 
   if (candidate.version === 1) {
+    if (candidate.cleared === true) return CLEARED;
     const tools = parseInclusiveToolNames(candidate.tools);
     return tools === undefined ? undefined : { mode: "inclusive", tools };
   }
@@ -50,7 +60,7 @@ function parseToolSelectionData(data: unknown): SessionToolSelection | undefined
   }
 }
 
-/** Return the newest valid persisted selection. Undefined identifies legacy sessions. */
+/** Return the newest valid persisted selection. Undefined identifies legacy/configured sessions. */
 export function readSessionToolSelection(
   entries: readonly SessionEntry[],
 ): SessionToolSelection | undefined {
@@ -58,17 +68,18 @@ export function readSessionToolSelection(
     const entry = entries[index];
     if (entry.type !== "custom" || entry.customType !== TOOL_SELECTION_TYPE) continue;
     const selection = parseToolSelectionData(entry.data);
+    if (selection === CLEARED) return undefined;
     if (selection !== undefined) return selection;
   }
   return undefined;
 }
 
 export function validateSessionToolSelection(tools: unknown): string[] {
-  const parsed = parseInclusiveToolNames(tools);
-  if (parsed === undefined) {
+  const parsed = parseToolSelectionData({ version: 1, tools });
+  if (parsed === undefined || parsed === CLEARED) {
     throw new Error("toolNames must contain only built-in tool names");
   }
-  return parsed;
+  return parsed.tools;
 }
 
 export function appendSessionToolSelection(
@@ -81,4 +92,12 @@ export function appendSessionToolSelection(
     mode,
     tools: [...tools],
   } satisfies SessionToolSelectionData);
+}
+
+/** Retract any earlier pin so the session follows settings.json defaultTools again. */
+export function appendClearedSessionToolSelection(sessionManager: SessionManager): void {
+  sessionManager.appendCustomEntry(TOOL_SELECTION_TYPE, {
+    version: 1,
+    cleared: true,
+  } satisfies ClearedSessionToolSelectionData);
 }

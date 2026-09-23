@@ -41,6 +41,8 @@ declare global {
   var __piProjectPromises: Map<string, Promise<ProjectInfo>> | undefined;
   var __piWorktreeListPromises: Map<string, Promise<WorktreeInfo[]>> | undefined;
   var __piWorktreeListCache: Map<string, { worktrees: WorktreeInfo[]; expiresAt: number }> | undefined;
+  var __piProjectRefresh: Map<string, Promise<void>> | undefined;
+  var __piProjectCacheGeneration: number | undefined;
 }
 
 const PROJECT_CACHE_TTL_MS = 60_000;
@@ -70,6 +72,8 @@ function getWorktreeListCache(): Map<string, { worktrees: WorktreeInfo[]; expire
 
 export function invalidateProjectCache(): void {
   globalThis.__piProjectCache?.clear();
+  globalThis.__piProjectCacheGeneration = (globalThis.__piProjectCacheGeneration ?? 0) + 1;
+  globalThis.__piProjectRefresh?.clear();
 }
 
 export function invalidateWorktreeCache(): void {
@@ -127,6 +131,16 @@ function canonicalCwdKey(cwd: string): string {
   return projectIdentityKey(realPathOrSelf(resolve(cwd)));
 }
 
+/**
+ * Resolve a cwd's project identity with stale-while-revalidate caching.
+ *
+ * Within PROJECT_CACHE_TTL_MS the cached value is returned directly. After
+ * that the stale value is still returned immediately while a background
+ * refresh re-runs git; callers (chiefly the session list, which fans out over
+ * every project cwd) therefore never wait on git subprocesses once a cwd has
+ * been resolved once. Concurrent refreshes for the same cwd share one promise.
+ * add/removeWorktree invalidate eagerly via invalidateProjectCache().
+ */
 export async function resolveProject(cwd: string): Promise<ProjectInfo> {
   const key = canonicalCwdKey(cwd);
   const cache = getProjectCache();

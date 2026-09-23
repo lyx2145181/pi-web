@@ -154,15 +154,17 @@ test("offers the downstream context-menu hook only on a normal session row", () 
   );
 });
 
-test("only manual refresh bypasses the server session-list cache", () => {
-  assert.match(source, /force \? "\/api\/sessions\?force=1" : "\/api\/sessions"/);
+test("lifecycle refreshes use summaries first while preserving manual refresh guards", () => {
+  assert.match(source, /function sessionListUrl\(summary: boolean, force: boolean\)/);
+  assert.match(source, /if \(summary\) return "\/api\/sessions\?summary=1"/);
+  assert.match(source, /if \(force\) return "\/api\/sessions\?force=1"/);
   assert.match(source, /cache: "no-store"/);
-  assert.match(source, /void loadSessions\(isFirst, false\)/);
+  // First paint uses the cheap summary listing, then hydrates after a delay.
+  assert.match(source, /loadSessions\(true, false, true\)/);
+  assert.match(source, /setTimeout\(\(\) => \{[\s\S]*?void loadSessions\(false, false, false\)/);
   assert.match(source, /onClick=\{\(\) => void loadSessions\(false, true\)\}/);
   assert.match(source, /loadSessions\(false, false\);[\s\S]*?onBackgroundTaskDone/);
-});
 
-test("manual refresh has priority over background loads and visible completion feedback", () => {
   const loadBlock = source.slice(
     source.indexOf("const loadSessions = useCallback"),
     source.indexOf("const sessionRefreshEffectRef"),
@@ -173,39 +175,16 @@ test("manual refresh has priority over background loads and visible completion f
   assert.match(source, /disabled=\{manualRefreshStatus === "loading"\}/);
   assert.match(source, /aria-busy=\{manualRefreshStatus === "loading"\}/);
   assert.match(source, /manualRefreshStatus === "done"/);
-});
 
-test("Strict Effects replay does not issue a second session-list request", () => {
   const effectStart = source.indexOf("const sessionRefreshEffectRef = useRef");
   const effectEnd = source.indexOf("// Browser storage is unavailable", effectStart);
   const effect = source.slice(effectStart, effectEnd);
   assert.match(effect, /effect\.initialized && Object\.is\(effect\.refreshKey, refreshKey\)/);
-  assert.match(effect, /void loadSessions\(isFirst, false\)/);
-
-  const state = { initialized: false, refreshKey: undefined };
-  const calls = [];
-  for (const refreshKey of [undefined, undefined]) {
-    if (state.initialized && Object.is(state.refreshKey, refreshKey)) continue;
-    const isFirst = !state.initialized;
-    state.initialized = true;
-    state.refreshKey = refreshKey;
-    calls.push({ showLoading: isFirst, force: false });
-  }
-  assert.deepEqual(calls, [{ showLoading: true, force: false }]);
-});
-
-test("session-list requests abort predecessors and ignore stale responses", () => {
+  assert.match(effect, /void loadSessions\(true, false, true\)/);
   assert.match(source, /sessionListControllerRef\.current\?\.abort\(\)/);
   assert.match(source, /signal: controller\.signal/);
   assert.match(source, /if \(requestId !== sessionListRequestRef\.current\) return/);
   assert.match(source, /name !== "AbortError"/);
-});
-
-test("a replacement refresh always clears initial loading state", () => {
-  const loadBlock = source.slice(
-    source.indexOf("const loadSessions = useCallback"),
-    source.indexOf("const sessionRefreshEffectRef"),
-  );
   assert.match(loadBlock, /if \(requestId === sessionListRequestRef\.current\) \{[\s\S]*setLoading\(false\)/);
   assert.doesNotMatch(loadBlock, /if \(showLoading\) setLoading\(false\)/);
 });
