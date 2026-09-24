@@ -247,6 +247,12 @@ try {
     await sentinel.waitFor({ state: "attached" });
     assert.equal(await page.getByText(text(4949), { exact: true }).count(), 0);
 
+    // The server sends 60 entries but only 50 are mounted initially. Reveal
+    // the remaining ten locally before expecting a network page request.
+    await sentinel.evaluate((element) => element.scrollIntoView({ block: "start", behavior: "instant" }));
+    await page.getByText(text(4940), { exact: true }).waitFor({ state: "attached" });
+    await page.getByText(text(4999), { exact: true }).evaluate((element) => element.scrollIntoView({ block: "end", behavior: "instant" }));
+
     // Exercise the real IntersectionObserver and prepend path, twice.
     for (let turn = 0; turn < 2; turn++) {
       const responsePromise = page.waitForResponse((response) =>
