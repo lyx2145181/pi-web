@@ -362,10 +362,10 @@ try {
         return readingOffset(target);
       };
       await selectSession(text(0), "e4999");
-      const olderPage = page.waitForResponse((response) => response.url().includes(`/api/sessions/${LONG}/context?`));
-      await page.getByText("Scroll up to load earlier messages", { exact: true }).evaluate((element) => element.scrollIntoView({ block: "start", behavior: "instant" }));
-      await olderPage;
+      // The session cache already holds the pages loaded above. Returning to
+      // the session should restore those messages without another API page.
       const olderMessage = page.locator("[data-entry-id='e4920']");
+      await olderMessage.waitFor({ state: "visible" });
       const olderOffset = await positionForReading(olderMessage);
       await selectSession("Render **E2E markdown**", "user");
       const process = page.getByRole("button", { name: /process details/i });
@@ -390,8 +390,10 @@ try {
       const agentRoute = `**/api/agent/${LONG}`;
       await page.route(agentRoute, (route) => route.fulfill({ json: {} }));
       try {
-        const pendingHistory = page.waitForRequest((request) => request.url().includes(`/api/sessions/${LONG}/context?`) && new URL(request.url()).searchParams.has("before"));
         await page.locator(`[title="${text(0)}"]`).click();
+        await olderMessage.waitFor({ state: "visible" });
+        const pendingHistory = page.waitForRequest((request) => request.url().includes(`/api/sessions/${LONG}/context?`) && new URL(request.url()).searchParams.has("before"));
+        await page.locator("[data-history-sentinel]").evaluate((element) => element.scrollIntoView({ block: "start", behavior: "instant" }));
         await pendingHistory;
         await page.getByRole("button", { name: "Branches", exact: true }).click();
         await page.getByText("E2E alternate history branch", { exact: true }).click();
