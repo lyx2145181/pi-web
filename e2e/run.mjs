@@ -99,10 +99,10 @@ try {
   ];
   Object.assign(richEntries.at(-1).message, { provider: "test", model: "E2E Model" });
   writeSession(RICH, richEntries);
-  // The default page is 50 *visible* messages (user / assistant / compaction).
-  // toolResults ride along free after #810, so 48 tool-call assistants + the
-  // final answer + the divider fill that window; the user prompt is the 51st
-  // visible entry and must stay outside the first page.
+  // The first server page is 60 messages, while the chat initially renders 50
+  // visible messages (user / assistant / compaction). Tool results ride along
+  // free after #810, so 48 tool-call assistants + the final answer + the
+  // divider fill that visible window; the user prompt remains outside it.
   const compactedEntries = [
     message("user", null, "user", "E2E prompt outside the compacted page"),
     { type: "compaction", id: "compact", parentId: "user", timestamp, summary: "E2E compaction anchor", firstKeptEntryId: "user", tokensBefore: 100 },
@@ -173,25 +173,29 @@ try {
     await delay(250);
   }
 
-  const detail = await api(`/api/sessions/${LONG}?deferThinking=1&deferMedia=1`);
-  assert.deepEqual(detail.context.entryIds, ids(4950, 5000));
-  assert.equal(detail.context.messages.length, 50);
+  // The web client explicitly requests a bounded page; omitting tail is the
+  // local full-branch API contract, not an implicit 50-message page.
+  const detail = await api(`/api/sessions/${LONG}?deferThinking=1&deferMedia=1&tree=summary&tail=60`);
+  assert.deepEqual(detail.context.entryIds, ids(4940, 5000));
+  assert.equal(detail.context.messages.length, 60);
   assert.equal(detail.context.hasMore, true);
+  assert.deepEqual(detail.contextPage, { startIndex: 4940, endIndex: 5000, totalMessages: 5000, hasEarlier: true });
   assert.ok(JSON.stringify(detail).length < 100_000, "Detail transferred unbounded history");
   const tail = await api(`/api/sessions/${LONG}/context?tail=50`);
   assert.deepEqual(tail.context.entryIds, ids(4950, 5000));
   assert.equal(tail.context.messages.length, 50);
   const selectedBranch = await api(`/api/sessions/${BRANCH}/context?leafId=old`);
   assert.deepEqual(selectedBranch.context.entryIds, ["root", "old"]);
-  const rootPage = await api(`/api/sessions/${BRANCH}/context?before=old&tail=1`);
+  const rootPage = await api(`/api/sessions/${BRANCH}/context?before=1&limit=1`);
   assert.deepEqual(rootPage.context.entryIds, ["root"]);
   assert.equal(rootPage.context.hasMore, false);
-  const beforeRoot = await api(`/api/sessions/${BRANCH}/context?before=root`);
+  const beforeRoot = await api(`/api/sessions/${BRANCH}/context?before=0`);
   assert.deepEqual(beforeRoot.context.entryIds, []);
   assert.equal(beforeRoot.context.hasMore, false);
+  await api(`/api/sessions/${BRANCH}/context?before=root`, 400);
   await api("/api/sessions/e2e-does-not-exist", 404);
   await api("/api/files/..%2F..%2Fetc%2Fpasswd?type=read", 403);
-  const compacted = await api(`/api/sessions/${COMPACTED}`);
+  const compacted = await api(`/api/sessions/${COMPACTED}?tail=50`);
   assert.equal(compacted.context.entryIds[0], "compact");
   assert.equal(compacted.context.messages.some((entry) => entry.role === "user"), false);
   console.log("PASS: bounded history, branch context, pagination root, and API errors");
@@ -261,15 +265,15 @@ try {
     })), { connected: true, text: text(4998) }, "Prepending history must preserve existing message nodes");
     await latestUser.dispose();
     assert.ok(olderResponses.length >= 2, "Scrolling must fetch consecutive older pages");
-    let oldest = Number(new URL(olderResponses[0].url()).searchParams.get("before")?.slice(1));
-    assert.ok(Number.isInteger(oldest), "Older page must include a numeric before cursor");
+    let oldest = Number(new URL(olderResponses[0].url()).searchParams.get("before"));
+    assert.equal(oldest, 4940, "The initial server page must contain the last 60 messages");
     for (const response of olderResponses) {
       assert.equal(response.status(), 200);
-      assert.equal(new URL(response.url()).searchParams.get("before"), `e${oldest}`);
+      assert.equal(new URL(response.url()).searchParams.get("before"), String(oldest));
       const older = (await response.json()).context;
-      assert.deepEqual(older.entryIds, ids(oldest - 50, oldest));
-      assert.equal(older.messages.length, 50);
-      oldest -= 50;
+      assert.deepEqual(older.entryIds, ids(oldest - 120, oldest));
+      assert.equal(older.messages.length, 120);
+      oldest -= 120;
       assert.equal(older.oldestEntryId, `e${oldest}`);
       assert.equal(older.hasMore, true);
     }
