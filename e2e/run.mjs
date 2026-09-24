@@ -362,9 +362,19 @@ try {
         return readingOffset(target);
       };
       await selectSession(text(0), "e4999");
-      // The session cache already holds the pages loaded above. Returning to
-      // the session should restore those messages without another API page.
+      // A validated cache may show e4920 immediately; a changed runtime
+      // revision can instead reload the first 60 and require a server page.
       const olderMessage = page.locator("[data-entry-id='e4920']");
+      if (!(await olderMessage.isVisible())) {
+        const sentinel = page.locator("[data-history-sentinel]");
+        await sentinel.evaluate((element) => element.scrollIntoView({ block: "start", behavior: "instant" }));
+        await page.getByText(text(4940), { exact: true }).waitFor({ state: "attached" });
+        if (!(await olderMessage.isVisible())) {
+          const olderPage = page.waitForResponse((response) => response.url().includes(`/api/sessions/${LONG}/context?`));
+          await sentinel.evaluate((element) => element.scrollIntoView({ block: "start", behavior: "instant" }));
+          await olderPage;
+        }
+      }
       await olderMessage.waitFor({ state: "visible" });
       const olderOffset = await positionForReading(olderMessage);
       await selectSession("Render **E2E markdown**", "user");
@@ -378,6 +388,10 @@ try {
       assert.equal(await process.getAttribute("aria-expanded"), "false");
       assert.ok(Math.abs(await readingOffset(answerHeading) - answerOffset) < 5, "Collapsing process details on remount must not displace the answer");
 
+      // Start the cancellation case from a cold page so only the first 60
+      // messages are loaded, regardless of earlier cache validation.
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.locator(".markdown-code-block pre").waitFor();
       // Hold pagination until a different branch has loaded, exercising effect cancellation.
       let releaseHistory;
       const historyGate = new Promise((resolve) => { releaseHistory = resolve; });
@@ -391,9 +405,12 @@ try {
       await page.route(agentRoute, (route) => route.fulfill({ json: {} }));
       try {
         await page.locator(`[title="${text(0)}"]`).click();
-        await olderMessage.waitFor({ state: "visible" });
+        await page.locator("[data-entry-id='e4999']").waitFor({ state: "visible" });
+        const sentinel = page.locator("[data-history-sentinel]");
+        await sentinel.evaluate((element) => element.scrollIntoView({ block: "start", behavior: "instant" }));
+        await page.getByText(text(4940), { exact: true }).waitFor({ state: "attached" });
         const pendingHistory = page.waitForRequest((request) => request.url().includes(`/api/sessions/${LONG}/context?`) && new URL(request.url()).searchParams.has("before"));
-        await page.locator("[data-history-sentinel]").evaluate((element) => element.scrollIntoView({ block: "start", behavior: "instant" }));
+        await sentinel.evaluate((element) => element.scrollIntoView({ block: "start", behavior: "instant" }));
         await pendingHistory;
         await page.getByRole("button", { name: "Branches", exact: true }).click();
         await page.getByText("E2E alternate history branch", { exact: true }).click();
