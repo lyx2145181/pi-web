@@ -19,6 +19,7 @@ import {
   deleteSessionViewSnapshot,
   getSessionViewSnapshot,
   setSessionViewSnapshot,
+  validatedSessionViewSnapshot,
 } from "@/lib/session-view-cache";
 import { clearDraft, rekeyDraft, restoreDraftSubmission } from "@/lib/draft-store";
 import { getPreferredToolPreset, setPreferredToolPreset } from "@/lib/tool-preset-preference";
@@ -626,35 +627,52 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const d = await res.json() as SessionData;
       if (!isCurrent()) return null;
-      // When the server revision is unchanged, retain any earlier pages already
-      // loaded in this ChatWindow instead of collapsing back to the tail page.
-      const cached = getSessionViewSnapshot(sid);
-      const revisionUnchanged = Boolean(
-        d.snapshotRevision
-        && cached?.revision === d.snapshotRevision
-        && cached.entryIds.length >= (d.context.entryIds ?? []).length,
-      );
-      const persistedMessages = revisionUnchanged ? messagesRef.current : d.context.messages;
-      const persistedEntryIds = revisionUnchanged ? entryIdsRef.current : (d.context.entryIds ?? []);
-      const effectiveContext = revisionUnchanged
+      // On a session switch the refs still belong to the outgoing chat (or
+      // have just been cleared). Restore from the target session's validated
+      // snapshot, not those refs. Only a same-session refresh keeps live state.
+      const cached = validatedSessionViewSnapshot(getSessionViewSnapshot(sid), {
+        revision: d.snapshotRevision,
+        leafId: d.leafId,
+        entryIds: d.context.entryIds ?? [],
+      });
+      const currentView = dataRef.current?.sessionId === sid && cached
+        ? validatedSessionViewSnapshot({ ...cached, messages: messagesRef.current, entryIds: entryIdsRef.current }, {
+            revision: d.snapshotRevision,
+            leafId: d.leafId,
+            entryIds: d.context.entryIds ?? [],
+          })
+        : null;
+      const retainedView = currentView ?? cached;
+      const persistedMessages = retainedView?.messages ?? d.context.messages;
+      const persistedEntryIds = retainedView?.entryIds ?? (d.context.entryIds ?? []);
+      const effectiveContext = retainedView
         ? {
             ...d.context,
-            messages: messagesRef.current,
-            entryIds: entryIdsRef.current,
-            oldestEntryId: contextPageRef.current?.startIndex
-              ? entryIdsRef.current[0] ?? null
-              : d.context.oldestEntryId,
-            hasMore: contextPageRef.current?.hasEarlier ?? d.context.hasMore,
+            messages: persistedMessages,
+            entryIds: persistedEntryIds,
+            oldestEntryId: currentView
+              ? (persistedEntryIds[0] ?? null)
+              : retainedView.oldestEntryId,
+            hasMore: currentView
+              ? (contextPageRef.current?.hasEarlier ?? retainedView.hasMore)
+              : retainedView.hasMore,
           }
         : d.context;
-      setData(revisionUnchanged ? { ...d, context: effectiveContext } : d);
+      setData(retainedView ? { ...d, context: effectiveContext } : d);
       setActiveLeafId(d.leafId);
       activeLeafIdRef.current = d.leafId;
-      if (!revisionUnchanged) {
+      if (!currentView) {
         setMessages(persistedMessages);
         setEntryIds(persistedEntryIds);
-        contextPageRef.current = d.contextPage ?? null;
-        setContextPage(d.contextPage ?? null);
+        const page = cached && d.contextPage
+          ? {
+              ...d.contextPage,
+              startIndex: Math.max(0, d.contextPage.endIndex - cached.entryIds.length),
+              hasEarlier: cached.hasMore,
+            }
+          : d.contextPage ?? null;
+        contextPageRef.current = page;
+        setContextPage(page);
         setContextStats(d.contextStats ?? null);
         setServerInputHistory(d.inputHistory ?? null);
       }

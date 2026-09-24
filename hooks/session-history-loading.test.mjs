@@ -30,8 +30,10 @@ const searchEffect = windowEffect("searchTarget.sessionId !== session?.id");
 const resetEffect = windowEffect("setPendingScrollRestore(initialReadingPositionRef.current)");
 const earlierScript = callback("loadEarlierMessages");
 const contextScript = callback("loadContext");
+const sessionScript = callback("loadSession");
 const jiti = createJiti(import.meta.url);
 const { mergeSessionStats } = await jiti.import("../lib/session-stats.ts");
+const viewCache = await jiti.import("../lib/session-view-cache.ts");
 const plain = value => JSON.parse(JSON.stringify(value));
 const message = (input) => ({ role: "assistant", content: [{ type: "text", text: String(input) }], usage: { input, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } });
 function page() {
@@ -64,6 +66,47 @@ function setup(fetchImpl = async () => Response.json(page())) {
   }
   return { state, context, writes, earlier: earlierScript.runInNewContext(context), loadContext: contextScript.runInNewContext(context) };
 }
+
+test("切回已缓存会话从目标缓存恢复消息，版本变化则使用服务器内容", async () => {
+  for (const [revision, expected, expectedStart] of [["rev-a", "older A", 0], ["rev-new", "server A", 1]]) {
+    viewCache.resetSessionViewCacheForTests();
+    viewCache.setSessionViewSnapshot({
+      sessionId: "A", revision: "rev-a", leafId: "e2", entryIds: ["e1", "e2"],
+      messages: [{ role: "user", content: "older A" }, { role: "user", content: "cached A" }],
+      oldestEntryId: "e1", hasMore: false, thinkingLevel: "off", model: null, loadedEntryIds: ["e1", "e2"],
+    });
+    const state = {};
+    const server = {
+      sessionId: "A", leafId: "e2", snapshotRevision: revision, tree: [],
+      context: { messages: [{ role: "user", content: "server A" }], entryIds: ["e2"], oldestEntryId: "e2", hasMore: true, thinkingLevel: "off", model: null },
+      contextPage: { startIndex: 1, endIndex: 2, totalMessages: 2, hasEarlier: true },
+    };
+    const context = {
+      AbortController, URLSearchParams, console, fetch: async () => Response.json(server),
+      INITIAL_SESSION_CONTEXT_MESSAGES: 60, sessionIdRef: { current: "A" }, sessionHookMountedRef: { current: true },
+      sessionLoadGenerationRef: { current: 0 }, sessionLoadControllerRef: { current: null },
+      contextLoadGenerationRef: { current: 0 }, contextLoadControllerRef: { current: null },
+      historyLoadGenerationRef: { current: 0 }, historyLoadControllerRef: { current: null }, historyLoadPendingRef: { current: false },
+      // The persistent ChatWindow still holds the outgoing session's refs.
+      dataRef: { current: { sessionId: "B" } }, messagesRef: { current: [] }, entryIdsRef: { current: [] },
+      activeLeafIdRef: { current: null }, contextPageRef: { current: null },
+      modelSwitchPendingRef: { current: false }, eventConnectionRef: { current: null },
+      setToolPresetState() {}, getPresetFromToolNames() {}, CONFIGURED_TOOL_PRESET: "configured",
+      getSessionViewSnapshot: viewCache.getSessionViewSnapshot,
+      setSessionViewSnapshot: viewCache.setSessionViewSnapshot,
+      deleteSessionViewSnapshot: viewCache.deleteSessionViewSnapshot,
+      validatedSessionViewSnapshot: viewCache.validatedSessionViewSnapshot,
+    };
+    for (const name of ["LoadingEarlierMessages", "Loading", "Data", "ActiveLeafId", "Messages", "EntryIds", "ContextPage", "ContextStats", "ServerInputHistory", "CurrentModelOverride", "CurrentThinkingOverride", "Error", "LiveThinkingLevel"]) {
+      context[`set${name}`] = value => { state[name] = typeof value === "function" ? value(state[name]) : value; };
+    }
+    await sessionScript.runInNewContext(context)("A", true);
+    assert.equal(state.Messages[0].content, expected);
+    assert.equal(state.ContextPage.startIndex, expectedStart);
+    assert.equal(state.Loading, false);
+  }
+  viewCache.resetSessionViewCacheForTests();
+});
 
 test("历史上翻只改变已加载窗口，不把旧消息重复计入实时用量", async () => {
   let request;
