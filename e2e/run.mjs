@@ -99,15 +99,15 @@ try {
   ];
   Object.assign(richEntries.at(-1).message, { provider: "test", model: "E2E Model" });
   writeSession(RICH, richEntries);
-  // The first server page is 60 messages, while the chat initially renders 50
-  // visible messages (user / assistant / compaction). Tool results ride along
-  // free after #810, so 48 tool-call assistants + the final answer + the
-  // divider fill that visible window; the user prompt remains outside it.
+  // The first server page is 60 context messages, including tool results.
+  // The compacted branch has 61 entries: user + divider + 29 call/result pairs
+  // + answer. That keeps the user outside the first page but includes the
+  // compaction anchor needed for the navigation test.
   const compactedEntries = [
     message("user", null, "user", "E2E prompt outside the compacted page"),
     { type: "compaction", id: "compact", parentId: "user", timestamp, summary: "E2E compaction anchor", firstKeptEntryId: "user", tokensBefore: 100 },
   ];
-  for (let i = 0; i < 48; i++) {
+  for (let i = 0; i < 29; i++) {
     compactedEntries.push(message(`call${i}`, compactedEntries.at(-1).id, "assistant", [
       { type: "toolCall", id: `t${i}`, name: "bash", arguments: { command: `echo step${i}` } },
     ]));
@@ -115,7 +115,7 @@ try {
     Object.assign(result.message, { toolCallId: `t${i}`, toolName: "bash", isError: false });
     compactedEntries.push(result);
   }
-  compactedEntries.push(message("answer", "result47", "assistant", [{ type: "text", text:
+  compactedEntries.push(message("answer", "result28", "assistant", [{ type: "text", text:
     "E2E compacted answer paragraph.\n\n".repeat(20)
     + "## E2E compacted heading\n\n"
     + "E2E compacted answer paragraph.\n\n".repeat(20),
@@ -195,7 +195,7 @@ try {
   await api(`/api/sessions/${BRANCH}/context?before=root`, 400);
   await api("/api/sessions/e2e-does-not-exist", 404);
   await api("/api/files/..%2F..%2Fetc%2Fpasswd?type=read", 403);
-  const compacted = await api(`/api/sessions/${COMPACTED}?tail=50`);
+  const compacted = await api(`/api/sessions/${COMPACTED}?tail=60`);
   assert.equal(compacted.context.entryIds[0], "compact");
   assert.equal(compacted.context.messages.some((entry) => entry.role === "user"), false);
   console.log("PASS: bounded history, branch context, pagination root, and API errors");
