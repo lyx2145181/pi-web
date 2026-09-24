@@ -405,7 +405,7 @@ try {
       await page.route(agentRoute, (route) => route.fulfill({ json: {} }));
       try {
         await page.locator(`[title="${text(0)}"]`).click();
-        await page.locator("[data-entry-id='e4999']").waitFor({ state: "visible" });
+        await page.locator("[data-entry-id='e4999']:not([data-message-role])").waitFor({ state: "visible" });
         const sentinel = page.locator("[data-history-sentinel]");
         await sentinel.evaluate((element) => element.scrollIntoView({ block: "start", behavior: "instant" }));
         await page.getByText(text(4940), { exact: true }).waitFor({ state: "attached" });
