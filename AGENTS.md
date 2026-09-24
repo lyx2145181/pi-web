@@ -279,7 +279,7 @@ Newer pi emits `compaction_start` / `compaction_end`; older versions emitted `au
 - git prints POSIX-style absolute paths even on Windows, so every path read out of git goes through `toNativePath()` (`lib/paths.ts`) before it is compared or returned. Compare paths with `samePath()`, never `===` — raw equality made `isTopLevel` permanently false on Windows and hid the worktree switcher entirely. Branch names are not paths and must keep their forward slashes. Browser code cannot apply Node path rules, so `/api/worktrees` resolves `currentWorktreePath` server-side; the sidebar must use that identity for highlighting and removal fallback.
 
 ### Project command environment
-- Pi Web's built-in agent `bash` tool and direct shell commands use `lib/project-command-env.ts` to remove host-only `PORT`, `NODE_ENV`, and `NEXT_*` variables while preserving the SDK-managed PATH, Pi session metadata, and user/project variables. See `docs/adr/0001-isolate-project-command-environments.md`.
+- Pi Web's built-in agent `bash` tool and direct shell commands use `lib/project-command-env.ts` to remove host-only `PORT`, `NODE_ENV`, `NEXT_*`, and `PI_WEB_PASSWORD` variables while preserving the SDK-managed PATH, Pi session metadata, and other user/project variables. Web terminal shells also omit `PI_WEB_PASSWORD`. See `docs/adr/0001-isolate-project-command-environments.md`.
 - The host-provided bash extension is a fallback only: if a user extension already owns `bash`, `preferUserBashExtension()` removes the host fallback instead of intercepting the user tool.
 - `startRpcSession()` must combine this extension configuration with `createPiWebAgentSessionServices()`; bypassing the serialized service wrapper can reintroduce extension singleton races.
 
@@ -321,7 +321,7 @@ Newer pi emits `compaction_start` / `compaction_end`; older versions emitted `au
 - auth.json holds **one** credential per provider and `ModelRuntime.logout()` deletes whichever it is. The delete routes therefore use `removeStoredCredentialIfType()` to compare and delete under the same file lock used by pi's auth storage. `ModelsConfig` also refreshes *both* provider lists after any auth change — refreshing one leaves a dual-auth provider rendered twice.
 - OAuth/device-code/manual-code flows are streamed by `GET /api/auth/login/[provider]`; manual code responses POST back with a short-lived token stored in `globalThis.__piLoginCallbacks`.
 - API-key routes store and remove keys through `AuthStorage`. Status endpoints must never return the raw key.
-- Browser password auth uses a signed `pi_web_session` cookie with `SameSite=Lax`; the API keeps Basic Auth compatibility, while failed password attempts use process-wide backoff and return `Retry-After`.
+- Browser password auth uses a signed `pi_web_session` cookie with `SameSite=Lax`; the API keeps Basic Auth compatibility. Failed form and Basic password attempts share process-wide backoff and return `Retry-After`; signed sessions remain usable during a Basic block. Login return paths must resolve to the same origin.
 - Provider model/auth listings include extension-registered providers, and OpenCode Go quota is exposed through the provider-usage helper when available.
 - The model test route is `app/api/models-config/test/route.ts`; `app/api/models/test/` is not a real route.
 

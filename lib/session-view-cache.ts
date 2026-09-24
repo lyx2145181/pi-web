@@ -104,6 +104,19 @@ export function deleteSessionViewSnapshot(sessionId: string): void {
 	cache().delete(sessionId);
 }
 
+/** Reuse only a complete cached window whose tail matches the server's current leaf. */
+export function validatedSessionViewSnapshot(
+	snapshot: SessionViewSnapshot | null,
+	server: { revision: string | null | undefined; leafId: string | null; entryIds: string[] },
+): SessionViewSnapshot | null {
+	if (!snapshot || !server.revision || snapshot.revision !== server.revision
+		|| snapshot.leafId !== server.leafId
+		|| snapshot.messages.length !== snapshot.entryIds.length
+		|| snapshot.entryIds.length < server.entryIds.length) return null;
+	const tail = snapshot.entryIds.slice(-server.entryIds.length);
+	return tail.every((id, index) => id === server.entryIds[index]) ? snapshot : null;
+}
+
 export function clearSessionViewCache(): void {
 	cache().clear();
 }

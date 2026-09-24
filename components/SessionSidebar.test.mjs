@@ -4,7 +4,7 @@ import test from "node:test";
 import { createJiti } from "jiti";
 
 const jiti = createJiti(import.meta.url, { jsx: { runtime: "automatic" }, tsconfigPaths: true });
-const { getSessionListIndices, getVariableSessionListIndices } = await jiti.import("./SessionSidebar.tsx");
+const { getSessionListIndices, getVariableSessionListIndices, quantizeSessionScrollTop } = await jiti.import("./SessionSidebar.tsx");
 
 const source = await readFile(new URL("./SessionSidebar.tsx", import.meta.url), "utf8");
 const globalStyles = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
@@ -27,7 +27,28 @@ test("scrolling keeps the focused session and the viewport mounted without expan
   assert.ok(!blurred.includes(0));
 });
 
+test("scroll position changes only at row boundaries while retaining variable-height viewport rows", () => {
+  const layouts = Array.from({ length: 100 }, (_, index) => ({
+    top: index * 54, height: 54,
+  }));
+  for (const top of [0, 1, 53, 54, 55, 107, 108, 5399]) {
+    const quantized = quantizeSessionScrollTop(top);
+    assert.equal(quantized, Math.floor(top / 54) * 54);
+    const indices = getVariableSessionListIndices(layouts, quantized, 54);
+    const actual = Math.min(99, Math.floor(top / 54));
+    assert.ok(indices.includes(actual), `viewport row ${actual} remains mounted at ${top}`);
+  }
+  assert.match(source, /listScrollTopRef\.current = e\.currentTarget\.scrollTop/);
+  assert.match(source, /renderedListScrollTopRef\.current === nextTop/);
+  assert.match(source, /useMemo\(\(\) => buildSessionTree\(filteredSessions, storedProjectPinnedSessionIds\)/);
+  assert.match(source, /useMemo\(\(\) => getVariableSessionListIndices\(/);
+});
+
 test("session windows stay valid after a project shrinks and before the viewport is measured", () => {
+  const smallerProject = Array.from({ length: 50 }, (_, index) => ({ top: index * 54, height: 54 }));
+  const visible = getVariableSessionListIndices(smallerProject, 80000, 54);
+  assert.ok(visible.includes(49), "a stale scroll offset does not hide the new project's rows");
+  assert.deepEqual(getVariableSessionListIndices([], 80000, 54), []);
   assert.deepEqual(getSessionListIndices(5, 80000, 335, 1999), [0, 1, 2, 3, 4]);
   assert.deepEqual(getSessionListIndices(0, 80000, 335, 1999), []);
   assert.equal(getSessionListIndices(2000, 0, 0).length, 28);

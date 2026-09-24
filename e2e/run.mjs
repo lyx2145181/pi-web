@@ -99,15 +99,15 @@ try {
   ];
   Object.assign(richEntries.at(-1).message, { provider: "test", model: "E2E Model" });
   writeSession(RICH, richEntries);
-  // The default page is 50 *visible* messages (user / assistant / compaction).
-  // toolResults ride along free after #810, so 48 tool-call assistants + the
-  // final answer + the divider fill that window; the user prompt is the 51st
-  // visible entry and must stay outside the first page.
+  // The first server page is 60 context messages, including tool results.
+  // The compacted branch has 61 entries: user + divider + 29 call/result pairs
+  // + answer. That keeps the user outside the first page but includes the
+  // compaction anchor needed for the navigation test.
   const compactedEntries = [
     message("user", null, "user", "E2E prompt outside the compacted page"),
     { type: "compaction", id: "compact", parentId: "user", timestamp, summary: "E2E compaction anchor", firstKeptEntryId: "user", tokensBefore: 100 },
   ];
-  for (let i = 0; i < 48; i++) {
+  for (let i = 0; i < 29; i++) {
     compactedEntries.push(message(`call${i}`, compactedEntries.at(-1).id, "assistant", [
       { type: "toolCall", id: `t${i}`, name: "bash", arguments: { command: `echo step${i}` } },
     ]));
@@ -115,7 +115,7 @@ try {
     Object.assign(result.message, { toolCallId: `t${i}`, toolName: "bash", isError: false });
     compactedEntries.push(result);
   }
-  compactedEntries.push(message("answer", "result47", "assistant", [{ type: "text", text:
+  compactedEntries.push(message("answer", "result28", "assistant", [{ type: "text", text:
     "E2E compacted answer paragraph.\n\n".repeat(20)
     + "## E2E compacted heading\n\n"
     + "E2E compacted answer paragraph.\n\n".repeat(20),
@@ -173,25 +173,29 @@ try {
     await delay(250);
   }
 
-  const detail = await api(`/api/sessions/${LONG}?deferThinking=1&deferMedia=1`);
-  assert.deepEqual(detail.context.entryIds, ids(4950, 5000));
-  assert.equal(detail.context.messages.length, 50);
+  // The web client explicitly requests a bounded page; omitting tail is the
+  // local full-branch API contract, not an implicit 50-message page.
+  const detail = await api(`/api/sessions/${LONG}?deferThinking=1&deferMedia=1&tree=summary&tail=60`);
+  assert.deepEqual(detail.context.entryIds, ids(4940, 5000));
+  assert.equal(detail.context.messages.length, 60);
   assert.equal(detail.context.hasMore, true);
+  assert.deepEqual(detail.contextPage, { startIndex: 4940, endIndex: 5000, totalMessages: 5000, hasEarlier: true });
   assert.ok(JSON.stringify(detail).length < 100_000, "Detail transferred unbounded history");
   const tail = await api(`/api/sessions/${LONG}/context?tail=50`);
   assert.deepEqual(tail.context.entryIds, ids(4950, 5000));
   assert.equal(tail.context.messages.length, 50);
   const selectedBranch = await api(`/api/sessions/${BRANCH}/context?leafId=old`);
   assert.deepEqual(selectedBranch.context.entryIds, ["root", "old"]);
-  const rootPage = await api(`/api/sessions/${BRANCH}/context?before=old&tail=1`);
+  const rootPage = await api(`/api/sessions/${BRANCH}/context?before=1&limit=1`);
   assert.deepEqual(rootPage.context.entryIds, ["root"]);
   assert.equal(rootPage.context.hasMore, false);
-  const beforeRoot = await api(`/api/sessions/${BRANCH}/context?before=root`);
+  const beforeRoot = await api(`/api/sessions/${BRANCH}/context?before=0`);
   assert.deepEqual(beforeRoot.context.entryIds, []);
   assert.equal(beforeRoot.context.hasMore, false);
+  await api(`/api/sessions/${BRANCH}/context?before=root`, 400);
   await api("/api/sessions/e2e-does-not-exist", 404);
   await api("/api/files/..%2F..%2Fetc%2Fpasswd?type=read", 403);
-  const compacted = await api(`/api/sessions/${COMPACTED}`);
+  const compacted = await api(`/api/sessions/${COMPACTED}?tail=60`);
   assert.equal(compacted.context.entryIds[0], "compact");
   assert.equal(compacted.context.messages.some((entry) => entry.role === "user"), false);
   console.log("PASS: bounded history, branch context, pagination root, and API errors");
@@ -243,6 +247,12 @@ try {
     await sentinel.waitFor({ state: "attached" });
     assert.equal(await page.getByText(text(4949), { exact: true }).count(), 0);
 
+    // The server sends 60 entries but only 50 are mounted initially. Reveal
+    // the remaining ten locally before expecting a network page request.
+    await sentinel.evaluate((element) => element.scrollIntoView({ block: "start", behavior: "instant" }));
+    await page.getByText(text(4940), { exact: true }).waitFor({ state: "attached" });
+    await page.getByText(text(4999), { exact: true }).evaluate((element) => element.scrollIntoView({ block: "end", behavior: "instant" }));
+
     // Exercise the real IntersectionObserver and prepend path, twice.
     for (let turn = 0; turn < 2; turn++) {
       const responsePromise = page.waitForResponse((response) =>
@@ -261,15 +271,15 @@ try {
     })), { connected: true, text: text(4998) }, "Prepending history must preserve existing message nodes");
     await latestUser.dispose();
     assert.ok(olderResponses.length >= 2, "Scrolling must fetch consecutive older pages");
-    let oldest = Number(new URL(olderResponses[0].url()).searchParams.get("before")?.slice(1));
-    assert.ok(Number.isInteger(oldest), "Older page must include a numeric before cursor");
+    let oldest = Number(new URL(olderResponses[0].url()).searchParams.get("before"));
+    assert.equal(oldest, 4940, "The initial server page must contain the last 60 messages");
     for (const response of olderResponses) {
       assert.equal(response.status(), 200);
-      assert.equal(new URL(response.url()).searchParams.get("before"), `e${oldest}`);
+      assert.equal(new URL(response.url()).searchParams.get("before"), String(oldest));
       const older = (await response.json()).context;
-      assert.deepEqual(older.entryIds, ids(oldest - 50, oldest));
-      assert.equal(older.messages.length, 50);
-      oldest -= 50;
+      assert.deepEqual(older.entryIds, ids(oldest - 120, oldest));
+      assert.equal(older.messages.length, 120);
+      oldest -= 120;
       assert.equal(older.oldestEntryId, `e${oldest}`);
       assert.equal(older.hasMore, true);
     }
@@ -352,10 +362,20 @@ try {
         return readingOffset(target);
       };
       await selectSession(text(0), "e4999");
-      const olderPage = page.waitForResponse((response) => response.url().includes(`/api/sessions/${LONG}/context?`));
-      await page.getByText("Scroll up to load earlier messages", { exact: true }).evaluate((element) => element.scrollIntoView({ block: "start", behavior: "instant" }));
-      await olderPage;
+      // A validated cache may show e4920 immediately; a changed runtime
+      // revision can instead reload the first 60 and require a server page.
       const olderMessage = page.locator("[data-entry-id='e4920']");
+      if (!(await olderMessage.isVisible())) {
+        const sentinel = page.locator("[data-history-sentinel]");
+        await sentinel.evaluate((element) => element.scrollIntoView({ block: "start", behavior: "instant" }));
+        await page.getByText(text(4940), { exact: true }).waitFor({ state: "attached" });
+        if (!(await olderMessage.isVisible())) {
+          const olderPage = page.waitForResponse((response) => response.url().includes(`/api/sessions/${LONG}/context?`));
+          await sentinel.evaluate((element) => element.scrollIntoView({ block: "start", behavior: "instant" }));
+          await olderPage;
+        }
+      }
+      await olderMessage.waitFor({ state: "visible" });
       const olderOffset = await positionForReading(olderMessage);
       await selectSession("Render **E2E markdown**", "user");
       const process = page.getByRole("button", { name: /process details/i });
@@ -368,6 +388,10 @@ try {
       assert.equal(await process.getAttribute("aria-expanded"), "false");
       assert.ok(Math.abs(await readingOffset(answerHeading) - answerOffset) < 5, "Collapsing process details on remount must not displace the answer");
 
+      // Start the cancellation case from a cold page so only the first 60
+      // messages are loaded, regardless of earlier cache validation.
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.locator(".markdown-code-block pre").waitFor();
       // Hold pagination until a different branch has loaded, exercising effect cancellation.
       let releaseHistory;
       const historyGate = new Promise((resolve) => { releaseHistory = resolve; });
@@ -380,8 +404,13 @@ try {
       const agentRoute = `**/api/agent/${LONG}`;
       await page.route(agentRoute, (route) => route.fulfill({ json: {} }));
       try {
-        const pendingHistory = page.waitForRequest((request) => request.url().includes(`/api/sessions/${LONG}/context?`) && new URL(request.url()).searchParams.has("before"));
         await page.locator(`[title="${text(0)}"]`).click();
+        await page.locator("[data-entry-id='e4999']:not([data-message-role])").waitFor({ state: "visible" });
+        const sentinel = page.locator("[data-history-sentinel]");
+        await sentinel.evaluate((element) => element.scrollIntoView({ block: "start", behavior: "instant" }));
+        await page.getByText(text(4940), { exact: true }).waitFor({ state: "attached" });
+        const pendingHistory = page.waitForRequest((request) => request.url().includes(`/api/sessions/${LONG}/context?`) && new URL(request.url()).searchParams.has("before"));
+        await sentinel.evaluate((element) => element.scrollIntoView({ block: "start", behavior: "instant" }));
         await pendingHistory;
         await page.getByRole("button", { name: "Branches", exact: true }).click();
         await page.getByText("E2E alternate history branch", { exact: true }).click();

@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
-import { Geist, Geist_Mono, Noto_Sans_SC } from "next/font/google";
+import { Geist, Geist_Mono } from "next/font/google";
+import localFont from "next/font/local";
 import { PwaRegistration } from "@/components/PwaRegistration";
 import { THEME_INIT_SCRIPT } from "@/lib/theme";
 import "katex/dist/katex.min.css";
@@ -18,8 +19,9 @@ const geistMono = Geist_Mono({
   display: "swap",
 });
 
-const notoSansSC = Noto_Sans_SC({
-  weight: "variable",
+const notoSansSC = localFont({
+  src: "./fonts/NotoSansSC-variable.ttf",
+  weight: "100 900",
   variable: "--font-noto-sans-sc",
   display: "swap",
   preload: false,

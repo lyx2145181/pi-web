@@ -28,7 +28,10 @@ function isHostRuntimeVariable(name: string, platform: NodeJS.Platform): boolean
   const comparableName = platform === "win32" ? name.toUpperCase() : name;
   return comparableName === "PORT"
     || comparableName === "NODE_ENV"
-    || comparableName.startsWith("NEXT_");
+    || comparableName.startsWith("NEXT_")
+    // Project commands (and their model-visible output) must not receive the
+    // password that protects the Pi Web server.
+    || comparableName === "PI_WEB_PASSWORD";
 }
 
 export function sanitizeProjectCommandEnvironment(
