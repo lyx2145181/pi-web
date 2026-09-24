@@ -74,8 +74,9 @@ export async function checkChatAppearance(page) {
   assert.ok(await fittedHeight() < narrowHeight, "Widening must shrink the existing draft");
   await page.reload({ waitUntil: "networkidle" });
   await page.locator(".markdown-code-block pre").waitFor();
-  assert.equal(await font(textarea), "18px");
-  assert.equal(await font(page.locator(".markdown-user-message")), "18px");
+  // The composer adds 0.5px and Markdown adds 1px to the selected size.
+  assert.equal(await font(textarea), "18.5px");
+  assert.equal(await font(page.locator(".markdown-user-message")), "19px");
   assert.equal(await font(page.locator(".markdown-code-block pre")), "16.5px");
 
   await openSettings();
