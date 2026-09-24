@@ -231,7 +231,9 @@ const CUSTOM_UI_KEYBINDINGS = new TuiKeybindingsManager(TUI_KEYBINDINGS);
 // ============================================================================
 
 export class AgentSessionWrapper {
-  private listeners: EventListener[] = [];
+  // An SSE listener may unsubscribe inside emit (for example on shutdown).
+  // Removing it must not skip the next listener receiving the same event.
+  private listeners = new Set<EventListener>();
   private activeToolEvents = new Map<string, AgentEvent>();
   private pendingUiResponses = new Map<string, PendingUiResponse>();
   private pendingUiRequests = new Map<string, AgentEvent>();
@@ -558,12 +560,11 @@ export class AgentSessionWrapper {
   }
 
   onEvent(listener: EventListener): () => void {
-    this.listeners.push(listener);
+    this.listeners.add(listener);
     for (const event of this.pendingUiRequests.values()) listener(event);
     for (const event of this.activeToolEvents.values()) listener(event);
     return () => {
-      const i = this.listeners.indexOf(listener);
-      if (i !== -1) this.listeners.splice(i, 1);
+      this.listeners.delete(listener);
     };
   }
 

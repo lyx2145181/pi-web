@@ -25,6 +25,7 @@ import { workspaceKeyOf } from "@/lib/workspace-memory";
 import { formatRelativeTime } from "@/lib/i18n/format";
 import { useI18n } from "@/hooks/useI18n";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
+import { useScrollbarVisibility } from "@/hooks/useScrollbarVisibility";
 import { DirectoryPicker } from "./DirectoryPicker";
 import { FileExplorer, type FileExplorerHandle } from "./FileExplorer";
 import { SessionSearch } from "./SessionSearch";
@@ -32,6 +33,11 @@ import { SessionSearch } from "./SessionSearch";
 // Fixed row height for the session list. SessionItem renders at exactly this
 // height, so the list can be windowed (only the visible slice is mounted).
 const SESSION_LIST_ITEM_HEIGHT = 54;
+const EMPTY_PINNED_SESSION_IDS: readonly string[] = [];
+
+export function quantizeSessionScrollTop(scrollTop: number): number {
+  return Math.floor(scrollTop / SESSION_LIST_ITEM_HEIGHT) * SESSION_LIST_ITEM_HEIGHT;
+}
 
 export function getSessionListIndices(count: number, scrollTop: number, viewportHeight: number, focusedIndex = -1): number[] {
   const overscan = 8;
@@ -382,9 +388,14 @@ export function getVariableSessionListIndices(
   forcedIndices: readonly number[] = [],
 ): number[] {
   const overscan = SESSION_LIST_ITEM_HEIGHT * 8;
-  const viewportEnd = scrollTop + (viewportHeight || 600);
+  const height = viewportHeight || 600;
+  const lastLayout = layouts[layouts.length - 1];
+  // Switching to a shorter project can leave one render with the previous
+  // project's scroll offset before the browser clamps the scroll container.
+  const visibleTop = Math.max(0, Math.min(scrollTop, lastLayout ? Math.max(0, lastLayout.top + lastLayout.height - height) : 0));
+  const viewportEnd = visibleTop + height;
   const indices = layouts.flatMap((layout, index) => (
-    layout.top + layout.height >= scrollTop - overscan && layout.top <= viewportEnd + overscan ? [index] : []
+    layout.top + layout.height >= visibleTop - overscan && layout.top <= viewportEnd + overscan ? [index] : []
   ));
   for (const index of forcedIndices) {
     if (index >= 0 && index < layouts.length && !indices.includes(index)) indices.push(index);
@@ -619,6 +630,9 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
 
   // Virtualized session list: only the visible window of rows is mounted.
   const listScrollRef = useRef<HTMLDivElement>(null);
+  const explorerScrollRef = useRef<HTMLDivElement>(null);
+  useScrollbarVisibility(listScrollRef);
+  useScrollbarVisibility(explorerScrollRef, explorerOpen && Boolean(selectedCwdProp || selectedCwd));
   const sessionPaneRef = useRef<HTMLDivElement>(null);
   const explorerSectionRef = useRef<HTMLDivElement>(null);
   const sessionPaneHeightRef = useRef(SESSION_PANE_DEFAULT_HEIGHT);
@@ -656,12 +670,17 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   const [listScrollTop, setListScrollTop] = useState(0);
   const [focusedSessionId, setFocusedSessionId] = useState<string | null>(null);
   const listScrollRafRef = useRef<number | null>(null);
+  const listScrollTopRef = useRef(0);
+  const renderedListScrollTopRef = useRef(0);
   const handleListScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
-    const top = e.currentTarget.scrollTop;
+    listScrollTopRef.current = e.currentTarget.scrollTop;
     if (listScrollRafRef.current != null) return;
     listScrollRafRef.current = requestAnimationFrame(() => {
       listScrollRafRef.current = null;
-      setListScrollTop(top);
+      const nextTop = quantizeSessionScrollTop(listScrollTopRef.current);
+      if (renderedListScrollTopRef.current === nextTop) return;
+      renderedListScrollTopRef.current = nextTop;
+      setListScrollTop(nextTop);
     });
   }, []);
   useLayoutEffect(() => {
@@ -672,8 +691,16 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     });
     ro.observe(el);
     setListViewportH(el.clientHeight);
-    setListScrollTop(el.scrollTop);
-    return () => ro.disconnect();
+    listScrollTopRef.current = el.scrollTop;
+    renderedListScrollTopRef.current = quantizeSessionScrollTop(el.scrollTop);
+    setListScrollTop(renderedListScrollTopRef.current);
+    return () => {
+      ro.disconnect();
+      if (listScrollRafRef.current !== null) {
+        cancelAnimationFrame(listScrollRafRef.current);
+        listScrollRafRef.current = null;
+      }
+    };
   }, [sessionSearchActive]);
 
   const loadSessions = useCallback(async (showLoading = false, force = false, summary = false) => {
@@ -1261,14 +1288,18 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     onNewSession?.(tempId, selectedCwd);
   }, [selectedCwd, onNewSession]);
 
-  const recentProjects = getRecentProjects(allSessions);
+  const recentProjects = useMemo(() => getRecentProjects(allSessions), [allSessions]);
   const showProjectFilter = recentProjects.length > 8;
-  const visibleProjects = projectFilter.trim()
-    ? recentProjects.filter((project) => project.root.toLowerCase().includes(projectFilter.trim().toLowerCase()))
-    : recentProjects;
+  const visibleProjects = useMemo(() => {
+    const query = projectFilter.trim().toLowerCase();
+    return query
+      ? recentProjects.filter((project) => project.root.toLowerCase().includes(query))
+      : recentProjects;
+  }, [projectFilter, recentProjects]);
 
   // Sessions of every worktree in the selected project are shown together
-  const selectedProject = projectFor(selectedCwd);
+  const selectedProject = useMemo(() => projectFor(selectedCwd), [projectFor, selectedCwd]);
+  const selectedProjectKey = selectedProject?.key ?? null;
 
   // Per-project activity counts (running / unread) for the workspace selector.
   // Uses the same stable server key as the project list and filtering.
@@ -1289,20 +1320,22 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     return total;
   }, [projectActivity]);
 
-  const projectSessions = selectedProject
-    ? sessionsForProject(allSessions, selectedProject.key)
-    : allSessions;
+  const projectSessions = useMemo(
+    () => selectedProjectKey ? sessionsForProject(allSessions, selectedProjectKey) : allSessions,
+    [allSessions, selectedProjectKey],
+  );
   const showWorktreeSwitcher = Boolean(
     worktreeState?.isGit
     && worktreeState.isTopLevel
     && selectedCwd
     && selectedProject?.key === worktreeState.projectKey
   );
-  const filteredSessions = showWorktreeSwitcher
-    && !showAllWorktreeSessions
-    && currentWorktreePath
-    ? sessionsForWorktree(projectSessions, currentWorktreePath)
-    : projectSessions;
+  const filteredSessions = useMemo(
+    () => showWorktreeSwitcher && !showAllWorktreeSessions && currentWorktreePath
+      ? sessionsForWorktree(projectSessions, currentWorktreePath)
+      : projectSessions,
+    [showWorktreeSwitcher, showAllWorktreeSessions, currentWorktreePath, projectSessions],
+  );
   const worktreeGuide = selectedCwd
     && worktreeState
     && selectedProject?.key === worktreeState.projectKey
@@ -1329,15 +1362,18 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
   // Hide subagent rows inside their owning conversation while preserving the
   // visible fork tree. Only roots can be pinned, and virtualization operates on
   // complete root subtrees so collapse and native drag retain stable DOM units.
-  const selectedProjectKey = selectedProject?.key ?? null;
   const storedProjectPinnedSessionIds = selectedProjectKey
-    ? (sessionOrderPreferences.projects[selectedProjectKey] ?? [])
-    : [];
-  const sessionTree = buildSessionTree(filteredSessions, storedProjectPinnedSessionIds);
-  const pinnedSessionIdSet = new Set(storedProjectPinnedSessionIds);
-  const pinnedSessionTrees = sessionTree.filter((node) => pinnedSessionIdSet.has(node.session.id));
-  const recentSessionTrees = sessionTree.filter((node) => !pinnedSessionIdSet.has(node.session.id));
-  const visibleRootSessionIds = new Set(sessionTree.map((node) => node.session.id));
+    ? (sessionOrderPreferences.projects[selectedProjectKey] ?? EMPTY_PINNED_SESSION_IDS)
+    : EMPTY_PINNED_SESSION_IDS;
+  const sessionTree = useMemo(() => buildSessionTree(filteredSessions, storedProjectPinnedSessionIds), [filteredSessions, storedProjectPinnedSessionIds]);
+  const { pinnedSessionTrees, recentSessionTrees, visibleRootSessionIds } = useMemo(() => {
+    const pinnedSessionIdSet = new Set(storedProjectPinnedSessionIds);
+    return {
+      pinnedSessionTrees: sessionTree.filter((node) => pinnedSessionIdSet.has(node.session.id)),
+      recentSessionTrees: sessionTree.filter((node) => !pinnedSessionIdSet.has(node.session.id)),
+      visibleRootSessionIds: new Set(sessionTree.map((node) => node.session.id)),
+    };
+  }, [sessionTree, storedProjectPinnedSessionIds]);
   const pinnedDragOffsets = new Map<string, number>();
   if (dragPreviewPinnedSessionIds && pinnedDragLayoutRef.current.size > 0) {
     let nextTop = Math.min(...[...pinnedDragLayoutRef.current.values()].map((layout) => layout.top));
@@ -1422,32 +1458,33 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
     />
   );
 
-  const sessionTreeLayouts: SessionTreeLayout[] = [];
-  let nextSessionTreeTop = 0;
-  const appendLayouts = (nodes: SessionTreeNode[], pinned: boolean) => {
-    for (const node of nodes) {
-      const height = visibleSessionTreeRows(node, collapsedSessionIds) * SESSION_LIST_ITEM_HEIGHT;
-      sessionTreeLayouts.push({ node, top: nextSessionTreeTop, height, pinned });
-      nextSessionTreeTop += height;
-    }
-  };
-  appendLayouts(pinnedSessionTrees, true);
-  const unpinnedSectionTop = pinnedSessionTrees.length > 0 && recentSessionTrees.length > 0
-    ? nextSessionTreeTop
-    : null;
-  if (unpinnedSectionTop !== null) nextSessionTreeTop += 18;
-  appendLayouts(recentSessionTrees, false);
-  const forcedLayoutIndices = [focusedSessionId, draggingPinnedSessionId].flatMap((sessionId) => {
+  const { sessionTreeLayouts, nextSessionTreeTop, unpinnedSectionTop } = useMemo(() => {
+    const layouts: SessionTreeLayout[] = [];
+    let nextTop = 0;
+    const appendLayouts = (nodes: SessionTreeNode[], pinned: boolean) => {
+      for (const node of nodes) {
+        const height = visibleSessionTreeRows(node, collapsedSessionIds) * SESSION_LIST_ITEM_HEIGHT;
+        layouts.push({ node, top: nextTop, height, pinned });
+        nextTop += height;
+      }
+    };
+    appendLayouts(pinnedSessionTrees, true);
+    const sectionTop = pinnedSessionTrees.length > 0 && recentSessionTrees.length > 0 ? nextTop : null;
+    if (sectionTop !== null) nextTop += 18;
+    appendLayouts(recentSessionTrees, false);
+    return { sessionTreeLayouts: layouts, nextSessionTreeTop: nextTop, unpinnedSectionTop: sectionTop };
+  }, [pinnedSessionTrees, recentSessionTrees, collapsedSessionIds]);
+  const forcedLayoutIndices = useMemo(() => [focusedSessionId, draggingPinnedSessionId].flatMap((sessionId) => {
     if (!sessionId) return [];
     const index = sessionTreeLayouts.findIndex((layout) => sessionTreeContains(layout.node, sessionId));
     return index >= 0 ? [index] : [];
-  });
-  const virtualSessionTreeIndices = getVariableSessionListIndices(
+  }), [sessionTreeLayouts, focusedSessionId, draggingPinnedSessionId]);
+  const virtualSessionTreeIndices = useMemo(() => getVariableSessionListIndices(
     sessionTreeLayouts,
     listScrollTop,
     listViewportH,
     forcedLayoutIndices,
-  );
+  ), [sessionTreeLayouts, listScrollTop, listViewportH, forcedLayoutIndices]);
 
   return (
     <div
@@ -2241,6 +2278,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
         <div
           ref={listScrollRef}
           onScroll={handleListScroll}
+          className="scrollbar-subtle"
           style={{
             flex: "1 1 auto",
             minHeight: 0,
@@ -2443,7 +2481,7 @@ export const SessionSidebar = memo(function SessionSidebar({ selectedSessionId, 
             </ToolbarIconButton>
           </div>
           {explorerOpen && (
-            <div style={{ flex: 1, overflowY: "auto", overflowX: "hidden" }}>
+            <div ref={explorerScrollRef} className="scrollbar-subtle" style={{ flex: 1, overflowY: "auto", overflowX: "hidden" }}>
               <FileExplorer
                 ref={fileExplorerRef}
                 cwd={selectedCwd ?? selectedCwdProp!}

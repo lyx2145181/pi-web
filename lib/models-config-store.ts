@@ -61,21 +61,48 @@ export function getModelsConfigPath(): string {
   return join(getAgentDir(), "models.json");
 }
 
+/** An existing models.json could not be read; replacing it would lose providers. */
+export class ModelsConfigReadError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ModelsConfigReadError";
+  }
+}
+
+// Match pi's unexported JSON parser: remove line comments and trailing commas
+// without changing string literals (including URLs and API keys).
+function stripJsonComments(input: string): string {
+  return input
+    .replace(/"(?:\\.|[^"\\])*"|\/\/[^\n]*/g, (match) => (match[0] === '"' ? match : ""))
+    .replace(/"(?:\\.|[^"\\])*"|,(\s*[}\]])/g, (match, tail?: string) => tail ?? (match[0] === '"' ? match : ""));
+}
+
 export function readModelsConfig(
   modelsPath = getModelsConfigPath(),
 ): Record<string, unknown> {
   if (!existsSync(modelsPath)) return { providers: {} };
+  let parsed: unknown;
   try {
-    return JSON.parse(readFileSync(modelsPath, "utf8")) as Record<string, unknown>;
-  } catch {
-    return { providers: {} };
+    const content = readFileSync(modelsPath, "utf8").replace(/^\uFEFF/, "");
+    if (!content.trim()) return { providers: {} };
+    parsed = JSON.parse(stripJsonComments(content));
+  } catch (error) {
+    throw new ModelsConfigReadError(
+      `Failed to read ${modelsPath}: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
+  if (!isRecord(parsed)) {
+    throw new ModelsConfigReadError(`Failed to read ${modelsPath}: expected a JSON object`);
+  }
+  return parsed;
 }
 
 export function writeModelsConfig(
   data: Record<string, unknown>,
   modelsPath = getModelsConfigPath(),
 ): void {
+  // A draft built from an unreadable file must never replace its contents.
+  readModelsConfig(modelsPath);
   const dir = dirname(modelsPath);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const normalized = normalizeModelsConfigCosts(sanitizeModelsConfig(data));

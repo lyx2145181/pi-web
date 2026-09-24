@@ -29,6 +29,15 @@ test("uses shared sidebar sizing for providers and matching indented model rows"
   assert.match(cssSource, /\.models-sidebar-indented-item \{[\s\S]*?padding-left: 26px/);
 });
 
+test("unreadable model config shows an error and cannot save a blank draft", () => {
+  const panel = source.slice(source.indexOf("export function ModelsConfig("));
+  assert.match(panel, /if \(!response\.ok \|\| data\.error\) throw new Error/);
+  assert.match(panel, /\.catch\(\(error: unknown\) => setLoadError\(/);
+  assert.match(panel, /if \(loading \|\| loadError\) return;/);
+  assert.match(panel, /disabled=\{loading \|\| saving \|\| savedOk \|\| loadError !== null\}/);
+  assert.match(panel, /t\("models\.configUnreadable", \{ error: loadError \}\)/);
+});
+
 test("ignores malformed auth provider responses", () => {
   assert.match(
     source,
