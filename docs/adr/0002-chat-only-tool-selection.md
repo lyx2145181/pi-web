@@ -73,16 +73,27 @@ launchers can require strict equality before sending a task.
 
 The persisted selection must be resolved before `createAgentSessionServices()`
 so Chat only never imports or executes session extensions. For nonempty exact
-selections, Pi Web carries the requested names across extension binding and
-validates the complete set after `session_start`; session startup does not
-return until that validation succeeds. Reload applies the currently registered
+selections, Pi Web passes the complete requested names (including extension
+tools and resolved shell aliases) as the SDK registration allow-list, carries
+them across extension binding, and validates the complete set after
+`session_start`; session startup does not return until that validation succeeds.
+Unselected tools are absent from the SDK registry, not merely inactive, so an
+extension cannot add them back with `setActiveTools()` at `before_agent_start`
+or from a loader tool. `get_tools` for an exact session therefore exposes only
+its registered selected tools. Inclusive sessions retain the complete registry
+and their normal dynamic activation. This is a tool registration boundary,
+not an operating-system sandbox; trusted extensions still execute as host code. Reload applies the currently registered
 subset through the SDK's `beforeSessionStart` hook, then reapplies and validates
 the complete exact set after lazy registration finishes. The exact system
 prompt must also be reapplied after Pi's `before_agent_start` phase, because the
 SDK rebuilds its base prompt immediately before the model call.
 
-Changing among nonempty tool presets can update an existing wrapper. Crossing
-the Chat-only boundary must append the new selection and rebuild the wrapper:
+Changing among ordinary inclusive nonempty tool presets can update an existing
+wrapper. Explicitly switching an exact session back to an inclusive preset
+must append the new selection and rebuild the wrapper to lift the SDK
+registration allow-list. A persisted session retains its ID and file; an
+unpersisted session returns its new actual ID rather than pretending to keep
+the original. Crossing the Chat-only boundary must also rebuild the wrapper:
 normal wrappers have already loaded extensions, while Chat-only wrappers do not
 have those resources available to enable in place. Persisted sessions retain
 their id and JSONL file. An unpersisted empty composer session may be discarded

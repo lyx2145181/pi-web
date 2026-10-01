@@ -55,6 +55,7 @@ export async function POST(req: Request) {
       skillNames,
       skillPolicy,
       thinkingLevel,
+      roleTaskPath,
       ...promptCommand
     } = command as {
       provider?: string;
@@ -64,6 +65,7 @@ export async function POST(req: Request) {
       skillNames?: string[];
       skillPolicy?: unknown;
       thinkingLevel?: unknown;
+      roleTaskPath?: string;
       [key: string]: unknown;
     };
     if ((provider && !modelId) || (!provider && modelId)) {
@@ -84,6 +86,7 @@ export async function POST(req: Request) {
       ...(skillPolicy !== undefined ? { skillPolicy: explicitSkillPolicy } : {}),
       ...(provider && modelId ? { initialModel: { provider, modelId } } : {}),
       ...(explicitThinkingLevel ? { thinkingLevel: explicitThinkingLevel } : {}),
+      ...(roleTaskPath !== undefined ? { roleTaskPath } : {}),
     });
 
     // Keep the files-route allowed-roots cache (see app/api/files/[...path]/route.ts)

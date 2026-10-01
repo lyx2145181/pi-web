@@ -15,6 +15,7 @@ import {
 import { cacheSessionPath, getLatestModelChange, invalidateSessionListCache, readLatestSessionEntryId, resolveSessionPath } from "./session-reader";
 import { getProjectTrustStatus, projectTrustReloadOptions } from "./project-trust";
 import { persistExplicitStartupPreferences } from "./startup-preferences";
+import { resolveShellTools } from "./powershell-settings";
 import { createPiWebAgentSessionServices } from "./agent-session-services";
 import { notifySessionComplete } from "./web-push";
 import { hasActiveSessionLivenessProvider } from "./session-liveness";
@@ -46,6 +47,9 @@ import { createSubagentController } from "./subagent-runtime";
 import { isBuiltInSubagentsEnabled } from "./subagent-settings";
 import { CHAT_ONLY_RESOURCE_LOADER_OPTIONS, contextFilesSystemPrompt } from "./chat-only";
 import { createExactSystemPromptExtension } from "./exact-system-prompt";
+import { appendRoleBinding, boundSession, nativeCall, readRoleBinding, readRoleTask, requestRoleTick, roleFinished, roleMessageInput } from "./role-tasks";
+import { Type } from "@earendil-works/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   resolveActiveToolNames,
   resolveRegisteredExactToolNames,
@@ -140,6 +144,7 @@ type AgentSessionWrapperOptions = {
   suppressCompletionNotifications?: boolean;
   backgroundWorkProbe?: BackgroundWorkProbe;
   idleTimeoutMs?: number;
+  roleTaskPath?: string;
 };
 
 
@@ -193,6 +198,7 @@ export interface RpcSessionStartOptions {
   initialModel?: { provider: string; modelId: string };
   allowInitialModelFallback?: boolean;
   thinkingLevel?: ThinkingLevel;
+  roleTaskPath?: string;
 }
 
 const THINKING_LEVEL_NAMES = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
@@ -268,6 +274,7 @@ export class AgentSessionWrapper {
   private _alive = true;
   private readonly backgroundWorkProbe?: BackgroundWorkProbe;
   private readonly idleTimeoutMs: number;
+  readonly roleTaskPath?: string;
 
   constructor(
     public readonly inner: AgentSessionLike,
@@ -282,6 +289,7 @@ export class AgentSessionWrapper {
     this.suppressCompletionNotifications = options.suppressCompletionNotifications ?? false;
     this.backgroundWorkProbe = options.backgroundWorkProbe;
     this.idleTimeoutMs = options.idleTimeoutMs ?? SESSION_IDLE_TIMEOUT_MS;
+    this.roleTaskPath = options.roleTaskPath;
   }
 
   get sessionId(): string {
@@ -357,6 +365,10 @@ export class AgentSessionWrapper {
         }
       }
       if (IDLE_RESET_EVENT_TYPES.has(event.type)) this.resetIdleTimer();
+      if (this.roleTaskPath && (event.type === "agent_end" || event.type === "agent_settled")) {
+        try { requestRoleTick(this.roleTaskPath); }
+        catch (error) { console.error("[pi-web] role task idle tick gap:", error); }
+      }
       this.emit(event);
       if (event.type === "agent_settled") this.notifyAgentRunCompleteIfIdle();
     });
@@ -630,12 +642,16 @@ export class AgentSessionWrapper {
       }
 
       switch (type) {
-      case "prompt": {
+      case "prompt":
+      case "role_task_deliver": {
+        if (type === "role_task_deliver" && (typeof command.onAdmitted !== "function" || !this.roleTaskPath)) throw new Error("Role delivery requires trusted host admission");
         // Serialize only admission. Once the preceding prompt has either
         // passed or failed preflight, the SDK can atomically decide whether
         // this submission starts a run or joins its streaming queue.
         const releaseAdmission = await this.acquirePromptAdmission();
         try {
+          if (type === "role_task_deliver" && this.isRunning()) return { status: "busy" };
+          if (type === "role_task_deliver") await (command.onAdmitted as () => Promise<void>)();
           if (this.inner.isBashRunning) {
             throw new Error("Cannot send a prompt while a shell command is running");
           }
@@ -1857,6 +1873,7 @@ export async function setRpcSessionTools(
   if (!existing?.isAlive()) {
     if (!sessionFile) throw new Error("Session not found");
     const manager = SessionManager.open(sessionFile, undefined);
+    if (readRoleBinding(manager.getEntries() as unknown as SessionEntry[])) throw new Error("Bound role task tools cannot be changed");
     if (readSubagentSessionResources(manager.getEntries() as unknown as SessionEntry[])) {
       throw new Error("Subagent tool selection is fixed by its profile");
     }
@@ -1867,6 +1884,7 @@ export async function setRpcSessionTools(
     return { session: started.session, sessionId: started.realSessionId, recreated: false };
   }
 
+  if (existing.roleTaskPath) throw new Error("Bound role task tools cannot be changed");
   if (existing.isRunning()) throw new Error("Cannot change tools while the session is running");
   if (readSubagentSessionResources(existing.inner.sessionManager.getEntries() as unknown as SessionEntry[])) {
     throw new Error("Subagent tool selection is fixed by its profile");
@@ -1874,14 +1892,20 @@ export async function setRpcSessionTools(
 
   const hasCurrentResourcePolicy = typeof existing.isChatOnly === "function"
     && typeof existing.setActiveToolSelection === "function";
-  const crossesChatOnlyBoundary = toolNames === undefined
+  const currentToolPolicy = readSessionToolSelection(
+    existing.inner.sessionManager.getEntries() as unknown as SessionEntry[],
+  )?.mode;
+  // Exact sessions have an SDK registration allow-list. Returning to an ordinary
+  // inclusive preset must recreate the SDK, not just change its active names.
+  const crossesResourceBoundary = toolNames === undefined
     || !hasCurrentResourcePolicy
-    || existing.isChatOnly() !== (toolNames.length === 0);
+    || existing.isChatOnly() !== (toolNames.length === 0)
+    || currentToolPolicy === "exact";
   if (toolNames === undefined) appendClearedSessionToolSelection(existing.inner.sessionManager);
   else appendSessionToolSelection(existing.inner.sessionManager, toolNames, "inclusive");
   invalidateSessionListCache();
 
-  if (toolNames !== undefined && !crossesChatOnlyBoundary) {
+  if (toolNames !== undefined && !crossesResourceBoundary) {
     existing.setActiveToolSelection(toolNames, "inclusive");
     return { session: existing, sessionId, recreated: false };
   }
@@ -2060,7 +2084,10 @@ export async function startRpcSession(
   const locks = getLocks();
 
   const existing = registry.get(sessionId);
-  if (existing?.isAlive()) return { session: existing, realSessionId: sessionId };
+  if (existing?.isAlive()) {
+    if (options.roleTaskPath && existing.roleTaskPath !== options.roleTaskPath) throw new Error("Role binding mismatch");
+    return { session: existing, realSessionId: sessionId };
+  }
 
   const inflight = locks.get(sessionId);
   if (inflight) return inflight;
@@ -2071,6 +2098,18 @@ export async function startRpcSession(
   } else {
     if (!cwd) throw new Error("cwd is required for a new session");
     sessionManager = SessionManager.create(cwd, undefined);
+  }
+  const persistedRoleTask = readRoleBinding(sessionManager.getEntries() as unknown as SessionEntry[]);
+  if (persistedRoleTask && options.roleTaskPath && persistedRoleTask !== options.roleTaskPath) throw new Error("Role binding mismatch");
+  const roleTaskPath = persistedRoleTask ?? options.roleTaskPath;
+  if (roleTaskPath) {
+    const task = readRoleTask(roleTaskPath);
+    // A fresh SDK session has no ID until construction returns. The native tool
+    // and delivery path recheck the registered ID on each call.
+    if (realpathSync(sessionManager.getCwd()) !== task.project_root) throw new Error("Role session cwd does not match task project root");
+    if (!sessionFile && (roleFinished(task) || (task.dispatcher_session_id !== null && (!task.work || task.work.session_id !== null)))) throw new Error("No unassigned role session in this task");
+    if (sessionFile && !persistedRoleTask && options.roleTaskPath) throw new Error("Cannot attach an existing chat session to a role task");
+    if (sessionFile && !boundSession(task, sessionManager.getSessionId() ?? sessionId)) throw new Error("Session is not registered in role task");
   }
   const sessionCwd = sessionManager.getCwd();
   const subagentResources = sessionFile
@@ -2124,7 +2163,7 @@ export async function startRpcSession(
     let toolsOption: string[] | undefined = subagentResources?.tools;
     if (!subagentResources && selectedToolNames !== undefined) {
       // toolNames === [] -> "all off" (an empty allow-list disables every tool).
-      // Otherwise DO NOT pass a builtin-only allow-list: passing CODING_TOOL_NAMES
+      // Inclusive sessions must not receive a builtin-only allow-list: passing CODING_TOOL_NAMES
       // set allowedToolNames to coding builtins only, which filtered every
       // extension/package-provided tool (e.g. subagents, web access) out of the
       // tool registry — so they were unavailable in Pi Web sessions even though the
@@ -2145,6 +2184,12 @@ export async function startRpcSession(
         ? undefined
         : projectTrustReloadOptions(sessionCwd, agentDir);
     const settingsManager = SettingsManager.create(sessionCwd, agentDir);
+    if (!subagentResources && toolPolicy === "exact" && selectedToolNames !== undefined) {
+      // Constrain registration as well as activation. Extensions may call
+      // setActiveTools() after startup; unrequested tools must never enter the
+      // SDK registry, including tools lazily registered on session_start/reload.
+      toolsOption = resolveShellTools(selectedToolNames, settingsManager.getDefaultTools());
+    }
     const extensionEventBus = createEventBus();
     const backgroundWorkProbe = createSubagentBackgroundWorkProbe(extensionEventBus, sessionManager.getSessionId() ?? sessionId);
     // Chat-only sessions and subagents that replace Pi's prompt send an exact
@@ -2153,6 +2198,24 @@ export async function startRpcSession(
     const exactSystemPromptRef: { current?: () => string } = {};
     const exactSystemPromptExtension = createExactSystemPromptExtension(() => exactSystemPromptRef.current?.());
     const usesExactSystemPrompt = chatOnly || subagentResources?.exactSystemPrompt !== undefined;
+    const roleTool = roleTaskPath ? (pi: ExtensionAPI) => {
+      pi.registerTool({
+        name: "role_task_message", label: "Role task message",
+        description: "Queue a bound role task progress, help, result or reply. No synchronous response from the other role.",
+        parameters: Type.Object({ kind: Type.Union([Type.Literal("progress"), Type.Literal("help"), Type.Literal("result"), Type.Literal("reply")]), text: Type.String() }),
+        execute: async (toolCallId, params, _signal, _update, ctx) => {
+          const caller = ctx.sessionManager.getSessionId();
+          const task = readRoleTask(roleTaskPath);
+          if (!caller || !boundSession(task, caller) || roleFinished(task)) throw new Error("Role task binding no longer active");
+          const result = await nativeCall(roleMessageInput(roleTaskPath, caller, toolCallId, params.kind, params.text));
+          if (!result || typeof result !== "object" || (result as { status?: unknown }).status !== "queued") throw new Error("Native driver did not confirm queued message");
+          requestRoleTick(roleTaskPath);
+          const reply = result as { status: "queued"; event_id?: unknown; instruction?: unknown; recipient_id?: unknown };
+          const details = { status: "queued", ...(typeof reply.event_id === "string" ? { event_id: reply.event_id } : {}), ...(typeof reply.instruction === "string" ? { instruction: reply.instruction } : {}), ...(typeof reply.recipient_id === "string" ? { recipient_id: reply.recipient_id } : {}) };
+          return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details };
+        },
+      });
+    } : undefined;
     const services = await createPiWebAgentSessionServices({
       cwd: sessionCwd,
       agentDir,
@@ -2172,13 +2235,14 @@ export async function startRpcSession(
                 }
               : {}),
             appendSystemPrompt: subagentResources.appendSystemPrompt,
-            ...(usesExactSystemPrompt ? { extensionFactories: [exactSystemPromptExtension] } : {}),
+            ...(usesExactSystemPrompt || roleTool ? { extensionFactories: [ ...(usesExactSystemPrompt ? [exactSystemPromptExtension] : []), ...(roleTool ? [roleTool] : []) ] } : {}),
           }
         : chatOnly
-          ? { ...CHAT_ONLY_RESOURCE_LOADER_OPTIONS, eventBus: extensionEventBus, extensionFactories: [exactSystemPromptExtension] }
+          ? { ...CHAT_ONLY_RESOURCE_LOADER_OPTIONS, eventBus: extensionEventBus, extensionFactories: [exactSystemPromptExtension, ...(roleTool ? [roleTool] : [])] }
           : {
               eventBus: extensionEventBus,
               extensionFactories: [
+                ...(roleTool ? [roleTool] : []),
                 createProjectCommandBashExtension({
                   cwd: sessionCwd,
                   settings: settingsManager,
@@ -2289,6 +2353,7 @@ export async function startRpcSession(
       toolPolicy,
       toolNames: selectedToolNames,
       backgroundWorkProbe,
+      roleTaskPath,
       onAgentRunComplete: (completedSessionId) => {
         void notifySessionComplete(completedSessionId).catch((error) => {
           console.error("[pi-web] failed to send completion push:", error instanceof Error ? error.message : error);
@@ -2302,6 +2367,7 @@ export async function startRpcSession(
       await wrapper.waitUntilReady();
       // Persist only after lazy extension tools have been registered and exact
       // names validated, so rejected requests cannot save an unusable policy.
+      if (roleTaskPath && !persistedRoleTask) appendRoleBinding(sessionManager, roleTaskPath);
       if (requestedToolSelectionToPersist) {
         appendSessionToolSelection(
           sessionManager,
