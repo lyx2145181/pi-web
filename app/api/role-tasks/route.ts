@@ -12,7 +12,12 @@ function serial<T>(key: string, operation: () => Promise<T>): Promise<T> {
   void next.finally(() => { if (locks.get(key) === next) locks.delete(key); }).catch(() => undefined);
   return next;
 }
-const respondError = (error: unknown) => NextResponse.json({ error: error instanceof Error ? error.message : String(error) }, { status: 400 });
+const respondError = (error: unknown) => NextResponse.json({
+  error: error instanceof Error ? error.message : String(error),
+  ...(error && typeof error === "object" && typeof (error as { code?: unknown }).code === "string"
+    ? { code: (error as { code: string }).code }
+    : {}),
+}, { status: 400 });
 
 export async function POST(req: Request) {
   try {
@@ -89,7 +94,7 @@ export async function POST(req: Request) {
 export async function GET(req: Request) {
   try {
     const url = new URL(req.url);
-    if (url.searchParams.get("capabilities") === "1") return NextResponse.json({ protocol: "start-leaf-role-messages-v1", nativeTool: "role_task_message", nonBlocking: true });
+    if (url.searchParams.get("capabilities") === "1") return NextResponse.json({ protocol: "start-leaf-role-messages-v1", nativeTool: "role_task_message", nonBlocking: true, historicalRoleRestore: true, roleModelPreference: true });
     recoverRoleMonitors();
     const path = url.searchParams.get("taskPath") ?? "";
     const eventId = url.searchParams.get("eventId") ?? "";

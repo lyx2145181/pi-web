@@ -7,6 +7,7 @@ import type { SessionManager } from "@earendil-works/pi-coding-agent";
 import type { SessionEntry } from "./types";
 
 export const ROLE_BINDING_TYPE = "pi-web:role-task-binding";
+export const ROLE_MODEL_PREFERENCE_TYPE = "pi-web:role-model-preference";
 const stateDir = () => join(getAgentDir(), "runtime", "pi-web-role-tasks");
 const key = (path: string) => createHash("sha256").update(path).digest("hex");
 function noSymlink(path: string): void {
@@ -72,8 +73,16 @@ export interface RoleTask {
   project_root: string;
   dispatcher_session_id: string | null;
   monitor?: { interval_seconds?: number };
-  work?: { id: string; session_id: string | null; status: string };
+  work?: { id: string; session_id: string | null; status: string; role?: string };
+  /** Archived works: only their registered session IDs are trusted for reopening. */
+  previous_works?: Array<{ id?: string; session_id?: string | null; role?: string; status?: string }>;
   mailbox?: Array<{ id: string; work_id: string; sender_id: string; recipient_id: string; kind: string; text: string; status: string }>;
+}
+export const PROFESSIONAL_ROLES = new Set(["施工", "审查", "验收"]);
+const DISPATCHER_MEMBERSHIP = "\u0000dispatcher";
+function professionalRole(role: unknown, label: string): string {
+  if (typeof role !== "string" || !PROFESSIONAL_ROLES.has(role)) throw new Error(`Invalid role task professional role: ${label}`);
+  return role;
 }
 export const roleFinished = (task: RoleTask) => task.status === "handoff_complete";
 /** Trusted-host provenance guard; not an OS sandbox. */
@@ -86,10 +95,52 @@ export function readRoleTask(taskPath: string): RoleTask {
   if (rel.length < 4 || rel[0] !== "_交付记录" || rel[1] !== "start-leaf" || rel.at(-1) !== "任务.json" || rel.some((part) => part === ".." || part === "")) throw new Error("Task outside git delivery records");
   const task = JSON.parse(readFileSync(taskPath, "utf8")) as RoleTask;
   if (!task || task.version !== 1 || task.mode !== "dispatcher-message-work" || typeof task.status !== "string" || task.project_root !== root || (task.dispatcher_session_id !== null && typeof task.dispatcher_session_id !== "string")) throw new Error("Invalid dispatcher message task state");
+  if (task.previous_works !== undefined && !Array.isArray(task.previous_works)) throw new Error("Invalid role task previous works");
+  // One membership map over dispatcher, current work and archived works. A
+  // session id may carry exactly one role: reuse must be same-role, an archived
+  // professional may not be the dispatcher, and the current worker may not be
+  // the dispatcher. Missing roles are only tolerated for legacy no-history
+  // fixtures; a reused id with history must state its role.
+  const membership = new Map<string, string>();
+  if (task.dispatcher_session_id) membership.set(task.dispatcher_session_id, DISPATCHER_MEMBERSHIP);
+  for (const work of task.previous_works ?? []) {
+    if (!work || typeof work !== "object") throw new Error("Invalid role task previous works");
+    if (work.status !== "reported") throw new Error("Archived role work must be reported");
+    if (typeof work.session_id !== "string" || !work.session_id) throw new Error("Archived role work is missing its session");
+    const role = professionalRole(work.role, "previous_works");
+    const seen = membership.get(work.session_id);
+    if (seen === DISPATCHER_MEMBERSHIP) throw new Error("Professional session cannot be the dispatcher");
+    if (seen !== undefined && seen !== role) throw new Error("Conflicting historical role membership");
+    membership.set(work.session_id, role);
+  }
+  const currentWork = task.work;
+  if (currentWork && typeof currentWork.session_id === "string" && currentWork.session_id) {
+    const seen = membership.get(currentWork.session_id);
+    if (seen === DISPATCHER_MEMBERSHIP) throw new Error("Current worker cannot be the dispatcher");
+    const role = currentWork.role === undefined || currentWork.role === null
+      ? undefined
+      : professionalRole(currentWork.role, "work");
+    if (seen !== undefined) {
+      if (role === undefined) throw new Error("Current worker history role is unspecified");
+      if (role !== seen) throw new Error("Conflicting historical role membership");
+    }
+  }
   return task;
 }
 export function boundSession(task: RoleTask, sessionId: string): boolean {
   return sessionId === task.dispatcher_session_id || sessionId === task.work?.session_id;
+}
+/** A session recorded in an archived work; reopening it is review, never new work. */
+export function historicalSession(task: RoleTask, sessionId: string): boolean {
+  return (task.previous_works ?? []).some((work) => work?.session_id === sessionId);
+}
+/**
+ * Identity check for reopening a persisted task session: the active dispatcher or
+ * worker, or a session registered by an archived work of the same task and cwd.
+ * Delivery and the native tool keep the narrower `boundSession` guard.
+ */
+export function restorableSession(task: RoleTask, sessionId: string): boolean {
+  return boundSession(task, sessionId) || historicalSession(task, sessionId);
 }
 export function readRoleBinding(entries: readonly SessionEntry[]): string | undefined {
   for (let i = entries.length - 1; i >= 0; i--) {
@@ -103,6 +154,34 @@ export function readRoleBinding(entries: readonly SessionEntry[]): string | unde
 }
 export function appendRoleBinding(manager: SessionManager, taskPath: string): void {
   manager.appendCustomEntry(ROLE_BINDING_TYPE, { version: 1, taskPath });
+}
+export interface RoleModelPreference {
+  version: 1;
+  provider: string;
+  modelId: string;
+  thinkingLevel: string;
+}
+export function readRoleModelPreference(entries: readonly SessionEntry[]): RoleModelPreference | undefined {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.type === "custom" && entry.customType === ROLE_MODEL_PREFERENCE_TYPE) {
+      const data = entry.data as { version?: unknown; provider?: unknown; modelId?: unknown; thinkingLevel?: unknown } | null;
+      if (data?.version !== 1
+        || typeof data.provider !== "string" || !data.provider
+        || typeof data.modelId !== "string" || !data.modelId
+        || typeof data.thinkingLevel !== "string" || !data.thinkingLevel) {
+        throw new Error("Invalid persisted role model preference");
+      }
+      return { version: 1, provider: data.provider, modelId: data.modelId, thinkingLevel: data.thinkingLevel };
+    }
+  }
+}
+export function appendRoleModelPreference(
+  manager: SessionManager,
+  preference: Omit<RoleModelPreference, "version">,
+): void {
+  if (!preference.provider || !preference.modelId || !preference.thinkingLevel) throw new Error("Invalid role model preference");
+  manager.appendCustomEntry(ROLE_MODEL_PREFERENCE_TYPE, { version: 1, ...preference });
 }
 export function roleMessageInput(taskPath: string, callerId: string, callId: string, kind: "progress" | "help" | "result" | "reply", text: string) {
   if (!callId || typeof callId !== "string") throw new Error("SDK tool call ID required");

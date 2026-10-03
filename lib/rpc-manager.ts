@@ -47,7 +47,8 @@ import { createSubagentController } from "./subagent-runtime";
 import { isBuiltInSubagentsEnabled } from "./subagent-settings";
 import { CHAT_ONLY_RESOURCE_LOADER_OPTIONS, contextFilesSystemPrompt } from "./chat-only";
 import { createExactSystemPromptExtension } from "./exact-system-prompt";
-import { appendRoleBinding, boundSession, nativeCall, readRoleBinding, readRoleTask, requestRoleTick, roleFinished, roleMessageInput } from "./role-tasks";
+import { appendRoleBinding, appendRoleModelPreference, boundSession, nativeCall, readRoleBinding, readRoleModelPreference, readRoleTask, requestRoleTick, restorableSession, roleFinished, roleMessageInput } from "./role-tasks";
+import type { RoleModelPreference } from "./role-tasks";
 import { Type } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
@@ -274,6 +275,12 @@ export class AgentSessionWrapper {
   private _alive = true;
   private readonly backgroundWorkProbe?: BackgroundWorkProbe;
   private readonly idleTimeoutMs: number;
+  /** Serializes role-session model/thinking changes (defaults and UI) per wrapper. */
+  private roleModelChangeTail: Promise<void> = Promise.resolve();
+  /** Count of in-flight defaults alignments; blocks new prompt admission. */
+  private roleModelDefaultsPending = 0;
+  /** Count of all in-flight role model/thinking setters (defaults or UI). */
+  private roleModelChangesPending = 0;
   readonly roleTaskPath?: string;
 
   constructor(
@@ -366,13 +373,34 @@ export class AgentSessionWrapper {
       }
       if (IDLE_RESET_EVENT_TYPES.has(event.type)) this.resetIdleTimer();
       if (this.roleTaskPath && (event.type === "agent_end" || event.type === "agent_settled")) {
-        try { requestRoleTick(this.roleTaskPath); }
-        catch (error) { console.error("[pi-web] role task idle tick gap:", error); }
+        this.requestCurrentRoleTick();
       }
       this.emit(event);
       if (event.type === "agent_settled") this.notifyAgentRunCompleteIfIdle();
     });
     this.resetIdleTimer();
+  }
+
+  /**
+   * Only the active dispatcher/worker may ask the native driver to advance work.
+   * A reopened archived session is a human review chat: its prompt must not
+   * restart an old handoff or trigger a semantic tick. Read the task fresh so a
+   * session reused for a new work becomes current again.
+   */
+  private requestCurrentRoleTick(): void {
+    const path = this.roleTaskPath;
+    if (!path) return;
+    try {
+      const task = readRoleTask(path);
+      // A completed/closed handoff must not be woken by a review chat, and only
+      // the active dispatcher/worker may advance work.
+      if (roleFinished(task) || !boundSession(task, this.inner.sessionId)) return;
+    } catch (error) {
+      console.error("[pi-web] role task tick binding check failed:", error);
+      return;
+    }
+    try { requestRoleTick(path); }
+    catch (error) { console.error("[pi-web] role task idle tick gap:", error); }
   }
 
   private notifyAgentRunCompleteIfIdle(): void {
@@ -383,6 +411,70 @@ export class AgentSessionWrapper {
       this.onAgentRunComplete?.(this.sessionId);
     } catch (error) {
       console.error("[pi-web] completion listener failed:", error instanceof Error ? error.message : error);
+    }
+  }
+
+  /**
+   * Latest explicit user model preference on the current tree branch, if any.
+   * Reading the visible branch keeps a navigate/fork to the user's chosen line;
+   * an unmarked SDK `model_change` is never interpreted as an override.
+   */
+  private roleModelPreference(): RoleModelPreference | undefined {
+    if (!this.roleTaskPath) return undefined;
+    const manager = this.inner.sessionManager;
+    const entries = manager.getBranch();
+    return readRoleModelPreference(entries as unknown as SessionEntry[]);
+  }
+
+  /** Persist the actual, already clamped provider/model/thinking state as the user's choice. */
+  private recordRoleModelPreference(): void {
+    if (!this.roleTaskPath) return;
+    const model = this.inner.model;
+    if (!model) return;
+    appendRoleModelPreference(this.inner.sessionManager, {
+      provider: model.provider,
+      modelId: model.id,
+      thinkingLevel: this.inner.agent.state?.thinkingLevel ?? "off",
+    });
+  }
+
+  /**
+   * Serializes role-session `set_model`/`set_thinking_level` end to end, so a
+   * defaults alignment that awaits model resolution cannot interleave with a UI
+   * change and silently overwrite the user's record. Non-role sessions keep
+   * their previous behavior. The caller's `send` awaits this, so the outer
+   * `activeMutatingCommands` guard still spans the whole queued operation.
+   */
+  private async runRoleModelChange<T>(defaults: boolean, operation: () => Promise<T>): Promise<T> {
+    if (!this.roleTaskPath) return operation();
+    // Cover both sources from enqueue through SDK completion for `isModelChanging`.
+    this.roleModelChangesPending += 1;
+    // Block new prompt admission while a defaults alignment waits in or runs on
+    // the queue, not only while the SDK call itself is in flight.
+    if (defaults) this.roleModelDefaultsPending += 1;
+    try {
+      const previous = this.roleModelChangeTail;
+      let release!: () => void;
+      this.roleModelChangeTail = new Promise<void>((resolve) => { release = resolve; });
+      await previous.catch(() => undefined);
+      try {
+        if (!defaults) return await operation();
+        // Hold the same admission lock as prompts from the fresh idle/preference
+        // check through directory refresh and the SDK setter, so a run can never
+        // start partway through the switch (and `onAdmitted` cannot observe a
+        // defaults setter sneaking in behind it).
+        const releaseAdmission = await this.acquirePromptAdmission();
+        try {
+          return await operation();
+        } finally {
+          releaseAdmission();
+        }
+      } finally {
+        release();
+      }
+    } finally {
+      if (defaults) this.roleModelDefaultsPending -= 1;
+      this.roleModelChangesPending -= 1;
     }
   }
 
@@ -645,11 +737,29 @@ export class AgentSessionWrapper {
       case "prompt":
       case "role_task_deliver": {
         if (type === "role_task_deliver" && (typeof command.onAdmitted !== "function" || !this.roleTaskPath)) throw new Error("Role delivery requires trusted host admission");
+        // Immediate busy: never queue behind an in-progress defaults switch and
+        // start late, after the caller's own timeout, once the SDK setter ends.
+        if (this.roleModelDefaultsPending > 0) {
+          if (type === "role_task_deliver") return { status: "busy" };
+          throw Object.assign(
+            new Error("Role model defaults are changing; session is busy"),
+            { code: "role_model_defaults_busy" },
+          );
+        }
         // Serialize only admission. Once the preceding prompt has either
         // passed or failed preflight, the SDK can atomically decide whether
         // this submission starts a run or joins its streaming queue.
         const releaseAdmission = await this.acquirePromptAdmission();
         try {
+          // In-lock re-check: a default may have started while this admission
+          // waited in line, and a defaults setter holds this same lock.
+          if (this.roleModelDefaultsPending > 0) {
+            if (type === "role_task_deliver") return { status: "busy" };
+            throw Object.assign(
+              new Error("Role model defaults are changing; session is busy"),
+              { code: "role_model_defaults_busy" },
+            );
+          }
           if (type === "role_task_deliver" && this.isRunning()) return { status: "busy" };
           if (type === "role_task_deliver") await (command.onAdmitted as () => Promise<void>)();
           if (this.inner.isBashRunning) {
@@ -776,6 +886,7 @@ export class AgentSessionWrapper {
           // before the first transcript system message has been persisted.
           systemPrompt: this.exactSystemPrompt?.() ?? this.inner.systemPrompt ?? this.inner.agent.state?.systemPrompt ?? "",
           thinkingLevel: this.inner.agent.state?.thinkingLevel ?? "off",
+          ...(this.roleTaskPath ? { roleModelPreference: this.roleModelPreference() ?? null, isModelChanging: this.roleModelChangesPending > 0 } : {}),
           extensionStatuses: this.getExtensionStatuses(),
           extensionWidgets: this.getExtensionWidgets(),
         };
@@ -783,16 +894,58 @@ export class AgentSessionWrapper {
 
       case "set_model": {
         const { provider, modelId } = command as { provider: string; modelId: string };
-        let model = this.inner.modelRuntime.getModel(provider, modelId);
-        if (!model) {
-          await this.inner.modelRuntime.refresh({ allowNetwork: false });
-          model = this.inner.modelRuntime.getModel(provider, modelId);
-        }
-        if (!model) throw new Error(`Model not found: ${provider}/${modelId}`);
-        await this.inner.setModel(model);
-        invalidateModelsCache();
-        this.invalidateSessionList();
-        return { id: model.id, provider: model.provider };
+        // `roleModelSource: "defaults"` only distinguishes workflow default
+        // alignment from an explicit user choice. It grants no identity and may
+        // never replace a recorded user preference.
+        const defaults = command.roleModelSource === "defaults";
+        // Returns the recorded preference (defaults only) after enforcing idle
+        // and the no-override rule; re-run after any awaited model resolution.
+        const readDefaultsPreference = (): RoleModelPreference | undefined => {
+          if (!defaults) return undefined;
+          // Workflow default alignment only runs on an idle session; an explicit
+          // user change keeps its previous behavior and is not gated here.
+          if (this.isRunning()) {
+            throw Object.assign(
+              new Error("Role model defaults require an idle session"),
+              { code: "role_model_defaults_busy" },
+            );
+          }
+          const preference = this.roleModelPreference();
+          if (preference && (preference.provider !== provider || preference.modelId !== modelId)) {
+            throw Object.assign(
+              new Error("Role model defaults cannot override the user session preference"),
+              { code: "role_model_preference_locked" },
+            );
+          }
+          return preference;
+        };
+        return await this.runRoleModelChange(defaults, async () => {
+          let preference = readDefaultsPreference();
+          let model = this.inner.modelRuntime.getModel(provider, modelId);
+          if (!model) {
+            await this.inner.modelRuntime.refresh({ allowNetwork: false });
+            // The awaited refresh is the interleaving window: re-check the idle
+            // state and the (possibly newly recorded) user preference.
+            preference = readDefaultsPreference();
+            model = this.inner.modelRuntime.getModel(provider, modelId);
+          }
+          if (!model) throw new Error(`Model not found: ${provider}/${modelId}`);
+          const current = this.inner.model;
+          // A defaults call resolving to the recorded preference and the model
+          // already active is a true no-op. The SDK would otherwise reset
+          // thinking from the model/global default even for the same model,
+          // silently diverging actual from the preference.
+          if (defaults && preference && current
+            && preference.provider === model.provider && preference.modelId === model.id
+            && current.provider === model.provider && current.id === model.id) {
+            return { id: model.id, provider: model.provider };
+          }
+          await this.inner.setModel(model);
+          invalidateModelsCache();
+          this.invalidateSessionList();
+          if (!defaults) this.recordRoleModelPreference();
+          return { id: model.id, provider: model.provider };
+        });
       }
 
       case "fork": {
@@ -908,15 +1061,34 @@ export class AgentSessionWrapper {
 
       case "set_thinking_level": {
         const level = command.level as string;
-        this.inner.setThinkingLevel(level);
-        // setThinkingLevel clamps xhigh→high for models where supportsXhigh()===false.
-        // If the model has DeepSeek thinking compat (reasoningEffortMap maps xhigh→max),
-        // force the state back so the compat layer can use it correctly.
-        if (level === "xhigh" && (this.inner.model as { compat?: { thinkingFormat?: string } } | null)?.compat?.thinkingFormat === "deepseek" && this.inner.agent?.state) {
-          this.inner.agent.state.thinkingLevel = "xhigh";
-        }
-        this.invalidateSessionList();
-        return null;
+        const defaults = command.roleModelSource === "defaults";
+        return await this.runRoleModelChange(defaults, async () => {
+          if (defaults && this.isRunning()) {
+            throw Object.assign(
+              new Error("Role thinking defaults require an idle session"),
+              { code: "role_model_defaults_busy" },
+            );
+          }
+          if (defaults) {
+            const preference = this.roleModelPreference();
+            if (preference && preference.thinkingLevel !== level) {
+              throw Object.assign(
+                new Error("Role thinking defaults cannot override the user session preference"),
+                { code: "role_model_preference_locked" },
+              );
+            }
+          }
+          this.inner.setThinkingLevel(level);
+          // setThinkingLevel clamps xhigh→high for models where supportsXhigh()===false.
+          // If the model has DeepSeek thinking compat (reasoningEffortMap maps xhigh→max),
+          // force the state back so the compat layer can use it correctly.
+          if (level === "xhigh" && (this.inner.model as { compat?: { thinkingFormat?: string } } | null)?.compat?.thinkingFormat === "deepseek" && this.inner.agent?.state) {
+            this.inner.agent.state.thinkingLevel = "xhigh";
+          }
+          this.invalidateSessionList();
+          if (!defaults) this.recordRoleModelPreference();
+          return null;
+        });
       }
 
       case "compact": {
@@ -2109,7 +2281,7 @@ export async function startRpcSession(
     if (realpathSync(sessionManager.getCwd()) !== task.project_root) throw new Error("Role session cwd does not match task project root");
     if (!sessionFile && (roleFinished(task) || (task.dispatcher_session_id !== null && (!task.work || task.work.session_id !== null)))) throw new Error("No unassigned role session in this task");
     if (sessionFile && !persistedRoleTask && options.roleTaskPath) throw new Error("Cannot attach an existing chat session to a role task");
-    if (sessionFile && !boundSession(task, sessionManager.getSessionId() ?? sessionId)) throw new Error("Session is not registered in role task");
+    if (sessionFile && !restorableSession(task, sessionManager.getSessionId() ?? sessionId)) throw new Error("Session is not registered in role task");
   }
   const sessionCwd = sessionManager.getCwd();
   const subagentResources = sessionFile

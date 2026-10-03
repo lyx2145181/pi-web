@@ -61,15 +61,19 @@ export async function POST(
     return NextResponse.json({ success: true, data: result });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    const code = error && typeof error === "object" && typeof (error as { code?: unknown }).code === "string"
+      ? (error as { code: string }).code
+      : undefined;
     const promptBusy = commandType === "prompt"
       && !promptAccepted
-      && getRpcSession(id)?.isRunning() === true;
+      && (getRpcSession(id)?.isRunning() === true || code === "role_model_defaults_busy");
     return NextResponse.json({
       error: message,
+      ...(code ? { code } : {}),
       ...(commandType === "prompt" && !promptAccepted
         ? { code: promptBusy ? "prompt_busy" : "prompt_rejected", accepted: false }
         : {}),
-    }, { status: promptBusy ? 409 : 500 });
+    }, { status: commandType === "prompt" ? (promptBusy ? 409 : 500) : code ? 409 : 500 });
   }
 }
 
