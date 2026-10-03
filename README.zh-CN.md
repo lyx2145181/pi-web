@@ -98,6 +98,10 @@ npx @agegr/pi-web@latest
 - **文件访问边界**：文件浏览器仅能访问在 Pi Web 中选择过的工作目录，以及它已识别的项目或会话根目录；它不是通用的文件系统浏览器。
 - **Git worktree**：切换器何时显示、如何创建 worktree，以及删除会产生什么影响，见 [Pi Web 里的 Worktree](./docs/worktrees.zh-CN.md)。
 
+## 本机日常服务
+
+本机个人部署以正式模式运行 `pi-web.service`，日常仍访问原来的 `30141`，无需重新构建或迁移会话。代码更新后的维护入口、空闲检查和开发服务隔离规则见 [AGENTS.md 的日常运行说明](./AGENTS.md#daily-runtime-personal-deployment)；不要把下面的开发启动命令当作日常服务入口。
+
 ## 开发
 
 ```bash
@@ -113,7 +117,7 @@ node_modules/.bin/tsc --noEmit
 npm run lint
 ```
 
-日常开发时不要运行 `next build` 或 `npm run build`。它们会写入 `.next/`，可能干扰开发服务器；仅在发布流程中执行构建。
+开发服务器运行时不要在同一目录执行 `next build` 或 `npm run build`，它们会写入 `.next/`。正式服务更新时先停止使用该目录的服务，再构建和启动；开发与日常服务使用独立 checkout 和端口，具体规则见 [AGENTS.md](./AGENTS.md#daily-runtime-personal-deployment)。
 
 贡献者文档：[国际化](./docs/i18n.md)和[发布流程](./docs/release.md)。
 

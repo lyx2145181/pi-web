@@ -1,9 +1,27 @@
 # Pi Web - Development Notes
 
-## Quick Start
+## Daily runtime (personal deployment)
+
+- 本机日常入口为用户服务 `pi-web.service`，使用正式模式 `npm run start`；继续监听原来的 `30141`，沿用原有 Pi 配置、凭据、会话和浏览器环境，不为切换模式迁移这些数据。
+- 服务配置位于 `~/.config/systemd/user/pi-web.service`；正常启动必须已有 `.next/BUILD_ID`。平时启动/重启只使用已构建产物，不重新编译，也不改成 `npm run dev`。
 
 ```bash
-npm run dev   # port 30141, listens on 0.0.0.0; use npm run dev:local for loopback only
+systemctl --user start pi-web.service
+systemctl --user status pi-web.service
+# 仅在确认没有运行中的任务、且获准重启后使用：
+systemctl --user restart pi-web.service
+```
+
+- 只有 Pi Web 源码变化后才需要重新构建。经用户授权后运行 `~/.local/bin/pi-web-rebuild`：它创建独立维护任务，等待全部会话空闲，并确认没有附属的独立后台进程后停止共享服务，备份 `.next`，执行 `npm run build`，启动正式服务并检查页面、运行态与会话列表；构建或检查失败会尝试恢复旧产物。每次任务的日志与结果保留在 `~/.local/state/pi-web/rebuild-*/`，必须读取结果，不能把“已安排”当成“已完成”。维护期间不要开启新任务。只有用户在当前请求中明确同意连带停止附属后台进程时，才可传入 `--allow-attached-background`；默认检查不得跳过。
+- 维护命令不会拉取代码、安装依赖或替换用户配置；锁文件变化时先在独立工作树验证依赖，实际替换日常目录的依赖仍需单独授权并停止服务。日常模型/技能设置不属于网页源码构建，按对应资源的重载规则生效。
+- 共享服务启停、依赖替换与部署仍需当前请求明确授权。正式服务故障时先查日志和产物，不自动降回开发模式。
+
+## Development (isolated checkout only)
+
+修改网页代码时使用独立 checkout、独立 `.next` 和空闲端口；下面的 `30241` 只是示例，启动前先核实未被占用。不要在日常服务目录中另起开发进程。
+
+```bash
+npm run dev:local -- -p 30241
 ```
 
 - Typecheck: `node_modules/.bin/tsc --noEmit`
@@ -11,7 +29,7 @@ npm run dev   # port 30141, listens on 0.0.0.0; use npm run dev:local for loopba
 - Synthetic session-list baseline: `npm run perf:sessions` (use `-- --dir <path>` for an explicit read-only session directory)
 - Browser interaction baseline: `npm run perf:browser` (requires the dev server and local `google-chrome`; repeat `-- --file-label <root-file>` for sanitized Viewer open/switch/cache measurements)
 
-**Never run `next build` during dev** — pollutes `.next/` and breaks `npm run dev`.
+**Never run `next build` during dev** — pollutes `.next/` and breaks `npm run dev`. Build only in an isolated checkout or after the exact service using that checkout has stopped. The daily production service is not a development fallback.
 
 ## Personal Fork Update Workflow
 
@@ -44,6 +62,8 @@ git push origin ui-custom
 If conflict resolution is uncertain, stop with `git merge --abort` rather than discarding either side. Never push personal changes to `upstream`.
 
 ### Dev server troubleshooting
+
+These rules apply only to an explicitly authorized, isolated development service. Keep the daily `pi-web.service` in production mode; substitute the development checkout's own port below rather than stopping the daily 30141 service.
 
 - Before starting a server, run `lsof -nP -iTCP:30141 -sTCP:LISTEN` and reuse the existing Pi Web process when it is healthy. A second `next dev` for the same checkout cannot use a different port as a workaround because both processes contend for `.next/dev/lock`.
 - A browser-only `Module ... factory is not available` overlay usually means that tab has a stale Turbopack/HMR graph; it does not prove the server or source is broken. First call the browser's explicit reload action, then compare the current server log and a direct HTTP/API request.
