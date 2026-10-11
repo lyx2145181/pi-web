@@ -51,6 +51,9 @@ export interface StartSubagentRequest {
   description: string;
   runInBackground?: boolean;
   model?: string;
+  thinking?: string;
+  maxTurns?: number;
+  inheritContext?: boolean;
   isolation?: "worktree";
   signal?: AbortSignal;
   onUpdate?: (run: SubagentRunInfo) => void;
@@ -181,15 +184,23 @@ export function createSubagentExtension(
           })),
           description: Type.String({ description: "Short activity label shown in the UI." }),
           run_in_background: Type.Optional(Type.Boolean({ description: "Return immediately and notify this session when complete." })),
-          model: Type.Optional(Type.String({ description: 'Optional provider/modelId override. Append ":<level>" (off, minimal, low, medium, high, xhigh, max) to also set the thinking level for this run, e.g. "provider/model:high".' })),
-          isolation: Type.Optional(Type.String({ description: 'Set to "worktree" to run the subagent in an isolated git worktree.' })),
+          model: Type.Optional(Type.String({ description: "Optional provider/modelId for new sessions, optionally ending in \":<level>\" (off, minimal, low, medium, high, xhigh, max) to also set this run's thinking level, e.g. \"provider/model:high\". Ignored when the role specifies a model and disallows parent overrides; that role model is used instead. Ignored with resume, which retains the child's current model." })),
+          thinking: Type.Optional(Type.String({ description: "Optional thinking level override." })),
+          max_turns: Type.Optional(Type.Number({ description: "Optional positive agent turn limit." })),
+          inherit_context: Type.Optional(Type.Boolean({ description: "Include the parent session's active conversation context." })),
+          isolation: Type.Optional(Type.String({ description: "Run the subagent in an isolated git worktree." })),
         }),
         async execute(toolCallId, params, signal, onUpdate, ctx) {
           try {
             const resume = params.resume?.trim();
             if (resume) {
+              // `model` is intentionally absent: resume ignores it (the child keeps its
+              // current model) instead of rejecting the call. Other creation-only options
+              // still refuse to be silently ignored.
               const creationOptions = [
-                params.model?.trim() && "model",
+                params.thinking?.trim() && "thinking",
+                params.max_turns && "max_turns",
+                params.inherit_context && "inherit_context",
                 params.input_files?.length && "input_files",
                 params.isolation?.trim() && "isolation",
               ].filter(Boolean);
@@ -220,6 +231,9 @@ export function createSubagentExtension(
               description: params.description,
               ...(params.run_in_background !== undefined ? { runInBackground: params.run_in_background } : {}),
               ...(params.model ? { model: params.model } : {}),
+              ...(params.thinking ? { thinking: params.thinking } : {}),
+              ...(params.max_turns ? { maxTurns: params.max_turns } : {}),
+              ...(params.inherit_context !== undefined ? { inheritContext: params.inherit_context } : {}),
               ...(params.isolation === "worktree" ? { isolation: "worktree" as const } : {}),
               signal,
               onUpdate: (run) => onUpdate?.({

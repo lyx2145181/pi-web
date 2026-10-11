@@ -4,6 +4,7 @@ import { dump as stringifyYaml } from "js-yaml";
 import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "fs";
 import { basename, dirname, join, resolve } from "path";
 import { parseFrontmatter } from "./frontmatter";
+import { profileResourceSelection, resourceSelectionEnabled, sameResourceSelection, type SubagentResourceSelection } from "./subagent-resource-selection";
 import { parseNpmSource } from "./npm-source";
 import { writePrivateFileAtomicSync } from "./atomic-file";
 import { isExistingPathWithinRoots } from "./path-security";
@@ -15,12 +16,40 @@ export const SUBAGENT_META_TYPE = "pi-web:subagent";
 export const SUBAGENT_STATUS_TYPE = "pi-web:subagent-status";
 export const SUBAGENT_RESULT_TYPE = "pi-web:subagent-result";
 export const SUBAGENT_CONTROL_TOOL_NAMES = ["Agent", "get_subagent_result", "steer_subagent"] as const;
+export const SUBAGENT_BUILTIN_TOOL_NAMES = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"] as const;
+export const SUBAGENT_BUILTIN_TOOLS = new Set<string>(SUBAGENT_BUILTIN_TOOL_NAMES);
+export const SUBAGENT_CONTROL_TOOLS = new Set<string>(SUBAGENT_CONTROL_TOOL_NAMES);
+
+/** Persisted creation authority. Explicit empty selectors mean None; deny always wins. */
+export interface SubagentToolPolicy {
+  mode: "implicitAll" | "selectors" | "none";
+  selectors: string[];
+  deny: string[];
+}
+
+export function isSubagentToolPolicy(value: unknown): value is SubagentToolPolicy {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const policy = value as Record<string, unknown>;
+  const selectors = (entries: unknown): entries is string[] => Array.isArray(entries) && entries.every((entry) => typeof entry === "string" && /^ext:.+/i.test(entry) && entry.slice(4).trim().length > 0);
+  return Object.keys(policy).every((key) => ["mode", "selectors", "deny"].includes(key))
+    && typeof policy.mode === "string" && ["implicitAll", "selectors", "none"].includes(policy.mode)
+    && selectors(policy.selectors) && selectors(policy.deny)
+    && (policy.mode === "selectors" || policy.selectors.length === 0);
+}
 
 export type SubagentStatus = SubagentSessionStatus;
 export type SubagentCodemode = "inherit" | "on" | "off";
 export type SubagentMcp = "on" | "off";
 export type SubagentScope = "builtin" | "global" | "workspace" | "project";
 export type SubagentWritableScope = Extract<SubagentScope, "global" | "project">;
+
+export type SubagentMcpServerRef = { scope: "global" | "project"; name: string };
+
+export function isSubagentMcpServerRefs(value: unknown): value is SubagentMcpServerRef[] {
+  return Array.isArray(value) && value.every((ref) => ref && typeof ref === "object" && !Array.isArray(ref)
+    && Object.keys(ref).every((key) => key === "scope" || key === "name")
+    && (ref.scope === "global" || ref.scope === "project") && typeof ref.name === "string" && /^[A-Za-z0-9_-]+$/.test(ref.name));
+}
 
 export interface SubagentProfile {
   name: string;
@@ -31,16 +60,14 @@ export interface SubagentProfile {
   extensionTools?: string[];
   /** Raw `ext:` deny selectors, resolved against the loaded extensions at spawn time. */
   disallowedExtensionTools?: string[];
-  /** Omitted = SDK on-demand discovery; [] = explicitly no selected skills. */
-  skills?: string[];
-  /** Omitted = every enabled extension; [] = none. Names only, resolved like `ext:` selectors. */
-  extensions?: string[];
   loadSkills: boolean;
   loadExtensions: boolean;
-  /** Whether this profile enables Pi Web's codemode tool. Omitted profiles are disabled. */
-  codemode?: SubagentCodemode;
-  /** Whether its children connect the servers in `mcp.json`. Omitted profiles do not. */
-  mcp?: SubagentMcp;
+  codeMode?: boolean;
+  loadMcp?: boolean;
+  allowParentModelOverride?: boolean;
+  mcpServers?: SubagentMcpServerRef[];
+  skills?: SubagentResourceSelection;
+  extensions?: SubagentResourceSelection;
   model?: string;
   thinking?: ThinkingLevel;
   maxTurns?: number;
@@ -70,33 +97,27 @@ export interface SubagentMetadata {
   worktreeBranch?: string;
 }
 
-export interface SubagentResourceSnapshot {
-  version: 1;
-  skills?: string[];
-  extensions?: string[];
+export type SubagentResourceSnapshot = SubagentResourceSnapshotBase & (
+  | { version: 1; tools: string[] }
+  | { version: 2; builtinTools: string[]; toolPolicy: SubagentToolPolicy }
+  | { version: 3; builtinTools: string[]; toolPolicy: SubagentToolPolicy; codeMode: boolean; loadMcp: boolean; mcpServers: SubagentMcpServerRef[] }
+);
+
+interface SubagentResourceSnapshotBase {
   appendSystemPrompt: string[];
-  tools: string[];
   loadSkills: boolean;
   loadExtensions: boolean;
-  codemode?: true;
-  mcp?: true;
-  /** Extensions load without `ext:` selectors: every tool they register is admitted (#883). */
-  allExtensionTools?: true;
+  skills?: SubagentResourceSelection;
+  extensions?: SubagentResourceSelection;
   exactSystemPrompt?: string;
 }
 
-export interface SubagentSessionResources {
-  skills?: string[];
-  extensions?: string[];
-  appendSystemPrompt: string[];
-  tools: string[];
-  loadSkills: boolean;
-  loadExtensions: boolean;
-  codemode?: true;
-  mcp?: true;
-  allExtensionTools?: true;
-  exactSystemPrompt?: string;
-}
+/** Each version is explicit; legacy authority never acquires v3 host capabilities. */
+export type SubagentSessionResources = SubagentResourceSnapshotBase & { tools: string[] } & (
+  | { version: 1; builtinTools?: never; toolPolicy?: never }
+  | { version: 2; builtinTools: string[]; toolPolicy: SubagentToolPolicy }
+  | { version: 3; builtinTools: string[]; toolPolicy: SubagentToolPolicy; codeMode: boolean; loadMcp: boolean; mcpServers: SubagentMcpServerRef[] }
+);
 
 export interface SubagentResultMetadata {
   version: 1;
@@ -133,12 +154,9 @@ export interface SubagentRunInfo {
   resumed?: boolean;
 }
 
-const DEFAULT_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
-const BUILTIN_TOOLS = new Set(DEFAULT_TOOLS);
-// `powershell` is platform-added by resolveShellTools and therefore is absent from
-// profile parsing's portable allow-list, but valid historical snapshots may contain it.
-const SNAPSHOT_BUILTIN_TOOLS = new Set([...BUILTIN_TOOLS, "powershell"]);
-const SUBAGENT_CONTROL_TOOLS = new Set<string>(SUBAGENT_CONTROL_TOOL_NAMES);
+const DEFAULT_TOOLS = SUBAGENT_BUILTIN_TOOL_NAMES.filter((name) => name !== "powershell");
+// Preserve the original profile/v1 shell vocabulary; v2 freezes resolved shell names.
+const BUILTIN_TOOLS = new Set<string>(DEFAULT_TOOLS);
 const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 /**
@@ -154,8 +172,10 @@ const MANAGED_FRONTMATTER_KEYS = new Set([
   "tools",
   "load_skills",
   "load_extensions",
-  "codemode",
-  "mcp",
+  "code_mode",
+  "load_mcp",
+  "allow_parent_model_override",
+  "mcp_servers",
   "enabled",
   "inherit_context",
   "run_in_background",
@@ -170,36 +190,6 @@ const MANAGED_FRONTMATTER_KEYS = new Set([
 
 const FRONTMATTER_OPEN_RE = /^(?:\uFEFF)?---[ \t]*(?:\r\n|\n|\r)/;
 
-/**
- * The UI exposes two booleans (`load_skills` / `load_extensions`); pi-subagents reads
- * the aliases `skills` / `extensions`, which also accept a whitelist. Aliases are
- * carried through by `unmanagedFrontmatter` and only rewritten once we own them.
- */
-const OWNED_ALIAS_VALUES = new Set(["none", "all", "true", "false"]);
-
-function parseCodemode(value: unknown): SubagentCodemode {
-  if (value === "on" || value === true) return "on";
-  if (value === "inherit") return "inherit";
-  return "off";
-}
-
-function validateSavedCodemode(value: unknown): SubagentCodemode {
-  if (value === undefined || value === "inherit" || value === "on" || value === "off") {
-    return value === undefined ? "off" : value;
-  }
-  throw new Error("codemode must be one of: inherit, on, off");
-}
-
-function parseMcp(value: unknown): SubagentMcp {
-  return value === "on" || value === true ? "on" : "off";
-}
-
-/** Undefined when the request names none (an older client): the save then keeps the file's value. */
-function validateSavedMcp(value: unknown): SubagentMcp | undefined {
-  if (value === undefined || value === "on" || value === "off") return value;
-  throw new Error("mcp must be one of: on, off");
-}
-
 const BUILTIN_PROFILES: SubagentProfile[] = [
   {
     name: "general-purpose",
@@ -209,8 +199,6 @@ const BUILTIN_PROFILES: SubagentProfile[] = [
     tools: DEFAULT_TOOLS,
     loadSkills: false,
     loadExtensions: false,
-    codemode: "off",
-    mcp: "off",
     promptMode: "append",
     inheritContext: false,
     runInBackground: false,
@@ -225,8 +213,6 @@ const BUILTIN_PROFILES: SubagentProfile[] = [
     tools: [...PRESET_READ_ONLY],
     loadSkills: false,
     loadExtensions: false,
-    codemode: "off",
-    mcp: "off",
     promptMode: "append",
     inheritContext: false,
     runInBackground: false,
@@ -241,8 +227,6 @@ const BUILTIN_PROFILES: SubagentProfile[] = [
     tools: [...PRESET_READ_ONLY],
     loadSkills: false,
     loadExtensions: false,
-    codemode: "off",
-    mcp: "off",
     promptMode: "append",
     inheritContext: false,
     runInBackground: false,
@@ -259,15 +243,11 @@ function booleanValue(value: unknown, fallback: boolean): boolean {
   return typeof value === "boolean" ? value : fallback;
 }
 
-function resourceBoolean(value: unknown, fallback: boolean): boolean {
-  if (typeof value === "boolean") return value;
-  return Array.isArray(value) || typeof value === "string" ? true : fallback;
-}
-
 /**
- * Skill or extension names from a list or a comma-separated string, trimmed and
- * deduplicated. Empty and non-string items are dropped, as pi-subagents does: a stray
- * comma must not make the whole profile unreadable.
+ * Names from a list or a comma-separated string, trimmed and deduplicated. Empty and
+ * non-string items are dropped. Shared with the (currently unwired) upstream skills-preload
+ * module so every reader treats an authored list the same way; the profile parser itself
+ * keeps the local boolean|string[] resource-selection contract.
  */
 export function subagentNameList(value: unknown): string[] {
   const items: unknown[] = Array.isArray(value) ? value : typeof value === "string" ? value.split(",") : [];
@@ -275,30 +255,6 @@ export function subagentNameList(value: unknown): string[] {
     .filter((item): item is string => typeof item === "string")
     .map((item) => item.trim())
     .filter(Boolean))];
-}
-
-/**
- * The names a profile lists in `skills:` or `extensions:`. `undefined` means no list: the
- * key is absent or empty, or holds a switch spelling (`true`, `all`, `none`, ...) that
- * `load_skills` / `load_extensions` fall back to and a save keeps in step with them.
- */
-function profileNameList(value: unknown): string[] | undefined {
-  if (Array.isArray(value)) return subagentNameList(value);
-  if (typeof value !== "string" || OWNED_ALIAS_VALUES.has(value.trim().toLowerCase())) return undefined;
-  const names = subagentNameList(value);
-  return names.length > 0 ? names : undefined;
-}
-
-/** An `extensions:` list; `*` in it loads every extension, as in pi-subagents. */
-function profileExtensions(value: unknown): string[] | undefined {
-  const names = profileNameList(value);
-  return names?.includes("*") ? undefined : names;
-}
-
-/** `load_skills` / `load_extensions`, else the alias, where `none` and `false` switch it off. */
-function profileResourceSwitch(value: unknown, fallback: boolean): boolean {
-  if (typeof value === "string" && ["none", "false"].includes(value.trim().toLowerCase())) return false;
-  return resourceBoolean(value, fallback);
 }
 
 function stringList(value: unknown): string[] {
@@ -357,21 +313,16 @@ function composeToolsField(tools: string[], storedTools: unknown): string {
   return combined.length > 0 ? combined.join(", ") : "none";
 }
 
-/**
- * Keep the alias in step with the boolean the UI owns. A boolean (or a "none" /
- * "all" spelling) is ours to rewrite; a whitelist such as `extensions:
- * pi-advisor-flow` expresses scoping the UI cannot show, so it stays as authored.
- */
-function syncFlagAlias(
-  frontmatter: Record<string, unknown>,
-  alias: string,
-  storedValue: unknown,
-  flag: boolean,
-): void {
-  const owned = storedValue === undefined
-    || typeof storedValue === "boolean"
-    || (typeof storedValue === "string" && OWNED_ALIAS_VALUES.has(storedValue.trim().toLowerCase()));
-  if (owned) frontmatter[alias] = flag;
+/** Keep unchanged CSV/array values, including a dormant list behind load_*: false. */
+function saveResourceAlias(stored: Record<string, unknown>, alias: "skills" | "extensions", selection: SubagentResourceSelection | undefined, flag: boolean): unknown {
+  const raw = stored[alias];
+  if (selection === undefined) {
+    // Old boolean clients can disable/re-enable but cannot edit a stored list.
+    if (Array.isArray(raw) || (typeof raw === "string" && !["all", "none", "true", "false"].includes(raw.trim().toLowerCase()))) return raw;
+    return flag;
+  }
+  if ((Array.isArray(raw) || (typeof raw === "string" && !["all", "none", "true", "false"].includes(raw.trim().toLowerCase()))) && sameResourceSelection(selection, profileResourceSelection(raw, stored[`load_${alias}`]))) return raw;
+  return selection;
 }
 function parseProfileFile(filePath: string, scope: SubagentScope): SubagentProfile | null {
   try {
@@ -382,43 +333,31 @@ function parseProfileFile(filePath: string, scope: SubagentScope): SubagentProfi
     const thinkingValue = stringValue(data?.thinking) as ThinkingLevel | undefined;
     const maxTurnsValue = typeof data?.max_turns === "number" ? Math.floor(data.max_turns) : undefined;
     const tools = parseTools(data?.tools, DEFAULT_TOOLS);
-    const codemode = parseCodemode(data?.codemode);
-    const skills = profileNameList(data?.skills);
-    const extensions = profileExtensions(data?.extensions);
     const disallowedTools = new Set(parseTools(data?.disallowed_tools, []));
-    // The deny list is also handed to the runtime, which resolves both sides against the
-    // loaded extensions. This parse-time filter is only the cheap literal fast path: it
-    // cannot see extension aliases (`ext:codegraph` vs `ext:@scope/pi-codegraph`), so it
-    // must never be the only gate.
+    // Keep raw allow intent: cancelling every explicit selector must never become All.
+    // Alias-aware deny precedence is resolved against the loaded roster at execution time.
     const disallowedExtensionTools = parseExtensionToolSelectors(data?.disallowed_tools);
-    const deniedKeys = new Set(
-      disallowedExtensionTools.map((tool) => normalizeExtensionSelector(tool).toLowerCase()),
-    );
-    const extensionSelectors = parseExtensionToolSelectors(data?.tools);
-    const extensionTools = extensionSelectors
-      .filter((tool) => {
-        const allowed = normalizeExtensionSelector(tool).toLowerCase();
-        return ![...deniedKeys].some((denied) => (
-          denied === "*" || allowed === denied || allowed.startsWith(`${denied}/`)
-        ));
-      });
+    const extensionTools = parseExtensionToolSelectors(data?.tools);
+    const explicitNone = rawToolValues(data?.tools).some((tool) => tool.toLowerCase() === "none");
     return {
       name,
       displayName: stringValue(data?.display_name) ?? name,
       description: stringValue(data?.description) ?? name,
       systemPrompt: rest.trim(),
       tools: tools.filter((tool) => !disallowedTools.has(tool)),
-      ...(extensionSelectors.length > 0 ? { extensionTools } : {}),
+      ...(extensionTools.length > 0 || explicitNone ? { extensionTools: explicitNone ? [] : extensionTools } : {}),
       ...(disallowedExtensionTools.length > 0 ? { disallowedExtensionTools } : {}),
-      ...(skills !== undefined ? { skills } : {}),
-      ...(extensions !== undefined ? { extensions } : {}),
-      loadSkills: profileResourceSwitch(data?.load_skills ?? data?.skills, false),
-      loadExtensions: profileResourceSwitch(data?.load_extensions ?? data?.extensions, extensionSelectors.length > 0),
-      codemode,
-      mcp: parseMcp(data?.mcp),
+      skills: profileResourceSelection(data?.skills, data?.load_skills),
+      extensions: profileResourceSelection(data?.extensions, data?.load_extensions, extensionTools.length > 0),
+      loadSkills: resourceSelectionEnabled(profileResourceSelection(data?.skills, data?.load_skills)),
+      loadExtensions: resourceSelectionEnabled(profileResourceSelection(data?.extensions, data?.load_extensions, extensionTools.length > 0)),
       ...(stringValue(data?.model) ? { model: stringValue(data?.model) } : {}),
       ...(thinkingValue && THINKING_LEVELS.has(thinkingValue) ? { thinking: thinkingValue } : {}),
       ...(maxTurnsValue && maxTurnsValue > 0 ? { maxTurns: maxTurnsValue } : {}),
+      codeMode: booleanValue(data?.code_mode, false),
+      loadMcp: booleanValue(data?.load_mcp, false),
+      allowParentModelOverride: booleanValue(data?.allow_parent_model_override, false),
+      mcpServers: isSubagentMcpServerRefs(data?.mcp_servers) ? structuredClone(data.mcp_servers) : [],
       inheritContext: booleanValue(data?.inherit_context, false),
       runInBackground: booleanValue(data?.run_in_background, false),
       promptMode: data?.prompt_mode === "replace" ? "replace" : "append",
@@ -466,6 +405,8 @@ function builtInProfiles(): SubagentProfile[] {
   return BUILTIN_PROFILES.map((profile) => ({
     ...profile,
     tools: [...profile.tools],
+    // Built-ins ship no frontmatter: a missing override flag is the default, false.
+    allowParentModelOverride: profile.allowParentModelOverride ?? false,
     enabled: !disabled.has(profile.name.toLowerCase()),
   }));
 }
@@ -526,6 +467,7 @@ export function saveSubagentProfile(
   cwd: string,
   scope: SubagentWritableScope,
   profile: Omit<SubagentProfile, "scope" | "filePath">,
+  cloneFrom?: Pick<SubagentProfile, "filePath">,
 ): SubagentProfile {
   const name = assertProfileName(profile.name);
   const tools = [...new Set(profile.tools.filter((tool) => BUILTIN_TOOLS.has(tool)))];
@@ -543,10 +485,15 @@ export function saveSubagentProfile(
   const description = profile.description.trim() || name;
   const systemPrompt = profile.systemPrompt.trim();
   const model = profile.model?.trim() || undefined;
-  const loadSkills = profile.loadSkills === true;
-  const loadExtensions = profile.loadExtensions === true;
-  const codemode = validateSavedCodemode(profile.codemode);
-  const requestedMcp = validateSavedMcp(profile.mcp);
+  for (const selection of [profile.skills, profile.extensions]) {
+    if (selection !== undefined && typeof selection !== "boolean" && !(Array.isArray(selection) && selection.every((entry) => typeof entry === "string"))) throw new Error("skills/extensions must be boolean or string[]");
+  }
+  for (const key of ["codeMode", "loadMcp", "allowParentModelOverride"] as const) {
+    if (profile[key] !== undefined && typeof profile[key] !== "boolean") throw new Error(`${key} must be boolean`);
+  }
+  if (profile.mcpServers !== undefined && !isSubagentMcpServerRefs(profile.mcpServers)) throw new Error("mcpServers must be scoped server references");
+  const loadSkills = profile.skills !== undefined ? resourceSelectionEnabled(profile.skills) : profile.loadSkills === true;
+  const loadExtensions = profile.extensions !== undefined ? resourceSelectionEnabled(profile.extensions) : profile.loadExtensions === true;
   const promptMode = profile.promptMode === "replace" ? "replace" : "append";
   const dir = assertWritableProfileDirectory(cwd, scope);
   mkdirSync(dir, { recursive: true });
@@ -554,34 +501,26 @@ export function saveSubagentProfile(
     throw new Error("Agent profile directory is outside the project root");
   }
   const filePath = join(dir, `${name}.md`);
-  const stored = readStoredFrontmatter(filePath);
-  const mcp = requestedMcp ?? parseMcp(stored.mcp);
+  if (cloneFrom && existsSync(filePath)) throw new Error("Cannot clone over an existing profile");
+  const stored = readStoredFrontmatter(cloneFrom?.filePath ?? filePath);
+  if (cloneFrom?.filePath && stored.name !== undefined) stored.name = name;
   const managed: Record<string, unknown> = {
     description,
     display_name: displayName,
     tools: composeToolsField([...tools, ...extensionTools], stored.tools),
     load_skills: loadSkills,
     load_extensions: loadExtensions,
-    codemode,
-    // Written once on, or once the file names it; profiles that never used MCP stay without the key.
-    ...(mcp === "on" || stored.mcp !== undefined ? { mcp } : {}),
+    code_mode: profile.codeMode ?? booleanValue(stored.code_mode, false),
+    load_mcp: profile.loadMcp ?? booleanValue(stored.load_mcp, false),
+    allow_parent_model_override: profile.allowParentModelOverride ?? booleanValue(stored.allow_parent_model_override, false),
+    mcp_servers: profile.mcpServers ?? (isSubagentMcpServerRefs(stored.mcp_servers) ? stored.mcp_servers : []),
     enabled: profile.enabled,
     inherit_context: profile.inheritContext,
     run_in_background: profile.runInBackground,
     prompt_mode: promptMode,
   };
-  const skills = profile.skills === undefined ? profileNameList(stored.skills) : subagentNameList(profile.skills);
-  if (skills !== undefined) {
-    const storedSkills = profileNameList(stored.skills);
-    managed.skills = storedSkills !== undefined && JSON.stringify(storedSkills) === JSON.stringify(skills)
-      ? stored.skills
-      : skills;
-  } else {
-    syncFlagAlias(managed, "skills", stored.skills, loadSkills);
-  }
-  // The panel has no editor for an `extensions:` list, so the file's own list always stays.
-  syncFlagAlias(managed, "extensions", stored.extensions, loadExtensions);
-  const extensions = profileExtensions(stored.extensions);
+  managed.skills = saveResourceAlias(stored, "skills", profile.skills, loadSkills);
+  managed.extensions = saveResourceAlias(stored, "extensions", profile.extensions, loadExtensions);
   if (model) managed.model = model;
   if (profile.thinking) managed.thinking = profile.thinking;
   if (maxTurns) managed.max_turns = maxTurns;
@@ -597,18 +536,20 @@ export function saveSubagentProfile(
   writePrivateFileAtomicSync(filePath, `---\n${yaml}\n---\n\n${systemPrompt}\n`);
   return {
     ...profile,
+    codeMode: managed.code_mode === true,
+    loadMcp: managed.load_mcp === true,
+    allowParentModelOverride: managed.allow_parent_model_override === true,
+    mcpServers: structuredClone(managed.mcp_servers as SubagentMcpServerRef[]),
+    skills: profileResourceSelection(managed.skills, loadSkills),
+    extensions: profileResourceSelection(managed.extensions, loadExtensions),
     name,
     displayName,
     description,
     systemPrompt,
     tools,
-    ...(skills !== undefined ? { skills } : {}),
-    extensions,
     ...(extensionTools.length > 0 ? { extensionTools } : {}),
     loadSkills,
     loadExtensions,
-    codemode,
-    mcp,
     ...(model ? { model } : { model: undefined }),
     ...(maxTurns ? { maxTurns } : { maxTurns: undefined }),
     promptMode,
@@ -668,38 +609,53 @@ export function readSubagentSessionResources(
   const data = subagentMetadataData(entries);
   if (!data) return null;
   const snapshot = data.resourceSnapshot;
-  // A malformed list narrows to what it names, never back to the whole catalog.
-  const skills = isRecord(snapshot) && "skills" in snapshot ? subagentNameList(snapshot.skills) : undefined;
-  const extensions = isRecord(snapshot) && "extensions" in snapshot ? subagentNameList(snapshot.extensions) : undefined;
   const loadSkills = isRecord(snapshot) && snapshot.loadSkills === true;
   const loadExtensions = isRecord(snapshot) && snapshot.loadExtensions === true;
-  const codemode = isRecord(snapshot) && snapshot.codemode === true;
-  const mcp = isRecord(snapshot) && snapshot.mcp === true;
+  if (isRecord(snapshot) && (snapshot.version === 2 || snapshot.version === 3)) {
+    if (snapshot.version === 3 && (typeof snapshot.codeMode !== "boolean" || typeof snapshot.loadMcp !== "boolean" || !isSubagentMcpServerRefs(snapshot.mcpServers))) return null;
+    if (typeof snapshot.loadSkills !== "boolean" || typeof snapshot.loadExtensions !== "boolean"
+      || ![snapshot.skills, snapshot.extensions].every((value) => value === undefined || typeof value === "boolean" || (Array.isArray(value) && value.every((entry) => typeof entry === "string" && entry.trim().length > 0)))
+      || !Array.isArray(snapshot.appendSystemPrompt) || !snapshot.appendSystemPrompt.every((item) => typeof item === "string")
+      || !Array.isArray(snapshot.builtinTools) || !snapshot.builtinTools.every((item) => typeof item === "string" && SUBAGENT_BUILTIN_TOOLS.has(item))
+      || !isSubagentToolPolicy(snapshot.toolPolicy)
+      || (!loadExtensions && snapshot.toolPolicy.mode !== "none")
+      || (snapshot.exactSystemPrompt !== undefined && typeof snapshot.exactSystemPrompt !== "string")) return null;
+    return {
+      ...(snapshot.version === 3
+        ? { version: 3 as const, codeMode: snapshot.codeMode as boolean, loadMcp: snapshot.loadMcp as boolean, mcpServers: structuredClone(snapshot.mcpServers as SubagentMcpServerRef[]) }
+        : { version: 2 as const }),
+      builtinTools: [...new Set(snapshot.builtinTools as string[])],
+      tools: [...new Set(snapshot.builtinTools as string[])],
+      toolPolicy: structuredClone(snapshot.toolPolicy),
+      appendSystemPrompt: [...snapshot.appendSystemPrompt],
+      loadSkills, loadExtensions,
+      ...(snapshot.skills !== undefined ? { skills: profileResourceSelection(snapshot.skills, loadSkills) } : {}),
+      ...(snapshot.extensions !== undefined ? { extensions: profileResourceSelection(snapshot.extensions, loadExtensions) } : {}),
+      ...(typeof snapshot.exactSystemPrompt === "string" ? { exactSystemPrompt: snapshot.exactSystemPrompt } : {}),
+    };
+  }
   if (
     isRecord(snapshot)
     && snapshot.version === 1
+    && [snapshot.skills, snapshot.extensions].every((value) => value === undefined || typeof value === "boolean" || (Array.isArray(value) && value.every((entry) => typeof entry === "string")))
     && Array.isArray(snapshot.appendSystemPrompt)
     && snapshot.appendSystemPrompt.every((item) => typeof item === "string")
-    && (!("codemode" in snapshot) || typeof snapshot.codemode === "boolean")
-    && (!("mcp" in snapshot) || typeof snapshot.mcp === "boolean")
     && Array.isArray(snapshot.tools)
     && snapshot.tools.every((item) =>
       typeof item === "string"
       && item.length > 0
       && !SUBAGENT_CONTROL_TOOLS.has(item)
-      && ((item === "codemode" && codemode) || SNAPSHOT_BUILTIN_TOOLS.has(item) || loadExtensions)
+      && (BUILTIN_TOOLS.has(item) || loadExtensions)
     )
   ) {
     return {
-      ...(skills !== undefined ? { skills } : {}),
-      ...(extensions !== undefined ? { extensions } : {}),
+      version: 1,
       appendSystemPrompt: [...snapshot.appendSystemPrompt],
       tools: [...new Set(snapshot.tools)],
       loadSkills,
       loadExtensions,
-      ...(codemode ? { codemode: true as const } : {}),
-      ...(mcp ? { mcp: true as const } : {}),
-      ...(loadExtensions && snapshot.allExtensionTools === true ? { allExtensionTools: true as const } : {}),
+      ...(snapshot.skills !== undefined ? { skills: profileResourceSelection(snapshot.skills, snapshot.loadSkills) } : {}),
+      ...(snapshot.extensions !== undefined ? { extensions: profileResourceSelection(snapshot.extensions, snapshot.loadExtensions) } : {}),
       ...(typeof snapshot.exactSystemPrompt === "string" ? { exactSystemPrompt: snapshot.exactSystemPrompt } : {}),
     };
   }
@@ -912,12 +868,10 @@ export function selectSubagentExtensionTools(
 
 /**
  * Keep only the extensions an `extensions:` list names, after the SDK has loaded them, as
- * pi-subagents does. A dropped extension binds no handlers, tools, commands or providers,
- * but its factory has already run once: this scopes the child, it is not a sandbox. Names
- * resolve like `ext:` selectors (directory, file or package name, case-insensitive), so a
- * name two sources claim keeps neither. pi-web's own inline extensions always stay, as do the
- * built-ins a child with `mcp: on` names (`SUBAGENT_MCP_EXTENSION_PATHS`). The SDK
- * calls the override on every reload, so the scope holds without further wiring.
+ * pi-subagents does. This is upstream's post-import scope and is deliberately NOT wired into
+ * the subagent runtime, which filters resources before import via `createSubagentSessionServices`
+ * (see [subagent-resources.md](../../docs/agents/subagent-resources.md)). It is kept exported so
+ * upstream's unit coverage still runs against the exact offline algorithm.
  */
 export function scopeSubagentExtensions(names: readonly string[]) {
   const wanted = new Set(names.map((name) => name.toLowerCase()));
@@ -925,7 +879,6 @@ export function scopeSubagentExtensions(names: readonly string[]) {
     const owners = extensionNameOwners(base.extensions);
     const extensions = base.extensions.filter((extension) => (
       extension.path.startsWith("<inline:")
-      || SUBAGENT_MCP_EXTENSION_PATHS.includes(extension.path)
       || extensionCandidateNames(extension).some((name) => wanted.has(name) && owners.get(name)?.size === 1)
     ));
     const kept = new Set(extensions.map((extension) => extension.path));
@@ -938,19 +891,10 @@ export function scopeSubagentExtensions(names: readonly string[]) {
   };
 }
 
-/**
- * The built-ins a child with `mcp: on` loads, by the paths the pi CLI's `-e builtin:<name>`
- * takes: listed there, they load under `noExtensions` too, with the `builtin:mcp` path the MCP
- * host and the read-only policy recognise (`lib/mcp-command.ts`). Their factories come from
- * `createSubagentMcpExtensions()`.
- */
-export const SUBAGENT_MCP_EXTENSION_PATHS: readonly string[] = ["builtin:tool-search", "builtin:mcp"];
-
-/** The extension half of a child's resource loader options, shared by spawn and reopen. */
-export function subagentExtensionLoaderOptions(resources: { loadExtensions: boolean; extensions?: readonly string[]; mcp?: boolean }) {
+/** The extension half of upstream's loader options; not used by the local subagent runtime. */
+export function subagentExtensionLoaderOptions(resources: { loadExtensions: boolean; extensions?: readonly string[] }) {
   return {
     noExtensions: !resources.loadExtensions,
-    ...(resources.mcp ? { additionalExtensionPaths: [...SUBAGENT_MCP_EXTENSION_PATHS] } : {}),
     ...(resources.loadExtensions && resources.extensions !== undefined
       ? { extensionsOverride: scopeSubagentExtensions(resources.extensions) }
       : {}),

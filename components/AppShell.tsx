@@ -2744,13 +2744,17 @@ export function AppShell() {
               />
             </div>
           ))}
-          {activeAgentTab && (
+          {activeAgentTab && rightPanelOpen && (
             <SubagentViewer
               key={activeAgentTab.sessionId}
               sessionId={activeAgentTab.sessionId}
               fallbackLabel={activeAgentTab.label}
               running={runningSessionIds.has(activeAgentTab.sessionId)}
-              onOpenFile={handleOpenLinkedFile}
+              onOpenFile={(filePath, page) => handleOpenFile(
+                filePath,
+                getFileName(filePath),
+                { sourceSessionId: activeAgentTab.sessionId, page },
+              )}
             />
           )}
         </div>

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
+import { useCallback, useEffect, useId, useMemo, useState, type CSSProperties } from "react";
 import { useI18n } from "@/hooks/useI18n";
 import { useIsMobile } from "@/hooks/useIsMobile";
 import type { ProjectTrustStatus, SubagentProfilesResponse, SubagentSettingsResponse } from "@/lib/api-types";
@@ -37,6 +37,8 @@ import {
   ConfigSwitch,
 } from "./SettingsUi";
 import { ModelSelector } from "./ModelSelector";
+import { AgentResourceControls } from "./AgentResourceControls";
+import { AgentMcpControls } from "./AgentMcpControls";
 import { projectTrustReloadKey } from "./settings-ui-helpers";
 
 const TOOL_OPTIONS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
@@ -53,8 +55,10 @@ const EMPTY_PROFILE: EditableProfile = {
   tools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
   loadSkills: false,
   loadExtensions: false,
-  codemode: "off",
-  mcp: "off",
+  codeMode: false,
+  loadMcp: false,
+  mcpServers: [],
+  allowParentModelOverride: false,
   promptMode: "append",
   inheritContext: false,
   runInBackground: false,
@@ -80,7 +84,7 @@ const disabledInputStyle: CSSProperties = {
   cursor: "default",
 };
 
-function editableProfile(profile: SubagentProfile): EditableProfile {
+export function editableProfile(profile: SubagentProfile): EditableProfile {
   return {
     name: profile.name,
     displayName: profile.displayName,
@@ -88,12 +92,20 @@ function editableProfile(profile: SubagentProfile): EditableProfile {
     systemPrompt: profile.systemPrompt,
     tools: [...profile.tools],
     loadSkills: profile.loadSkills,
-    ...(profile.skills !== undefined ? { skills: [...profile.skills] } : {}),
     loadExtensions: profile.loadExtensions,
-    codemode: profile.codemode ?? "off",
-    mcp: profile.mcp ?? "off",
-    ...(profile.extensions !== undefined ? { extensions: [...profile.extensions] } : {}),
+    codeMode: profile.codeMode ?? false,
+    loadMcp: profile.loadMcp ?? false,
+    mcpServers: (profile.mcpServers ?? []).map((ref) => ({ ...ref })),
+    // Copy arrays so a draft edit never mutates the profile it was loaded from.
+    skills: profile.skills === undefined ? profile.loadSkills : Array.isArray(profile.skills) ? [...profile.skills] : profile.skills,
+    extensions: profile.extensions === undefined ? profile.loadExtensions : Array.isArray(profile.extensions) ? [...profile.extensions] : profile.extensions,
+    extensionTools: profile.extensionTools ? [...profile.extensionTools] : undefined,
+    disallowedExtensionTools: profile.disallowedExtensionTools ? [...profile.disallowedExtensionTools] : undefined,
+    color: profile.color,
+    isolation: profile.isolation,
+    persistSession: profile.persistSession,
     promptMode: profile.promptMode,
+    allowParentModelOverride: profile.allowParentModelOverride ?? false,
     ...(profile.model ? { model: profile.model } : {}),
     ...(profile.thinking ? { thinking: profile.thinking } : {}),
     ...(profile.maxTurns ? { maxTurns: profile.maxTurns } : {}),
@@ -147,14 +159,14 @@ function displayProfilePath(profile: SubagentProfile, cwd: string): string | nul
     : shortenPath(profile.filePath);
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({ label, children }: { label: React.ReactNode; children: React.ReactNode }) {
   return <ConfigField label={label}>{children}</ConfigField>;
 }
 
-function Toggle({ checked, disabled, label, onChange }: { checked: boolean; disabled: boolean; label: string; onChange: (checked: boolean) => void }) {
+function Toggle({ checked, disabled, label, onChange, describedBy }: { checked: boolean; disabled: boolean; label: string; onChange: (checked: boolean) => void; describedBy?: string }) {
   return (
     <label style={{ display: "flex", alignItems: "center", gap: 7, color: disabled ? "var(--text-dim)" : "var(--text-muted)", fontSize: 12, cursor: disabled ? "default" : "pointer" }}>
-      <input type="checkbox" checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
+      <input type="checkbox" checked={checked} disabled={disabled} aria-describedby={describedBy} onChange={(event) => onChange(event.target.checked)} />
       {label}
     </label>
   );
@@ -178,6 +190,7 @@ export function AgentsConfig({
 }) {
   const isMobile = useIsMobile();
   const { t } = useI18n();
+  const modelOverrideHintId = useId();
   const [profiles, setProfiles] = useState<SubagentProfile[]>([]);
   const [modelOptions, setModelOptions] = useState<ModelsData["modelList"]>([]);
   const [modelsLoading, setModelsLoading] = useState(true);
@@ -185,6 +198,7 @@ export function AgentsConfig({
   const [selectedKey, setSelectedKey] = useState<string | null>(() => getLastSettingsSelection("agents", cwd));
   const [draft, setDraft] = useState<EditableProfile>(EMPTY_PROFILE);
   const [mode, setMode] = useState<EditorMode>("view");
+  const [cloneFrom, setCloneFrom] = useState<Pick<SubagentProfile, "name" | "scope"> | null>(null);
   const [targetScope, setTargetScope] = useState<SubagentWritableScope>("global");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -299,6 +313,7 @@ export function AgentsConfig({
   }, [cwd, trustKey]);
 
   const selectProfile = (profile: SubagentProfile) => {
+    setCloneFrom(null);
     setSelectedKey(profileKey(profile));
     setDraft(editableProfile(profile));
     setMode(isWritableScope(profile.scope) ? "edit" : "view");
@@ -307,6 +322,7 @@ export function AgentsConfig({
   };
 
   const beginCreate = () => {
+    setCloneFrom(null);
     let name = "custom-agent";
     let suffix = 2;
     while (profiles.some((profile) => profile.name === name)) name = `custom-agent-${suffix++}`;
@@ -320,6 +336,7 @@ export function AgentsConfig({
   const beginDuplicate = () => {
     if (!selected) return;
     const name = duplicateProfileName(selected.name, profiles);
+    setCloneFrom({ name: selected.name, scope: selected.scope });
     setSelectedKey(null);
     setDraft({
       ...editableProfile(selected),
@@ -339,7 +356,7 @@ export function AgentsConfig({
       const response = await fetch("/api/subagents/profiles", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cwd, scope: targetScope, profile: draft }),
+        body: JSON.stringify({ cwd, scope: targetScope, profile: draft, ...(creating && cloneFrom ? { cloneFrom } : {}) }),
       });
       const data = await response.json() as { profile?: SubagentProfile; error?: string };
       if (!response.ok || data.error || !data.profile) throw new Error(data.error ?? `HTTP ${response.status}`);
@@ -403,8 +420,6 @@ export function AgentsConfig({
   const update = <K extends keyof EditableProfile>(key: K, value: EditableProfile[K]) => {
     setDraft((current) => ({ ...current, [key]: value }));
   };
-  // As `buildSubagentPromptPlan()` decides: no tools, skills or extensions.
-  const chatOnlyDraft = draft.tools.length === 0 && !draft.loadSkills && !draft.loadExtensions;
 
   const toggleEnabled = async (enabled: boolean) => {
     if (creating) {
@@ -628,59 +643,35 @@ export function AgentsConfig({
                   </Field>
 
                   <Field label={t("agents.resources")}>
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: "8px 20px" }}>
-                      <Toggle label={t("agents.loadSkills")} disabled={disabled} checked={draft.loadSkills} onChange={(checked) => update("loadSkills", checked)} />
-                      <Toggle label={t("agents.loadExtensions")} disabled={disabled} checked={draft.loadExtensions} onChange={(checked) => update("loadExtensions", checked)} />
-                      {/* A chat-only child cannot start with MCP on; the switch still turns it off. */}
-                      <Toggle label={t("agents.mcp")} disabled={disabled || (chatOnlyDraft && draft.mcp !== "on")} checked={draft.mcp === "on"} onChange={(checked) => update("mcp", checked ? "on" : "off")} />
-                    </div>
-                    {/* `skills:` and `extensions:` lists are edited in the profile file; show what they load. */}
-                    {draft.loadSkills && draft.skills !== undefined && (
-                      <span style={{ color: "var(--text-dim)", fontSize: 11, lineHeight: 1.4, overflowWrap: "anywhere" }}>
-                        {draft.skills.length > 0
-                          ? t("agents.skillsOnly", { skills: draft.skills.join(", ") })
-                          : t("agents.skillsNone")}
-                      </span>
-                    )}
-                    {draft.loadExtensions && draft.extensions !== undefined && (
-                      <span style={{ color: "var(--text-dim)", fontSize: 11, lineHeight: 1.4, overflowWrap: "anywhere" }}>
-                        {draft.extensions.length > 0
-                          ? t("agents.extensionsOnly", { extensions: draft.extensions.join(", ") })
-                          : t("agents.extensionsNone")}
-                      </span>
-                    )}
-                    {!disabled && chatOnlyDraft ? (
-                      <span style={{ color: "var(--text-dim)", fontSize: 11, lineHeight: 1.4 }}>
-                        {t("agents.mcpChatOnly")}
-                      </span>
-                    ) : draft.mcp === "on" && (
-                      <span style={{ color: "var(--text-dim)", fontSize: 11, lineHeight: 1.4 }}>
-                        {t("agents.mcpHint")}
-                      </span>
-                    )}
-                  </Field>
-
-                  <Field label={t("agents.codemode")}>
-                    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                      <select
-                        aria-label={t("agents.codemode")}
-                        value={draft.codemode ?? "off"}
-                        disabled={disabled}
-                        onChange={(event) => update("codemode", event.target.value as EditableProfile["codemode"])}
-                        style={{ ...controlStyle, width: "auto", minWidth: 180, alignSelf: "flex-start" }}
-                      >
-                        <option value="inherit">{t("agents.codemode.inherit")}</option>
-                        <option value="on">{t("agents.codemode.on")}</option>
-                        <option value="off">{t("agents.codemode.off")}</option>
-                      </select>
-                      <span style={{ color: "var(--text-dim)", fontSize: 11, lineHeight: 1.4 }}>
-                        {t("agents.codemodeHint")}
-                      </span>
-                    </div>
+                    <AgentResourceControls
+                      cwd={cwd} trustKey={trustKey}
+                      profileKey={selectedKey ?? "create"}
+                      skills={draft.skills ?? draft.loadSkills}
+                      extensions={draft.extensions ?? draft.loadExtensions}
+                      disabled={disabled}
+                      onChange={(kind, value) => setDraft((current) => ({ ...current, [kind]: value, [kind === "skills" ? "loadSkills" : "loadExtensions"]: value !== false }))}
+                    />
+                    <AgentMcpControls
+                      cwd={cwd} trustKey={trustKey} profileKey={selectedKey ?? draft.name}
+                      codeMode={draft.codeMode ?? false} loadMcp={draft.loadMcp ?? false}
+                      mcpServers={draft.mcpServers ?? []} disabled={disabled}
+                      onCodeModeChange={(value) => update("codeMode", value)}
+                      onLoadMcpChange={(value) => update("loadMcp", value)}
+                      onServersChange={(refs) => update("mcpServers", refs)}
+                    />
                   </Field>
 
                   <div style={{ display: "grid", gridTemplateColumns: isMobile ? "1fr" : "minmax(0, 1.5fr) minmax(120px, 0.75fr) minmax(100px, 0.5fr)", gap: 12 }}>
-                    <Field label={t("agents.model")}>
+                    <Field label={<span style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "5px 12px" }}>
+                      <span>{t("agents.model")}</span>
+                      <Toggle
+                        label={t("agents.allowParentModelOverride")}
+                        checked={draft.allowParentModelOverride ?? false}
+                        disabled={disabled || !draft.model}
+                        describedBy={!draft.model ? modelOverrideHintId : undefined}
+                        onChange={(checked) => update("allowParentModelOverride", checked)}
+                      />
+                    </span>}>
                       <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
                         <ModelSelector
                           options={modelSelectorOptions}
@@ -696,6 +687,7 @@ export function AgentsConfig({
                           variant="field"
                           placement="auto"
                         />
+                        {!draft.model && <span id={modelOverrideHintId} style={{ color: "var(--text-dim)", fontSize: 10 }}>{t("agents.allowParentModelOverrideInherited")}</span>}
                         {modelsError && <span style={{ color: "#ef4444", fontSize: 10 }}>{modelsError}</span>}
                       </div>
                     </Field>

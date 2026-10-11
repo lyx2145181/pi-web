@@ -1,11 +1,18 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { createJiti } from "jiti";
+
+const jiti = createJiti(import.meta.url, { jsx: { runtime: "automatic" }, tsconfigPaths: true });
+const { editableProfile } = await jiti.import("./AgentsConfig.tsx");
 
 import ts from "typescript";
 import vm from "node:vm";
 
 const source = await readFile(new URL("./AgentsConfig.tsx", import.meta.url), "utf8");
+const cssSource = await readFile(new URL("../app/settings.css", import.meta.url), "utf8");
+const chatInputSource = await readFile(new URL("./ChatInput.tsx", import.meta.url), "utf8");
+const modelSelectorSource = await readFile(new URL("./ModelSelector.tsx", import.meta.url), "utf8");
 
 test("editor draft preserves named and empty selections independently of activation", () => {
   const declaration = source.slice(source.indexOf("function editableProfile("), source.indexOf("function profileKey("));
@@ -24,40 +31,212 @@ test("editor draft preserves named and empty selections independently of activat
   }
 });
 
-test("draft backfills MCP as off and keeps an explicit choice", () => {
-  const declaration = source.slice(source.indexOf("function editableProfile("), source.indexOf("function profileKey("));
-  const code = ts.transpileModule(declaration, { compilerOptions: { target: ts.ScriptTarget.ES2020 } }).outputText;
-  const editable = vm.runInNewContext(`${code}; editableProfile`);
-  assert.equal(editable({ name: "legacy", tools: [], loadSkills: false, loadExtensions: false }).mcp, "off");
-  for (const mcp of ["on", "off"]) {
-    assert.equal(editable({ name: "reviewer", tools: [], loadSkills: false, loadExtensions: false, mcp }).mcp, mcp);
-  }
+test("keeps same-name profiles selectable by scope and groups writable sources first", () => {
+  assert.match(source, /return `\$\{profile\.scope\}:\$\{profile\.name\}`/);
+  assert.match(source, /\["project", "global", "workspace", "builtin"\] as const/);
+  assert.match(source, /profile\.scope === scope/);
+});
+
+test("uses the shared enabled status treatment", () => {
+  assert.match(source, /<ConfigStatusDot active=\{profile\.enabled\}/);
+  assert.match(source, /className=\{`is-grow\$\{profile\.enabled \? "" : " is-muted"\}`\}/);
+  assert.match(cssSource, /\.config-sidebar-text\.is-muted \{[\s\S]*?color: var\(--text-dim\)/);
+});
+
+test("offers a persisted built-in sub-agent switch with explicit session reload", () => {
+  assert.match(source, /fetch\("\/api\/subagents\/settings"/);
+  assert.match(source, /JSON\.stringify\(\{ enabled \}\)/);
+  assert.match(source, /<ConfigSwitch[\s\S]*?checked=\{builtInEnabled\}[\s\S]*?t\("agents\.builtInTitle"\)/);
+  assert.match(source, /sendAgentCommand\(sessionId, \{ type: "reload" \}\)/);
+  assert.match(source, /reloadNeeded && sessionId/);
+  assert.match(source, /className="agents-concurrency-control"[\s\S]*?t\("agents\.maxConcurrent"\)/);
+  assert.equal((source.match(/className="agents-feature-setting"/g) ?? []).length, 1);
+  assert.match(cssSource, /\.agents-feature-setting \{[\s\S]*?border-bottom: 1px solid var\(--border\)/);
+  assert.match(cssSource, /\.agents-concurrency-control \{[\s\S]*?white-space: nowrap;/);
+});
+
+test("marks profiles shadowed by a higher-precedence source", () => {
+  assert.match(source, /isSubagentProfileOverridden\(profile, profiles\)/);
+  assert.match(source, /overridden && <span className="agents-overridden-label">\{t\("agents\.overridden"\)\}<\/span>/);
+  assert.match(cssSource, /\.agents-overridden-label \{[\s\S]*?white-space: nowrap;/);
+});
+
+test("treats global and project profiles as directly editable", () => {
+  assert.match(source, /scope === "global" \|\| scope === "project"/);
+  assert.match(source, /setMode\(isWritableScope\(profile\.scope\) \? "edit" : "view"\)/);
+  assert.match(source, /selected && isWritableScope\(selected\.scope\) && mode === "edit"/);
+});
+
+test("offers both writable scopes when creating a profile", () => {
+  // In the header, where a saved profile shows its scope tag.
+  assert.match(source, /\{creating \? \(\s*<ConfigSaveTarget\s+value=\{targetScope\}/);
+  // Both, whatever the folder's trust: profiles are not project resources that wait for it.
+  assert.match(source, /\(\["global", "project"\] as const\)\.map\(\(scope\) => \(\{\s*value: scope,\s*label: t\(`agents\.scope\.\$\{scope\}`\),\s*disabled: saving,\s*\}\)\)/);
+  assert.doesNotMatch(source, /beginOverride|mode === "override"|agents\.readOnly|agents\.override/);
+});
+
+test("uses the shared sidebar action for new profiles", () => {
+  assert.match(source, /<ConfigListAction[\s\S]*?active=\{creating\}[\s\S]*?onClick=\{beginCreate\}/);
+  assert.match(source, /t\("agents\.new"\)[\s\S]*?<\/ConfigListAction>/);
+});
+
+test("sends the selected scope for saves and the source scope for deletes", () => {
+  assert.match(source, /JSON\.stringify\(\{ cwd, scope: targetScope, profile: draft, \.\.\.\(creating && cloneFrom \? \{ cloneFrom \} : \{\}\) \}\)/);
+  assert.match(source, /JSON\.stringify\(\{ cwd, scope: selected\.scope, name: selected\.name \}\)/);
+});
+
+test("shows a Skills-style path row with the same switch in editable and readonly modes", () => {
+  assert.match(source, /function displayProfilePath\(profile: SubagentProfile, cwd: string\)/);
+  assert.match(source, /profile\.scope === "project" \|\| profile\.scope === "workspace"/);
+  assert.match(source, /`~\/\.pi\/agent\/agents\/\$\{draft\.name \|\| "\.\.\."\}\.md`/);
+  assert.match(source, /<ConfigSwitch checked=\{draft\.enabled\} disabled=\{switchDisabled\}/);
+  assert.doesNotMatch(source, /agents-readonly-status/);
+  assert.doesNotMatch(source, /<Toggle label=\{t\("agents\.enabled"\)\}/);
+});
+
+test("keeps the enabled switch live for built-ins whose fields stay read-only", () => {
+  assert.match(source, /function isTogglableScope\(scope: SubagentScope\): boolean \{\s*return isWritableScope\(scope\) \|\| scope === "builtin";/);
+  assert.match(source, /const switchDisabled = creating\s*\? disabled\s*: !selected \|\| !isTogglableScope\(selected\.scope\) \|\| saving \|\| toggling;/);
+  assert.match(source, /if \(!selected \|\| !isTogglableScope\(selected\.scope\)\) return;/);
+  // Everything else on a built-in stays read-only: only the switch has somewhere to write.
+  assert.match(source, /setMode\(isWritableScope\(profile\.scope\) \? "edit" : "view"\)/);
+});
+
+test("persists existing profile toggles immediately without submitting unsaved fields", () => {
+  assert.match(source, /const toggleEnabled = async \(enabled: boolean\)/);
+  assert.match(source, /method: "PATCH"/);
+  assert.match(source, /JSON\.stringify\(\{ cwd, scope: selected\.scope, name: selected\.name, enabled \}\)/);
+  assert.match(source, /setDraft\(\(current\) => \(\{ \.\.\.current, enabled: saved\.enabled \}\)\)/);
+  assert.doesNotMatch(source, /method: "PATCH"[\s\S]*?profile: draft/);
+});
+
+test("reuses the ChatInput model selector with scoped models", () => {
+  assert.match(source, /fetch\(`\/api\/models\?cwd=\$\{encodeURIComponent\(cwd\)\}`/);
+  assert.match(source, /import \{ ModelSelector \} from "\.\/ModelSelector"/);
+  assert.match(chatInputSource, /import \{ ModelSelector, type ModelSelectorOption \} from "\.\/ModelSelector"/);
+  assert.match(source, /<ModelSelector[\s\S]*?options=\{modelSelectorOptions\}[\s\S]*?variant="field"/);
+  assert.match(chatInputSource, /<ModelSelector[\s\S]*?options=\{modelOptions\}/);
+  assert.match(modelSelectorSource, /filterModelOptions\(options, filter\)/);
+  assert.match(modelSelectorSource, /modelsByProvider\.map/);
+  assert.match(modelSelectorSource, /event\.key !== "Escape" \|\| !open[\s\S]*?event\.preventDefault\(\)[\s\S]*?event\.stopPropagation\(\)/);
+  assert.match(source, /agents\.modelUnavailable/);
+  assert.doesNotMatch(source, /placeholder="provider\/modelId"/);
+});
+
+test("renders the stable agent id as text outside create mode", () => {
+  assert.match(source, /creating \? \(\s*<input aria-label=\{t\("agents\.name"\)\}/);
+  assert.match(source, /<code style=\{\{ minHeight: 34,[\s\S]*?\{draft\.name\}[\s\S]*?<\/code>/);
+  assert.doesNotMatch(source, /disabled=\{disabled \|\| !creating\}/);
+});
+
+test("uses the same form controls for editable and readonly profiles", () => {
+  assert.match(source, /<input aria-label=\{t\("agents\.displayName"\)\}[\s\S]*?disabled=\{disabled\}/);
+  assert.match(source, /<input aria-label=\{t\("agents\.description"\)\}[\s\S]*?disabled=\{disabled\}/);
+  assert.match(source, /<textarea className="agents-system-prompt"[\s\S]*?disabled=\{disabled\}/);
+  assert.match(source, /<Toggle key=\{tool\}[\s\S]*?disabled=\{disabled\}/);
+  assert.match(source, /<select aria-label=\{t\("agents\.thinking"\)\}[\s\S]*?disabled=\{disabled\}/);
+  assert.match(source, /<input aria-label=\{t\("agents\.maxTurns"\)[\s\S]*?disabled=\{disabled\}/);
+  assert.match(source, /<Toggle label=\{t\("agents\.inheritContext"\)\} disabled=\{disabled\}/);
+  assert.match(source, /<Toggle label=\{t\("agents\.background"\)\} disabled=\{disabled\}/);
+  assert.match(source, /<AgentResourceControls[\s\S]*?skills=\{draft.skills \?\? draft.loadSkills\}[\s\S]*?extensions=\{draft.extensions \?\? draft.loadExtensions\}[\s\S]*?disabled=\{disabled\}/);
+  assert.doesNotMatch(source, /ReadonlyValue|readonlyPromptStyle|agents-readonly/);
+});
+
+test("renders the local compact resource and MCP controls instead of an upstream read-only list summary", async () => {
+  // Local contract: the profile file's skills/extensions selections stay boolean|string[] and
+  // are edited through the compact AgentResourceControls/AgentMcpControls, never an upstream
+  // read-only `skills:` / `extensions:` list summary.
+  assert.match(source, /<AgentResourceControls[\s\S]*?skills=\{draft\.skills \?\? draft\.loadSkills\}[\s\S]*?extensions=\{draft\.extensions \?\? draft\.loadExtensions\}[\s\S]*?disabled=\{disabled\}/);
+  assert.match(source, /<AgentMcpControls[\s\S]*?codeMode=\{draft\.codeMode \?\? false\}[\s\S]*?loadMcp=\{draft\.loadMcp \?\? false\}[\s\S]*?mcpServers=\{draft\.mcpServers \?\? \[\]\}[\s\S]*?disabled=\{disabled\}/);
+  assert.doesNotMatch(source, /agents\.skillsOnly/);
+  assert.doesNotMatch(source, /agents\.extensionsOnly/);
+  assert.doesNotMatch(source, /\{draft\.loadSkills && draft\.skills !== undefined && \(/);
+  assert.doesNotMatch(source, /\{draft\.loadExtensions && draft\.extensions !== undefined && \(/);
 });
 
 test("draft backfills code mode for legacy profiles and keeps an explicit choice", () => {
   const declaration = source.slice(source.indexOf("function editableProfile("), source.indexOf("function profileKey("));
   const code = ts.transpileModule(declaration, { compilerOptions: { target: ts.ScriptTarget.ES2020 } }).outputText;
   const editable = vm.runInNewContext(`${code}; editableProfile`);
-  // Profiles written before the setting existed have no value: code mode stays disabled.
-  assert.equal(editable({ name: "legacy", tools: [], loadSkills: false, loadExtensions: false }).codemode, "off");
+  // Profiles written before the setting existed have no value: Code mode stays disabled.
+  assert.equal(editable({ name: "legacy", tools: [], loadSkills: false, loadExtensions: false }).codeMode, false);
   // An explicit choice survives the draft, so duplicating a profile keeps it too.
-  for (const codemode of ["on", "off", "inherit"]) {
-    const draft = editable({ name: "reviewer", tools: [], loadSkills: false, loadExtensions: false, codemode });
-    assert.equal(draft.codemode, codemode);
+  for (const codeMode of [true, false]) {
+    const draft = editable({ name: "reviewer", tools: [], loadSkills: false, loadExtensions: false, codeMode });
+    assert.equal(draft.codeMode, codeMode);
   }
 });
 
-test("a profile model's pi :level suffix names its base model; a listed colon id matches whole", () => {
-  const constant = source.slice(source.indexOf("const THINKING_OPTIONS"), source.indexOf("\n", source.indexOf("const THINKING_OPTIONS")));
-  const declaration = source.slice(source.indexOf("function profileModelBase("), source.indexOf("function profileKey("));
-  const code = ts.transpileModule(`${constant}\n${declaration}`, { compilerOptions: { target: ts.ScriptTarget.ES2020 } }).outputText;
-  const base = vm.runInNewContext(`${code}; profileModelBase`);
-  const listed = new Set(["openai/gpt-5", "ollama/qwen3:8b", "local/tuned:high"]);
-  const isListed = (reference) => listed.has(reference);
-  assert.equal(base("openai/gpt-5:high", isListed), "openai/gpt-5");
-  assert.equal(base("openai/gpt-5", isListed), "openai/gpt-5");
-  assert.equal(base("ollama/qwen3:8b", isListed), "ollama/qwen3:8b");
-  assert.equal(base("local/tuned:high", isListed), "local/tuned:high");
-  assert.equal(base("openai/gpt-5:turbo", isListed), "openai/gpt-5:turbo");
-  assert.equal(base("openai/gpt-5:", isListed), "openai/gpt-5:");
+test("round-trips Code mode and dormant scoped MCP refs through selected and cloned drafts", () => {
+  const profile = {
+    name: "fixture", displayName: "Fixture", description: "", systemPrompt: "",
+    tools: ["read"], loadSkills: false, loadExtensions: false, skills: false, extensions: false,
+    promptMode: "replace", inheritContext: false, runInBackground: false, enabled: true,
+    scope: "builtin", codeMode: true, loadMcp: false,
+    mcpServers: [{ scope: "global", name: "a-b" }, { scope: "project", name: "a-b" }, { scope: "project", name: "missing" }],
+  };
+  const selectedDraft = editableProfile(profile);
+  const clonedDraft = { ...editableProfile(profile), name: "fixture-copy" };
+  for (const draft of [selectedDraft, clonedDraft]) {
+    const payload = JSON.parse(JSON.stringify({ cwd: "/fixture", scope: "global", profile: draft }));
+    assert.equal(payload.profile.codeMode, true);
+    assert.equal(payload.profile.loadMcp, false);
+    assert.deepEqual(payload.profile.mcpServers, profile.mcpServers);
+    assert.notEqual(draft.mcpServers, profile.mcpServers);
+    assert.notEqual(draft.mcpServers[0], profile.mcpServers[0]);
+    assert.equal("scope" in payload.profile, false);
+    assert.equal("filePath" in payload.profile, false);
+  }
+  const legacy = { ...profile };
+  for (const field of ["codeMode", "loadMcp", "mcpServers"]) delete legacy[field];
+  const legacyDraft = editableProfile(legacy);
+  assert.equal(legacyDraft.codeMode, false);
+  assert.equal(legacyDraft.loadMcp, false);
+  assert.deepEqual(legacyDraft.mcpServers, []);
+  assert.match(source, /const EMPTY_PROFILE[\s\S]*?codeMode: false,[\s\S]*?loadMcp: false,[\s\S]*?mcpServers: \[\]/);
+  assert.match(source, /setDraft\(editableProfile\(chosen\)\)/);
+  assert.match(source, /setDraft\(editableProfile\(profile\)\)/);
+  assert.match(source, /<AgentMcpControls[\s\S]*?disabled=\{disabled\}[\s\S]*?onCodeModeChange=\{\(value\) => update\("codeMode", value\)\}/);
+  assert.match(source, /onServersChange=\{\(refs\) => update\("mcpServers", refs\)\}/);
+});
+
+test("round-trips model override intent through selection, copies and temporary model clearing", () => {
+  const profile = {
+    name: "fixture", displayName: "Fixture", description: "", systemPrompt: "",
+    tools: [], loadSkills: false, loadExtensions: false, promptMode: "append",
+    inheritContext: false, runInBackground: false, enabled: true, scope: "builtin",
+    model: "fixture/pinned", allowParentModelOverride: true,
+  };
+  const selected = editableProfile(profile);
+  const copied = { ...editableProfile(profile), name: "fixture-copy" };
+  for (const draft of [selected, copied]) {
+    assert.equal(JSON.parse(JSON.stringify(draft)).allowParentModelOverride, true);
+    assert.equal(draft.model, profile.model);
+    const cleared = editableProfile({ ...draft, scope: "global", model: undefined });
+    assert.equal(cleared.allowParentModelOverride, true, "clearing a model must not erase dormant intent");
+    assert.equal(cleared.model, undefined);
+  }
+  const legacy = { ...profile };
+  delete legacy.allowParentModelOverride;
+  assert.equal(editableProfile(legacy).allowParentModelOverride, false);
+  assert.equal(editableProfile({ ...profile, allowParentModelOverride: false }).allowParentModelOverride, false);
+  assert.match(source, /const EMPTY_PROFILE[\s\S]*?allowParentModelOverride: false/);
+});
+
+test("places a draft-only override checkbox beside the model label with a visible inherited-model reason", () => {
+  const modelField = source.slice(source.indexOf('<Field label={<span'), source.indexOf('<Field label={t("agents.thinking")}'));
+  assert.match(modelField, /t\("agents\.model"\)[\s\S]*?<Toggle[\s\S]*?t\("agents\.allowParentModelOverride"\)[\s\S]*?<ModelSelector/);
+  assert.match(modelField, /checked=\{draft\.allowParentModelOverride \?\? false\}/);
+  assert.match(modelField, /disabled=\{disabled \|\| !draft\.model\}/);
+  assert.match(modelField, /onChange=\{\(checked\) => update\("allowParentModelOverride", checked\)\}/);
+  assert.match(modelField, /describedBy=\{!draft\.model \? modelOverrideHintId : undefined\}/);
+  assert.match(modelField, /!draft\.model && <span id=\{modelOverrideHintId\}[\s\S]*?agents\.allowParentModelOverrideInherited/);
+  assert.match(source, /aria-describedby=\{describedBy\}/);
+  assert.doesNotMatch(modelField, /fetch\(|void save\(|update\("thinking"/);
+});
+
+test("confirms deletion and limits it to writable profiles", () => {
+  assert.match(source, /window\.confirm\(t\("agents\.deleteConfirm", \{ name: selected\.displayName \}\)\)/);
+  assert.match(source, /selected && isWritableScope\(selected\.scope\) && mode === "edit"/);
+  assert.match(source, /method: "DELETE"/);
 });

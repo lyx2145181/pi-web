@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { createAgentSessionFromServices, createAgentSessionServices, getAgentDir, initTheme, SessionManager, SettingsManager, Theme, type ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { createAgentSessionFromServices, createAgentSessionServices, getAgentDir, initTheme, SessionManager, SettingsManager, Theme, type AgentSession, type ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager as TuiKeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
 import { existsSync, realpathSync, writeFileSync } from "fs";
@@ -16,6 +16,8 @@ import {
 } from "./project-command-env";
 import { cacheSessionPath, catalogFirstMessage, getLatestModelChange, invalidateSessionListCache, readLatestSessionEntryId, resolveSessionPath } from "./session-reader";
 import { getProjectTrustStatus, projectTrustReloadOptions } from "./project-trust";
+import { createSubagentSessionServices, subagentHostToolAdmission } from "./subagent-resources";
+import { reconcileSubagentActiveTools, subagentToolExclusions } from "./subagent-tool-policy";
 import { notifySessionComplete } from "./web-push";
 import { hasActiveSessionLivenessProvider } from "./session-liveness";
 import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
@@ -35,23 +37,21 @@ import {
 } from "./subagent-extension";
 import {
   listSubagentProfiles,
-  hasSubagentResourceSnapshot,
   readSubagentRun,
   readSubagentSessionResources,
-  subagentExtensionLoaderOptions,
-  subagentToolOptions,
   SUBAGENT_CONTROL_TOOL_NAMES,
+  SUBAGENT_META_TYPE,
+  type SubagentSessionResources,
 } from "./subagents";
-import { createSubagentController } from "./subagent-runtime";
+import { createSubagentController, requestSubagentRunAbort } from "./subagent-runtime";
 import { isBuiltInSubagentsEnabled } from "./subagent-settings";
 import { resolveShellTools } from "./powershell-settings";
 import { CHAT_ONLY_RESOURCE_LOADER_OPTIONS, contextFilesSystemPrompt } from "./chat-only";
 import { createExactSystemPromptExtension } from "./exact-system-prompt";
-import { createPiWebBuiltinExtensions, createSubagentCodemodeExtension, createSubagentMcpExtensions } from "./builtin-extensions";
+import { createPiWebBuiltinExtensions } from "./builtin-extensions";
 import type { McpHost } from "./mcp-host";
 import { mcpPromptPreparation, type McpCommandCandidate } from "./mcp-command";
-import { createReadOnlyMcpPolicyExtension, createSubagentMcpPolicyExtension } from "./mcp-read-only-policy";
-import { createSubagentSkillsBinding } from "./subagent-skills";
+import { createReadOnlyMcpPolicyExtension } from "./mcp-read-only-policy";
 import { isNestedToolExecutionEvent } from "./agent-event-wire";
 import {
   appendClearedSessionToolSelection,
@@ -128,8 +128,10 @@ type AgentSessionWrapperOptions = {
   chatOnly?: boolean;
   onAgentRunComplete?: AgentRunCompleteListener;
   suppressCompletionNotifications?: boolean;
+  /** Validated creation snapshot, supplied by child registration/cold restore; never a live profile. */
+  subagentResources?: SubagentSessionResources | null;
   /** Connects the session's MCP servers before a prompt starts a run, and lets go of them when it closes (lib/mcp-host.ts). */
-  mcpHost?: Pick<McpHost, "prepareForPrompt" | "dispose">;
+  mcpHost?: Pick<McpHost, "prepareForPrompt" | "dispose"> & Partial<Pick<McpHost, "admitsTool">>;
   /** Chat only: the extension-provided model the session wanted, named when a prompt finds no model. */
   chatOnlyExtensionModel?: { provider: string; id: string };
 };
@@ -321,7 +323,8 @@ export class AgentSessionWrapper {
   private readonly chatOnly: boolean;
   private readonly onAgentRunComplete?: AgentRunCompleteListener;
   private readonly suppressCompletionNotifications: boolean;
-  private readonly mcpHost?: Pick<McpHost, "prepareForPrompt" | "dispose">;
+  private readonly subagentResources?: SubagentSessionResources;
+  private readonly mcpHost?: Pick<McpHost, "prepareForPrompt" | "dispose"> & Partial<Pick<McpHost, "admitsTool">>;
   private readonly chatOnlyExtensionModel?: { provider: string; id: string };
   private mcpHostDisposed = false;
   // The MCP wait of the prompt being admitted; Stop ends it.
@@ -349,6 +352,7 @@ export class AgentSessionWrapper {
     this.chatOnly = options.chatOnly ?? false;
     this.onAgentRunComplete = options.onAgentRunComplete;
     this.suppressCompletionNotifications = options.suppressCompletionNotifications ?? false;
+    this.subagentResources = options.subagentResources ? structuredClone(options.subagentResources) : undefined;
     this.mcpHost = options.mcpHost;
     this.chatOnlyExtensionModel = options.chatOnlyExtensionModel;
   }
@@ -560,6 +564,8 @@ export class AgentSessionWrapper {
       } else {
         this.inner.extensionRunner.setUIContext?.(uiContext, "rpc");
       }
+      // bindExtensions also awaits resources_discover, which runs AFTER session_start.
+      this.reconcileSubagentToolPolicy();
       this.extensionsBound = true;
       console.log(`[pi-web] session_start dispatched to extensions for session ${this.inner.sessionId}`);
     })().catch((err) => {
@@ -568,6 +574,84 @@ export class AgentSessionWrapper {
     });
 
     return this.extensionBindingPromise;
+  }
+
+  private resetExtensionUiForPrompt(): void {
+    if (this.extensionUiAbortController.signal.aborted) this.extensionUiAbortController = new AbortController();
+  }
+
+  /** Complete delegated run, not the send() preflight acknowledgement. One bind only. */
+  async promptDelegated(message: string, signal?: AbortSignal): Promise<void> {
+    await this.waitUntilReady();
+    // The current run's Stop controller, captured only after `resetExtensionUiForPrompt()` below;
+    // a previous run's signal must never cancel this one.
+    let uiAbort: AbortController | undefined;
+    const check = () => {
+      if (signal?.aborted || uiAbort?.signal.aborted || !this.isAlive()) throw new Error("Subagent cancelled before prompting");
+    };
+    check();
+    const releaseAdmission = await this.acquirePromptAdmission();
+    try {
+      check();
+      if (this.isRunning()) throw new Error("Subagent is already running");
+      this.resetExtensionUiForPrompt();
+      uiAbort = this.extensionUiAbortController;
+      const cancel = () => {
+        this.mcpPromptWait?.controller.abort();
+        if (this.inner.isStreaming) void this.inner.abort();
+      };
+      signal?.addEventListener("abort", cancel, { once: true });
+      try {
+        // The increment is inside the finally-protected span: every exit below, a readiness or
+        // pre-prompt Stop included, resets it to zero.
+        this.pendingPromptCount += 1;
+        check();
+        await this.prepareMcpPrompt(message);
+        check();
+        this.reconcileSubagentToolPolicy();
+        this.agentRunNeedsCompletion = true;
+        await this.inner.prompt(message, { source: "rpc" });
+      } finally {
+        signal?.removeEventListener("abort", cancel);
+        this.pendingPromptCount = Math.max(0, this.pendingPromptCount - 1);
+        this.resetIdleTimer();
+        this.notifyAgentRunCompleteIfIdle();
+      }
+    } finally { releaseAdmission(); }
+  }
+
+  async abortDelegated(): Promise<void> { await this.send({ type: "abort" }); }
+
+  private async prepareMcpPrompt(message: string): Promise<void> {
+    if (this.subagentResources?.version === 3 && this.subagentResources.loadMcp
+      && typeof this.mcpHost?.prepareForPrompt !== "function") throw new Error("Subagent MCP requires a prepared session host");
+    const preparation = this.mcpHost && !this.inner.isStreaming
+      ? mcpPromptPreparation(message, this.extensionCommandCandidates()) : "none";
+    if (!this.mcpHost || preparation === "none") return;
+    const controller = new AbortController();
+    const waited = this.mcpHost.prepareForPrompt(controller.signal, { wait: preparation === "wait" })
+      .catch((error: unknown) => {
+        if (this.subagentResources?.version === 3) throw error;
+        console.error("[pi-web] MCP servers could not be prepared:", error instanceof Error ? error.message : error);
+      }).then(() => {
+        if (controller.signal.aborted) throw new DOMException(MCP_WAIT_STOPPED_MESSAGE, "AbortError");
+      });
+    const wait = { controller, done: waited.then(() => undefined, () => undefined) };
+    this.mcpPromptWait = wait;
+    try { await waited; }
+    finally { if (this.mcpPromptWait === wait) this.mcpPromptWait = null; }
+  }
+
+  private reconcileSubagentToolPolicy(): void {
+    const resources = this.subagentResources;
+    if (resources?.version !== 2 && resources?.version !== 3) return; // Normal sessions and v1 retain their existing loadout rules.
+    const sdk = this.inner as unknown as Pick<AgentSession, "getAllTools" | "getActiveToolNames" | "setActiveToolsByName" | "resourceLoader">;
+    reconcileSubagentActiveTools({
+      getActiveTools: () => sdk.getActiveToolNames(),
+      getAllTools: () => sdk.getAllTools(),
+      setActiveTools: (names) => sdk.setActiveToolsByName(names),
+    }, resources.builtinTools, resources.toolPolicy, () => sdk.resourceLoader.getExtensions().extensions,
+      resources.version === 3 ? subagentHostToolAdmission(resources, this.mcpHost?.admitsTool ? { admitsTool: this.mcpHost.admitsTool.bind(this.mcpHost) } : undefined) : undefined);
   }
 
   private async waitForExtensionsBound(): Promise<void> {
@@ -601,6 +685,7 @@ export class AgentSessionWrapper {
       || type === "steer"
       || type === "follow_up"
       || type === "get_commands"
+      || type === "get_tools"
       || type === "get_state";
   }
 
@@ -821,9 +906,7 @@ export class AgentSessionWrapper {
           if (this.chatOnlyExtensionModel && !(model && this.inner.modelRuntime.getModel(model.provider, model.id))) {
             throw chatOnlyExtensionModelError(this.chatOnlyExtensionModel.provider, this.chatOnlyExtensionModel.id);
           }
-          if (this.extensionUiAbortController.signal.aborted) {
-            this.extensionUiAbortController = new AbortController();
-          }
+          this.resetExtensionUiForPrompt();
           const promptImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
           const streamingBehavior = command.streamingBehavior as "steer" | "followUp" | undefined;
           let preflightAccepted = false;
@@ -863,28 +946,8 @@ export class AgentSessionWrapper {
           // extension command before anything else and starts no run for it: another
           // extension's command skips this, and the built-in `/mcp`, which acts on the
           // registered servers, registers them without waiting (`mcpPromptPreparation()`).
-          const mcpPreparation = this.mcpHost && !this.inner.isStreaming
-            ? mcpPromptPreparation(typeof command.message === "string" ? command.message : "", this.extensionCommandCandidates())
-            : "none";
-          if (this.mcpHost && mcpPreparation !== "none") {
-            const controller = new AbortController();
-            const waited = this.mcpHost.prepareForPrompt(controller.signal, { wait: mcpPreparation === "wait" })
-              .catch((error: unknown) => {
-                console.error("[pi-web] MCP servers could not be prepared:", error instanceof Error ? error.message : error);
-              })
-              .then(() => {
-                if (!controller.signal.aborted) return;
-                finishPrompt();
-                throw new Error(MCP_WAIT_STOPPED_MESSAGE);
-              });
-            const wait = { controller, done: waited.then(() => undefined, () => undefined) };
-            this.mcpPromptWait = wait;
-            try {
-              await waited;
-            } finally {
-              if (this.mcpPromptWait === wait) this.mcpPromptWait = null;
-            }
-          }
+          try { await this.prepareMcpPrompt(typeof command.message === "string" ? command.message : ""); }
+          catch (error) { finishPrompt(); throw error; }
           let prompt: Promise<void>;
           try {
             prompt = this.inner.prompt(command.message as string, {
@@ -937,6 +1000,9 @@ export class AgentSessionWrapper {
 
       case "abort":
         this.forceShutdownOnIdle = true;
+        // A Stop cancels the subagent runtime's current stored run (its queued slot or its
+        // per-run controller) before the SDK path; an idle Stop touches no later run.
+        requestSubagentRunAbort(this.sessionId);
         // Arm the forced cleanup now: the reset above ran before this flag,
         // and the final reset only runs once the SDK run has unwound.
         this.resetIdleTimer();
@@ -956,6 +1022,7 @@ export class AgentSessionWrapper {
         }
 
       case "get_state": {
+        this.reconcileSubagentToolPolicy();
         const model = this.inner.model;
         const contextUsage = this.inner.getContextUsage();
         return {
@@ -986,6 +1053,7 @@ export class AgentSessionWrapper {
           // per-run changes again once the run ends.
           systemPrompt: this.exactSystemPrompt?.() ?? (this.inner.agent.state?.systemPrompt || this.inner.systemPrompt || ""),
           thinkingLevel: this.inner.agent.state?.thinkingLevel ?? "off",
+          activeToolNames: this.inner.getActiveToolNames(),
           extensionStatuses: this.getExtensionStatuses(),
           extensionWidgets: this.getExtensionWidgets(),
         };
@@ -1188,6 +1256,7 @@ export class AgentSessionWrapper {
       }
 
       case "get_tools": {
+        this.reconcileSubagentToolPolicy();
         // A hidden tool is withdrawn: pi ignores it when setting the active tools.
         const all: ToolInfo[] = this.inner.getAllTools().filter((t) => t.exposure !== "hidden");
         const active = new Set<string>(this.inner.getActiveToolNames());
@@ -1262,6 +1331,7 @@ export class AgentSessionWrapper {
         if (typeof this.inner.bindExtensions !== "function") {
           this.inner.extensionRunner.setUIContext?.(this.createExtensionUiContext(), "rpc");
         }
+        this.reconcileSubagentToolPolicy();
         invalidateModelsCache();
         return { success: true };
       }
@@ -2021,6 +2091,7 @@ export class AgentSessionWrapper {
             this.inner.extensionRunner.setUIContext?.(this.createExtensionUiContext(), "rpc");
           },
         });
+        this.reconcileSubagentToolPolicy();
       },
     };
   }
@@ -2083,14 +2154,15 @@ const SUBAGENT_CONTROLLER = createSubagentController({
   registerSession: (inner, options) => {
     const wrapper = new AgentSessionWrapper(inner, {
       ...(options?.exactSystemPrompt !== undefined
-        ? { exactSystemPrompt: options.exactSystemPrompt }
+        ? { exactSystemPrompt: () => options.exactSystemPrompt! }
         : {}),
       chatOnly: options?.chatOnly,
+      mcpHost: options?.mcpHost,
+      subagentResources: readSubagentSessionResources(inner.sessionManager.getEntries() as unknown as SessionEntry[]),
       suppressCompletionNotifications: true,
-      ...(options?.mcpHost ? { mcpHost: options.mcpHost } : {}),
     });
     registerRpcWrapper(wrapper);
-    return wrapper;
+    return wrapper.waitUntilReady();
   },
   reopenSession: async (sessionId, sessionFile) =>
     (await startRpcSession(sessionId, sessionFile, undefined)).session,
@@ -2434,12 +2506,11 @@ export async function startRpcSession(
   }
   const sessionCwd = sessionManager.getCwd();
   const sessionEntries = sessionManager.getEntries() as unknown as SessionEntry[];
-  const hasPersistedSubagentSnapshot = sessionFile && hasSubagentResourceSnapshot(sessionEntries);
   const subagentResources = sessionFile
     ? readSubagentSessionResources(sessionEntries)
     : null;
-  if (hasPersistedSubagentSnapshot && !subagentResources) {
-    throw new Error("Invalid subagent resource snapshot");
+  if (sessionFile && !subagentResources && sessionManager.getEntries().some((entry) => entry.type === "custom" && entry.customType === SUBAGENT_META_TYPE)) {
+    throw new Error("Cannot restore subagent: missing or invalid resource snapshot");
   }
   const persistedToolNames = subagentResources
     ? undefined
@@ -2449,7 +2520,7 @@ export async function startRpcSession(
     appendSessionToolSelection(sessionManager, requestedToolNames);
   }
   const subagentLoadsResources = Boolean(
-    subagentResources?.loadExtensions || subagentResources?.loadSkills || subagentResources?.codemode || subagentResources?.mcp,
+    subagentResources?.loadExtensions || subagentResources?.loadSkills || (subagentResources?.version === 3 && (subagentResources.codeMode || subagentResources.loadMcp)),
   );
   const chatOnly = selectedToolNames?.length === 0 && !subagentLoadsResources;
   const finishStartingSession = trackStartingSession(sessionCwd);
@@ -2460,8 +2531,7 @@ export async function startRpcSession(
 
     // Determine which tools to pass based on requested toolNames.
     // Since v0.68.0, session creation expects string[] tool names instead of Tool[] instances.
-    // A subagent's tools come from its snapshot (subagentToolOptions() below).
-    let toolsOption: string[] | undefined;
+    let toolsOption: string[] | undefined = subagentResources?.toolPolicy ? undefined : subagentResources?.tools;
     if (!subagentResources && selectedToolNames !== undefined) {
       // toolNames === [] -> "all off" (an empty allow-list disables every tool).
       // Otherwise DO NOT pass a builtin-only allow-list: passing CODING_TOOL_NAMES
@@ -2484,7 +2554,7 @@ export async function startRpcSession(
       : chatOnly
         ? undefined
         : projectTrustReloadOptions(sessionCwd, agentDir);
-    const settingsManager = SettingsManager.create(sessionCwd, agentDir);
+    const settingsManager = SettingsManager.create(sessionCwd, agentDir, subagentResources ? { projectTrusted: getProjectTrustStatus(sessionCwd, agentDir).trusted } : undefined);
     // Chat-only sessions and subagents that replace Pi's prompt send an exact
     // system prompt. The prompt is resolved at prompt time through this inline
     // extension: it may read the session's context files, which exist only
@@ -2496,43 +2566,17 @@ export async function startRpcSession(
     const builtins = subagentResources || chatOnly
       ? undefined
       : await createPiWebBuiltinExtensions({ agentDir });
-    const subagentCodemode = subagentResources?.codemode
-      ? await createSubagentCodemodeExtension({
-          agentDir,
-          cwd: sessionCwd,
-          projectTrusted: () => settingsManager.isProjectTrusted(),
-        })
-      : undefined;
-    const subagentMcp = subagentResources?.mcp
-      ? await createSubagentMcpExtensions({
-          agentDir,
-          cwd: sessionCwd,
-          projectTrusted: () => settingsManager.isProjectTrusted(),
-          codemode: subagentResources.codemode === true,
-        })
-      : undefined;
-    const skillsBinding = subagentResources ? createSubagentSkillsBinding({
-      loadSkills: subagentResources.loadSkills,
-      skills: subagentResources.skills,
-      exactSystemPrompt: subagentResources.exactSystemPrompt
-        ?? (chatOnly ? subagentResources.appendSystemPrompt[0] ?? "" : undefined),
-    }) : undefined;
-    const subagentExtensionFactories = [
-      ...(subagentCodemode ? [subagentCodemode] : []),
-      ...(subagentMcp && subagentResources
-        ? [...subagentMcp.extensions, createSubagentMcpPolicyExtension(() => subagentResources)]
-        : []),
-      ...(skillsBinding?.loaderOptions.extensionFactories ?? []),
-    ];
-    const services = await createAgentSessionServices({
+    const createServices = subagentResources
+      ? (options: Parameters<typeof createSubagentSessionServices>[0]) => createSubagentSessionServices(options, subagentResources)
+      : createAgentSessionServices;
+    const services = await createServices({
       cwd: sessionCwd,
       agentDir,
       settingsManager,
       resourceLoaderOptions: subagentResources
         ? {
-            ...subagentExtensionLoaderOptions(subagentResources),
-            ...skillsBinding!.loaderOptions,
-            ...(subagentExtensionFactories.length > 0 ? { extensionFactories: subagentExtensionFactories } : {}),
+            noExtensions: !subagentResources.loadExtensions,
+            noSkills: !subagentResources.loadSkills,
             noPromptTemplates: true,
             noThemes: true,
             noContextFiles: true,
@@ -2543,6 +2587,7 @@ export async function startRpcSession(
                 }
               : {}),
             appendSystemPrompt: subagentResources.appendSystemPrompt,
+            ...(chatOnly || subagentResources.exactSystemPrompt !== undefined ? { extensionFactories: [exactSystemPromptExtension] } : {}),
           }
         : chatOnly
           ? { ...CHAT_ONLY_RESOURCE_LOADER_OPTIONS, extensionFactories: [exactSystemPromptExtension] }
@@ -2564,10 +2609,6 @@ export async function startRpcSession(
           },
       ...(trustReloadOptions ? { resourceLoaderReloadOptions: trustReloadOptions } : {}),
     });
-    if (subagentResources?.codemode
-      && !services.resourceLoader.getExtensions().extensions.some((extension) => extension.tools.has("codemode"))) {
-      throw new Error("Code mode is unavailable: builtin:codemode was not registered");
-    }
     const scope = await resolveVisibleModels(
       services.modelRuntime,
       services.settingsManager.getEnabledModels(),
@@ -2592,13 +2633,31 @@ export async function startRpcSession(
     const branch = sessionManager.getBranch();
     // System messages carry the prompt and tool loadout, not a conversation.
     const hasExistingMessages = branch.some((entry) => entry.type === "message" && entry.message.role !== "system");
-    const savedModel = hasExistingMessages
+    // Child setup already records its selected model, even before its first conversation.
+    const savedModel = hasExistingMessages || subagentResources
       ? getLatestModelChange(branch as unknown as SessionEntry[])
       : null;
     const restoredModel = savedModel
       ? services.modelRuntime.getModel(savedModel.provider, savedModel.modelId)
       : undefined;
-    const initial = hasExistingMessages ? null : selectInitialModelScope(scope, {
+    // A snapshot with no recorded model is corrupt: fail closed before the SDK appends a default
+    // `model_change`, which would silently rewrite the child onto the runtime's default model.
+    if (subagentResources && !savedModel) {
+      throw new Error("Cannot restore subagent: no recorded model");
+    }
+    // A child must restore its recorded model from this runtime before the SDK ever touches the
+    // session file. For a new / setup-only child session the SDK appends a default `model_change`
+    // during construction, so waiting for a post-bind switch would rewrite the record first. A
+    // remembered deferred catalog entry is therefore not enough; an unavailable model (including
+    // a session_start-only provider) fails closed here without touching the file.
+    if (subagentResources && savedModel
+      && (!restoredModel || !services.modelRuntime.hasConfiguredAuth(restoredModel.provider))) {
+      throw new Error(`Cannot restore subagent model ${savedModel.provider}/${savedModel.modelId}: model or authentication is unavailable`);
+    }
+    const deferredSavedModel = savedModel && !restoredModel
+      ? findDeferredModel(services.modelRuntime, savedModel.provider, savedModel.modelId)
+      : undefined;
+    const initial = hasExistingMessages || (subagentResources && savedModel) ? null : selectInitialModelScope(scope, {
         ...(effectiveInitialModel ? { requestedModel: effectiveInitialModel } : {}),
         ...(defaultProvider && defaultModelId
           ? { defaultModel: { provider: defaultProvider, modelId: defaultModelId } }
@@ -2608,11 +2667,9 @@ export async function startRpcSession(
     const startupModel = restoredModel && services.modelRuntime.hasConfiguredAuth(restoredModel.provider)
       ? restoredModel
       : initial?.model;
-    const deferredModel = hasExistingMessages
-      ? savedModel && !restoredModel
-        ? findDeferredModel(services.modelRuntime, savedModel.provider, savedModel.modelId)
-        : undefined
-      : deferredInitialModel;
+    // Only a normal session may start on a remembered deferred provider and switch after bind.
+    // A child already restored a live model above, or refused to start at all.
+    const deferredModel = subagentResources ? undefined : hasExistingMessages ? deferredSavedModel : deferredInitialModel;
     // The extension's model a Chat-only session wanted (saved, chosen or default); a prompt names
     // it when the session ended up with no model at all.
     const chatOnlyExtensionModel = chatOnly
@@ -2626,10 +2683,15 @@ export async function startRpcSession(
       ...(startupModel ? { model: startupModel } : {}),
       ...(initial?.thinkingLevel ? { thinkingLevel: initial.thinkingLevel } : {}),
       ...(scope.scopedModels.length > 0 ? { scopedModels: [...scope.scopedModels] } : {}),
-      ...(subagentResources
-        ? subagentToolOptions(subagentResources)
-        : toolsOption !== undefined ? { tools: toolsOption } : {}),
+      ...(toolsOption !== undefined ? { tools: toolsOption } : {}),
+      ...(subagentResources?.toolPolicy
+        ? { noTools: "builtin", excludeTools: subagentToolExclusions(subagentResources.builtinTools) }
+        : subagentResources ? { excludeTools: [...SUBAGENT_CONTROL_TOOL_NAMES] } : {}),
     });
+
+    if (subagentResources?.toolPolicy) {
+      inner.setActiveToolsByName([...new Set([...subagentResources.builtinTools, ...inner.getActiveToolNames()])]);
+    }
 
     // A pinned selection replaces only the coding tools of the SDK's initial loadout, which
     // already holds the extension tools pi activates on registration and whatever
@@ -2642,14 +2704,14 @@ export async function startRpcSession(
       );
     }
 
-    skillsBinding?.setActiveToolsGetter(() => inner.getActiveToolNames());
-    const exactSystemPrompt = subagentResources
-      ? skillsBinding!.getExactSystemPrompt
+    const exactSystemPrompt = subagentResources?.exactSystemPrompt !== undefined
+      ? () => subagentResources.exactSystemPrompt!
       : chatOnly
-        ? () => contextFilesSystemPrompt(inner.resourceLoader.getAgentsFiles().agentsFiles)
+        ? subagentResources
+          ? () => subagentResources.appendSystemPrompt[0] ?? ""
+          : () => contextFilesSystemPrompt(inner.resourceLoader.getAgentsFiles().agentsFiles)
         : undefined;
     exactSystemPromptRef.current = exactSystemPrompt;
-    const mcpHost = builtins?.mcpHost ?? subagentMcp?.mcpHost;
     const wrapper = new AgentSessionWrapper(inner, {
       exactSystemPrompt,
       chatOnly,
@@ -2659,7 +2721,8 @@ export async function startRpcSession(
         });
       },
       suppressCompletionNotifications: Boolean(subagentResources),
-      ...(mcpHost ? { mcpHost } : {}),
+      subagentResources,
+      ...(subagentResources && "mcpHost" in services && services.mcpHost ? { mcpHost: services.mcpHost as McpHost } : builtins?.mcpHost ? { mcpHost: builtins.mcpHost } : {}),
       ...(chatOnlyExtensionModel ? { chatOnlyExtensionModel } : {}),
     });
     const realSessionId = inner.sessionId as string;
