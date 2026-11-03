@@ -32,6 +32,8 @@ import { parseFormDataWithinLimit, RequestBodyTooLargeError } from "@/lib/bounde
 import { filePathFromApiSegments, samePath } from "@/lib/paths";
 import { hasParentDirectorySegment } from "@/lib/path-security";
 import { readTextPreviewChunk } from "@/lib/text-preview";
+import { registerFileWatch } from "@/lib/file-watch-registry";
+import { pageStreamLabel, registerPageStream } from "@/lib/page-stream-registry";
 
 const FILE_REQUEST_TYPES = ["list", "read", "download", "meta", "preview", "watch"] as const;
 type FileRequestType = typeof FILE_REQUEST_TYPES[number];
@@ -41,17 +43,28 @@ const MAX_UPLOAD_TOTAL_BYTES = 100 * 1024 * 1024;
 // Multipart boundaries and headers are not file bytes, but must be bounded too.
 const MAX_UPLOAD_REQUEST_BYTES = MAX_UPLOAD_TOTAL_BYTES + 1024 * 1024;
 
+// The source view highlights every language here but text, pdf and word with
+// the Prism grammar of that name (refractor/all); a name it lacks renders
+// plain. "html" and "markdown" also turn on FileViewer's Preview, so templates
+// that are not pages take "markup". `.m` stays plain: Objective-C and MATLAB
+// both use it.
 const EXT_TO_LANGUAGE: Record<string, string> = {
-  ts: "typescript", tsx: "typescript", js: "javascript", jsx: "javascript",
-  mjs: "javascript", cjs: "javascript", py: "python", rb: "ruby",
-  go: "go", rs: "rust", java: "java", kt: "kotlin", swift: "swift",
-  c: "c", cpp: "cpp", h: "c", hpp: "cpp", cs: "csharp",
-  html: "html", htm: "html", css: "css", scss: "css", less: "css",
+  ts: "typescript", tsx: "tsx", mts: "typescript", cts: "typescript",
+  js: "javascript", jsx: "jsx", mjs: "javascript", cjs: "javascript",
+  py: "python", rb: "ruby", php: "php", lua: "lua", pl: "perl", r: "r",
+  go: "go", rs: "rust", java: "java", kt: "kotlin", kts: "kotlin", swift: "swift",
+  scala: "scala", groovy: "groovy", gradle: "groovy", dart: "dart", zig: "zig",
+  c: "c", cpp: "cpp", h: "c", hpp: "cpp", cs: "csharp", mm: "objectivec",
+  ex: "elixir", exs: "elixir", hs: "haskell", ml: "ocaml", clj: "clojure", nix: "nix",
+  html: "html", htm: "html", vue: "markup", svelte: "markup", astro: "markup",
+  css: "css", scss: "scss", less: "less",
   json: "json", jsonl: "json", yaml: "yaml", yml: "yaml",
-  toml: "toml", xml: "xml", md: "markdown", mdx: "markdown",
+  toml: "toml", ini: "ini", cfg: "ini", properties: "properties",
+  xml: "xml", md: "markdown", mdx: "markdown", tex: "latex",
   sh: "bash", bash: "bash", zsh: "bash", fish: "bash",
-  sql: "sql", graphql: "graphql", gql: "graphql",
-  dockerfile: "dockerfile", tf: "hcl", hcl: "hcl",
+  ps1: "powershell", psm1: "powershell", bat: "batch", cmd: "batch",
+  sql: "sql", graphql: "graphql", gql: "graphql", proto: "protobuf",
+  dockerfile: "dockerfile", tf: "hcl", hcl: "hcl", diff: "diff", patch: "diff",
   env: "bash", gitignore: "bash", txt: "text",
   pdf: "pdf", docx: "word",
 };
@@ -518,7 +531,7 @@ export async function GET(
       }
       const chunk = readTextPreviewChunk(filePath, stat.size, offset);
       const language = getLanguage(filePath);
-      return NextResponse.json({ ...chunk, language, size: stat.size });
+      return NextResponse.json({ ...chunk, language, size: stat.size, mtime: stat.mtime.toISOString() });
     }
 
     if (type === "download") {
@@ -539,6 +552,8 @@ export async function GET(
       const documentMime = getDocumentMime(filePath);
       return NextResponse.json({
         size: stat.size,
+        // The watch's `change` events carry the same pair (lib/file-version.ts).
+        mtime: stat.mtime.toISOString(),
         language: getLanguage(filePath),
         mime: imageMime || audioMime || videoMime || documentMime || "text/plain",
         previewKind: documentPreviewKind(filePath),
@@ -581,6 +596,8 @@ export async function GET(
         return NextResponse.json({ error: "Not a file" }, { status: 400 });
       }
       let watcher: fs.FSWatcher | null = null;
+      // The debug panel's count of open watches; released when the watcher fails or the client cancels.
+      let releaseWatch: (() => void) | null = null;
       let lastMtimeMs = stat?.mtimeMs ?? 0;
       let lastCtimeMs = stat?.ctimeMs ?? 0;
       let lastIno = stat?.ino ?? 0;
@@ -629,8 +646,29 @@ export async function GET(
             watcher.on("error", () => {
               try { watcher?.close(); } catch { /* ignore */ }
               watcher = null;
+              releaseWatch?.();
               try { controller.close(); } catch { /* ignore */ }
             });
+            // Counted, and listed under the page that opened it (`?holder=`).
+            const releaseCount = registerFileWatch();
+            const releasePage = registerPageStream(pageStreamLabel("file-watch", request));
+            releaseWatch = () => {
+              releaseCount();
+              releasePage();
+            };
+            // A client gone without a cancel (a phone off the network) would keep
+            // the watcher, and its place in the debug panel's count, forever.
+            const onAbort = () => {
+              try { watcher?.close(); } catch { /* ignore */ }
+              watcher = null;
+              releaseWatch?.();
+              try { controller.close(); } catch { /* ignore */ }
+            };
+            if (request.signal.aborted) {
+              onAbort();
+              return;
+            }
+            request.signal.addEventListener("abort", onAbort, { once: true });
             // The client snapshots only after this event, so emit it after the
             // watcher exists to avoid dropping changes between those steps.
             send("connected", { filePath });
@@ -641,6 +679,7 @@ export async function GET(
         },
         cancel() {
           try { watcher?.close(); } catch { /* ignore */ }
+          releaseWatch?.();
         },
       });
       return new Response(stream, {

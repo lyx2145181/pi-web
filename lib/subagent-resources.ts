@@ -193,6 +193,12 @@ export async function createSubagentSessionServices(options: CreateAgentSessionS
     addExplicitResources(catalog, selections, cwd, agentDir);
     const skills = selectCatalogResources(catalog.skills, selections.skills, cwd);
     const extensions = selectCatalogResources(catalog.extensions, selections.extensions, cwd);
+    // A formal spawn/restoration cannot silently run with an incomplete frozen selection.
+    // Static catalogs and editable drafts still retain unknown entries as diagnostics.
+    const selectionErrors = [...skills.diagnostics, ...extensions.diagnostics];
+    if (policy.version !== undefined && selectionErrors.length > 0) {
+      throw new Error(`Cannot load subagent resources: ${selectionErrors.map((entry) => entry.message).join("; ")}`);
+    }
     const projectIdentities = projectExtensionIdentities(catalog.extensions, selections.extensions, cwd);
     const trusted = getProjectTrustStatus(cwd, agentDir, { additionalProjectResources: extensions.items.some((entry) => projectIdentities.has(entry.identity)) }).trusted;
     source.setProjectTrusted(trusted);

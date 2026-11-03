@@ -1,9 +1,10 @@
 /**
  * Per-browser sidebar preferences: the active tab (sessions or files), the
- * user's explicit project group expand/collapse choices, whether the pinned
- * section is collapsed, whether the files section below the sessions is
- * collapsed, whether the files tab or section lists ignored files, and the
- * folders the worktree listing last found outside git.
+ * user's explicit project group expand/collapse choices, the archive view's
+ * folded projects, whether the pinned section is collapsed, whether the files section below the sessions is
+ * collapsed, whether the files tab or section lists ignored files, whether the
+ * Git changes panel shows a flat list or a folder tree, and the folders the
+ * worktree listing last found outside git.
  * Best-effort localStorage, like the other sidebar memories: privacy mode or
  * quota errors fall back to defaults.
  */
@@ -17,9 +18,11 @@ const GROUP_EXPANSION_STORAGE_KEY = "pi-web:sidebar-groups-v2";
  * move to v2 (loadGroupExpansion).
  */
 const LEGACY_GROUP_EXPANSION_STORAGE_KEY = "pi-web:sidebar-groups";
+const ARCHIVE_COLLAPSED_STORAGE_KEY = "pi-web:sidebar-archive-collapsed";
 const PINNED_COLLAPSED_STORAGE_KEY = "pi-web:sidebar-pins-collapsed";
 const SHOW_IGNORED_FILES_STORAGE_KEY = "pi-web:sidebar-files-show-ignored";
 const FILES_COLLAPSED_STORAGE_KEY = "pi-web:sidebar-files-collapsed";
+const CHANGES_VIEW_MODE_STORAGE_KEY = "pi-web:sidebar-changes-view-mode";
 const NON_GIT_CWDS_STORAGE_KEY = "pi-web:sidebar-non-git-cwds";
 /**
  * Keys nothing reads now: the sessions/explorer split's, which the two tabs
@@ -34,6 +37,9 @@ const MAX_GROUP_EXPANSION_ENTRIES = 300;
 const MAX_NON_GIT_CWDS = 50;
 
 export type SidebarTab = "sessions" | "files";
+
+/** Flat list (default) or folder tree for the Git changes panel. */
+export type ChangesViewMode = "list" | "tree";
 
 interface StorageLike {
   getItem(key: string): string | null;
@@ -128,6 +134,37 @@ export function saveGroupExpansion(
   }
 }
 
+/**
+ * The archive view's folded projects (project keys, oldest choice first). Its
+ * groups are open unless folded here: apart from the main tree's choices, so
+ * folding a project's archive never folds its live sessions.
+ */
+export function loadArchiveCollapsed(storage: StorageLike | null = getBrowserStorage()): string[] {
+  if (!storage) return [];
+  try {
+    const raw = storage.getItem(ARCHIVE_COLLAPSED_STORAGE_KEY);
+    const value: unknown = raw === null ? [] : JSON.parse(raw);
+    if (!Array.isArray(value)) return [];
+    const keys = value.filter((key): key is string => typeof key === "string" && key !== "");
+    return [...new Set(keys)].slice(-MAX_GROUP_EXPANSION_ENTRIES);
+  } catch {
+    return [];
+  }
+}
+
+/** Keeps the newest 300 keys; to mark one as recent, put it last. */
+export function saveArchiveCollapsed(
+  keys: readonly string[],
+  storage: StorageLike | null = getBrowserStorage(),
+): void {
+  if (!storage) return;
+  try {
+    storage.setItem(ARCHIVE_COLLAPSED_STORAGE_KEY, JSON.stringify([...new Set(keys)].slice(-MAX_GROUP_EXPANSION_ENTRIES)));
+  } catch {
+    // Persistence is best-effort.
+  }
+}
+
 export function loadPinnedCollapsed(storage: StorageLike | null = getBrowserStorage()): boolean {
   if (!storage) return false;
   try {
@@ -191,6 +228,29 @@ export function saveFilesCollapsed(
   if (!storage) return;
   try {
     storage.setItem(FILES_COLLAPSED_STORAGE_KEY, String(collapsed));
+  } catch {
+    // Persistence is best-effort.
+  }
+}
+
+
+/** Flat list unless the browser saved tree mode for the Git changes panel. */
+export function loadChangesViewMode(storage: StorageLike | null = getBrowserStorage()): ChangesViewMode {
+  if (!storage) return "list";
+  try {
+    return storage.getItem(CHANGES_VIEW_MODE_STORAGE_KEY) === "tree" ? "tree" : "list";
+  } catch {
+    return "list";
+  }
+}
+
+export function saveChangesViewMode(
+  mode: ChangesViewMode,
+  storage: StorageLike | null = getBrowserStorage(),
+): void {
+  if (!storage) return;
+  try {
+    storage.setItem(CHANGES_VIEW_MODE_STORAGE_KEY, mode);
   } catch {
     // Persistence is best-effort.
   }

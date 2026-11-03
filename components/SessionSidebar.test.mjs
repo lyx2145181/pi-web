@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { createJiti } from "jiti";
+import ts from "typescript";
+import vm from "node:vm";
 
 const jiti = createJiti(import.meta.url, { jsx: { runtime: "automatic" }, tsconfigPaths: true });
 const React = await jiti.import("react");
 const { renderToStaticMarkup } = await jiti.import("react-dom/server");
-const { I18nProvider } = await jiti.import("@/hooks/useI18n.tsx");
+const { I18nProvider } = await jiti.import("@/hooks/useI18n");
 const { SessionSidebar, nearestEnabledKey, handOffDisabledKeyFocus, sameIdsOr } = await jiti.import("./SessionSidebar.tsx");
 const { buildSessionTree, getRowOffsets, getVisibleRowIndices } = await jiti.import("@/lib/session-tree.ts");
 const { SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MIN_WIDTH } = await jiti.import("@/lib/panel-layout.ts");
@@ -430,4 +432,54 @@ test("the running poll keeps the same Set while the running ids stay the same", 
   assert.deepEqual([...sameIdsOr(previous, ["a", "c"])], ["a", "c"]);
   const empty = new Set();
   assert.equal(sameIdsOr(empty, []), empty);
+});
+
+test("a read or a mark in another tab reaches this one: the storage handler adopts that tab's write", () => {
+  const parse = between("function parseUnreadSessionIds(", "\nfunction loadUnreadSessionIds");
+  const handler = between("const onStorage = (event: StorageEvent) => {", '\n    window.addEventListener("storage", onStorage);');
+  const code = ts.transpileModule(`${parse}\n${handler}`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2020 },
+  }).outputText;
+  const updaters = [];
+  const onStorage = vm.runInNewContext(`${code}\nonStorage`, {
+    UNREAD_SESSIONS_STORAGE_KEY: "pi-web:unread-session-ids",
+    sameIdsOr,
+    setUnreadSessionIds: (updater) => updaters.push(updater),
+  });
+
+  // Another key's write never touches the unread markers.
+  onStorage({ key: "pi-web:terminal-theme", newValue: '["a"]' });
+  assert.equal(updaters.length, 0);
+
+  // The other tab read the session: the key (or all of storage) went away.
+  onStorage({ key: "pi-web:unread-session-ids", newValue: null });
+  assert.deepEqual([...updaters.pop()(new Set(["a", "b"]))], []);
+
+  // The other tab wrote a newer set; it replaces this tab's, stale markers and all.
+  onStorage({ key: "pi-web:unread-session-ids", newValue: '["a","b","b","c"]' });
+  assert.deepEqual([...updaters.pop()(new Set(["a", "d"]))].sort(), ["a", "b", "c"]);
+
+  // The same set keeps the same Set: no re-render, so no echo of the write back.
+  onStorage({ key: "pi-web:unread-session-ids", newValue: '["a"]' });
+  const unchanged = new Set(["a"]);
+  assert.equal(updaters.pop()(unchanged), unchanged);
+
+  // A malformed write means no markers, not a crash.
+  onStorage({ key: "pi-web:unread-session-ids", newValue: "{not json" });
+  assert.deepEqual([...updaters.pop()(new Set(["a"]))], []);
+
+  // The listener is registered for the storage event and taken off again.
+  assert.match(source, /window\.addEventListener\("storage", onStorage\);/);
+  assert.match(source, /window\.removeEventListener\("storage", onStorage\);/);
+});
+
+test("the favicon counts sessions that finished while the tab was hidden (#1484)", () => {
+  // The rows exclude the selected session ("already looking"), which is false
+  // while hidden: the badge takes those ids as a separate prop instead.
+  assert.match(source, /hiddenFinishedSessionIds\?: Set<string>;/);
+  assert.match(source, /countFaviconUnread\(unreadSessionIds, hiddenFinishedSessionIds\)/);
+  assert.match(
+    source,
+    /\}, \[awaitingInputSessionIds, unreadSessionIds, hiddenFinishedSessionIds\]\);/,
+  );
 });

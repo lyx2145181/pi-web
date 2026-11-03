@@ -126,6 +126,8 @@ export interface SubagentResultMetadata {
   result?: string;
   error?: string;
   worktreeCleanupError?: string;
+  /** Whether an isolated run's worktree path still existed when this entry was written (#1202). */
+  worktreeExists?: boolean;
 }
 
 export interface SubagentStatusMetadata {
@@ -150,6 +152,8 @@ export interface SubagentRunInfo {
   worktreePath?: string;
   worktreeBranch?: string;
   worktreeCleanupError?: string;
+  /** Set once the run's result is recorded, as `SubagentResultMetadata.worktreeExists`. */
+  worktreeExists?: boolean;
   /** Set on a run started by `resume`, which reuses the session ID of an earlier run. Not persisted. */
   resumed?: boolean;
 }
@@ -901,6 +905,14 @@ export function subagentExtensionLoaderOptions(resources: { loadExtensions: bool
   };
 }
 
+/**
+ * A persisted `running` / `queued` status with no live child was left by a process that
+ * stopped mid-run. Every listing must settle it, or a restart leaves a spinner forever.
+ */
+export function settleOrphanedSubagentStatus(status: SubagentStatus): SubagentStatus {
+  return status === "running" || status === "queued" ? "interrupted" : status;
+}
+
 export function readSubagentRun(entries: readonly SessionEntry[], sessionId: string, sessionPath: string): SubagentRunInfo | null {
   const data = subagentMetadataData(entries);
   if (!data) return null;
@@ -937,5 +949,6 @@ export function readSubagentRun(entries: readonly SessionEntry[], sessionId: str
     ...(typeof data.worktreePath === "string" ? { worktreePath: data.worktreePath } : {}),
     ...(typeof data.worktreeBranch === "string" ? { worktreeBranch: data.worktreeBranch } : {}),
     ...(result && typeof result.worktreeCleanupError === "string" ? { worktreeCleanupError: result.worktreeCleanupError } : {}),
+    ...(result && typeof result.worktreeExists === "boolean" ? { worktreeExists: result.worktreeExists } : {}),
   };
 }

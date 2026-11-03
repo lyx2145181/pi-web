@@ -13,10 +13,12 @@ import {
 } from "@/lib/file-paths";
 import type { GitFileStatus, GitFileStatusKind, GitStatusResponse } from "@/lib/git-types";
 import type { FileIndexEntry } from "@/lib/file-fuzzy";
-import { uploadFiles, type UploadConflictStrategy, type UploadError, type UploadResponse } from "@/lib/file-upload-client";
+import { uploadFiles, type DroppedItem, type UploadConflictStrategy, type UploadError, type UploadResponse } from "@/lib/file-upload-client";
 import { buildSearchTree, type SearchTreeNode } from "@/lib/search-tree";
 import type { FileTreeHiddenReason } from "@/lib/file-tree-visibility";
 import { createExpandedPathsMemory } from "@/lib/file-tree-expansion";
+import { loadChangesViewMode, saveChangesViewMode, type ChangesViewMode } from "@/lib/sidebar-prefs";
+import { droppedItems } from "@/hooks/useDragDrop";
 import { useI18n } from "@/hooks/useI18n";
 type Translate = ReturnType<typeof useI18n>["t"];
 
@@ -73,12 +75,14 @@ type UploadPhase = "idle" | "checking" | "uploading";
 const expandedPathsByCwd = createExpandedPathsMemory();
 
 interface UploadSummary {
+  directory: string;
   uploaded: string[];
   skipped: string[];
   errors: UploadError[];
 }
 
 interface PendingConflict {
+  directory: string;
   files: File[];
   conflicts: string[];
   nonReplaceable: string[];
@@ -213,6 +217,9 @@ export function TreeNode({
   changedDirectoryPaths,
   showHidden = false,
   parentHidden,
+  dropTargetPath,
+  onDropFiles,
+  onDropTargetChange,
   t,
 }: {
   node: FileNode;
@@ -229,10 +236,14 @@ export function TreeNode({
   showHidden?: boolean;
   /** Set inside a hidden directory: Git has no answer there, so its entries inherit the reason. */
   parentHidden?: HiddenReason;
+  dropTargetPath?: string | null;
+  onDropFiles?: (directory: string, items: DroppedItem[]) => void;
+  onDropTargetChange?: (path: string | null) => void;
   t: Translate;
 }) {
   const open = expandedPaths.has(node.fullPath);
   const hidden = node.hidden ?? parentHidden;
+  const isDropTarget = node.isDir && dropTargetPath === node.fullPath;
   const highlighted = highlightedPaths.has(node.fullPath);
   const normalizedPath = normalizeFilePathSlashes(node.fullPath);
   const gitStatus = gitStatusByPath.get(normalizedPath);
@@ -294,11 +305,12 @@ export function TreeNode({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Re-fetch children when the tree refreshes and the directory is open.
+  // Re-fetch children when the tree refreshes: an open directory now, a
+  // collapsed one when it next opens (a file dropped onto its row).
   useEffect(() => {
-    if (refreshToken !== undefined && open && loaded && !pendingLinkTarget) {
-      loadChildren(true);
-    }
+    if (refreshToken === undefined || !loaded || pendingLinkTarget) return;
+    if (open) loadChildren(true);
+    else setLoaded(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshToken]);
 
@@ -339,6 +351,20 @@ export function TreeNode({
         onClick={handleClick}
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
+        onDragOver={node.isDir ? (event) => {
+          if (!event.dataTransfer.types.includes("Files")) return;
+          event.preventDefault();
+          event.stopPropagation();
+          event.dataTransfer.dropEffect = "copy";
+          onDropTargetChange?.(node.fullPath);
+        } : undefined}
+        onDrop={node.isDir ? (event) => {
+          if (!event.dataTransfer.types.includes("Files")) return;
+          event.preventDefault();
+          event.stopPropagation();
+          onDropTargetChange?.(null);
+          onDropFiles?.(node.fullPath, droppedItems(event.dataTransfer));
+        } : undefined}
         style={{
           position: "relative",
           display: "flex",
@@ -346,9 +372,15 @@ export function TreeNode({
           gap: 4,
           paddingLeft: 8 + depth * 14,
           paddingRight: 8,
-          height: 24,
+          height: "var(--file-row-height)",
           cursor: "pointer",
-          background: hovered ? "var(--bg-hover)" : "transparent",
+          background: isDropTarget
+            ? "color-mix(in srgb, var(--accent) 16%, transparent)"
+            : hovered
+              ? "var(--bg-hover)"
+              : "transparent",
+          outline: isDropTarget ? "1px dashed var(--accent)" : "none",
+          outlineOffset: -1,
           borderRadius: 4,
           userSelect: "none",
         }}
@@ -440,7 +472,7 @@ export function TreeNode({
               justifyContent: "center",
               gap: 4,
               padding: "0 8px",
-              height: 20,
+              height: "calc(var(--file-row-height) - 4px)",
               background: "var(--bg-panel)",
               border: "1px solid var(--border)",
               borderRadius: 4,
@@ -471,7 +503,7 @@ export function TreeNode({
               justifyContent: "center",
               gap: 4,
               padding: "0 5px",
-              height: 20,
+              height: "calc(var(--file-row-height) - 4px)",
               background: "var(--bg-panel)",
               border: "1px solid var(--border)",
               borderRadius: 4,
@@ -516,7 +548,7 @@ export function TreeNode({
             disabled={allowingLink}
             title={t("files.allowOutsideLinkTitle", { target: pendingLinkTarget })}
             style={{
-              height: 20,
+              height: "calc(var(--file-row-height) - 4px)",
               padding: "0 8px",
               background: "var(--bg-panel)",
               border: "1px solid var(--border)",
@@ -554,6 +586,9 @@ export function TreeNode({
               changedDirectoryPaths={changedDirectoryPaths}
               showHidden={showHidden}
               parentHidden={hidden}
+              dropTargetPath={dropTargetPath}
+              onDropFiles={onDropFiles}
+              onDropTargetChange={onDropTargetChange}
               t={t}
             />
           ))}
@@ -583,20 +618,24 @@ function ChangeRow({
   onOpenFile,
   onAtMention,
   t,
+  depth = 0,
+  treeMode = false,
 }: {
   status: GitFileStatus;
   cwd: string;
   onOpenFile: OpenFileHandler;
   onAtMention?: (relativePath: string, isDir: boolean) => void;
   t: Translate;
+  depth?: number;
+  treeMode?: boolean;
 }) {
   const [hovered, setHovered] = useState(false);
   const name = getFileName(status.filePath);
   const rel = getRelativeFilePath(status.filePath, cwd);
   // Split the path so the directory part ellipsizes while the file name stays fully visible
   const lastSlash = rel.lastIndexOf("/");
-  const dirPart = lastSlash >= 0 ? rel.slice(0, lastSlash + 1) : "";
-  const baseName = lastSlash >= 0 ? rel.slice(lastSlash + 1) : rel;
+  const dirPart = !treeMode && lastSlash >= 0 ? rel.slice(0, lastSlash + 1) : "";
+  const baseName = treeMode ? name : (lastSlash >= 0 ? rel.slice(lastSlash + 1) : rel);
   return (
     <div
       onClick={() => onOpenFile(status.filePath, name, { modeHint: "diff" })}
@@ -606,10 +645,10 @@ function ChangeRow({
       style={{
         display: "flex",
         alignItems: "center",
-        gap: 6,
-        paddingLeft: 10,
+        gap: treeMode ? 4 : 6,
+        paddingLeft: treeMode ? 8 + depth * 14 : 10,
         paddingRight: 8,
-        height: 24,
+        height: "var(--file-row-height)",
         cursor: "pointer",
         background: hovered ? "var(--bg-hover)" : "transparent",
         borderRadius: 4,
@@ -618,6 +657,7 @@ function ChangeRow({
       }}
     >
       <GitStatusBadge status={status} t={t} />
+      {treeMode && <span style={{ width: 10, flexShrink: 0 }} />}
       <span style={{ flexShrink: 0, display: "flex", alignItems: "center", opacity: 0.85 }}>
         {getFileIcon(name, 13)}
       </span>
@@ -651,7 +691,7 @@ function ChangeRow({
             overflow: "hidden",
             textOverflow: "ellipsis",
             whiteSpace: "nowrap",
-            flexShrink: 0,
+            flexShrink: treeMode ? 1 : 0,
             maxWidth: "100%",
           }}
         >
@@ -675,7 +715,7 @@ function ChangeRow({
             justifyContent: "center",
             gap: 4,
             padding: "0 8px",
-            height: 20,
+            height: "calc(var(--file-row-height) - 4px)",
             background: "var(--bg-panel)",
             border: "1px solid var(--border)",
             borderRadius: 4,
@@ -691,6 +731,154 @@ function ChangeRow({
         </button>
       )}
     </div>
+  );
+}
+
+function ChangesFolderRow({
+  node,
+  depth,
+  open,
+  onToggle,
+}: {
+  node: SearchTreeNode;
+  depth: number;
+  open: boolean;
+  onToggle: (path: string, open: boolean) => void;
+}) {
+  const [hovered, setHovered] = useState(false);
+  return (
+    <div
+      onClick={() => onToggle(node.path, !open)}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      title={node.path}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 4,
+        paddingLeft: 8 + depth * 14,
+        paddingRight: 8,
+        height: "var(--file-row-height)",
+        cursor: "pointer",
+        background: hovered ? "var(--bg-hover)" : "transparent",
+        borderRadius: 4,
+        userSelect: "none",
+      }}
+    >
+      <svg
+        width="10" height="10" viewBox="0 0 10 10" fill="none"
+        stroke="var(--text-dim)" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"
+        style={{ flexShrink: 0, transform: open ? "rotate(90deg)" : "none", transition: "transform 0.1s" }}
+        aria-hidden="true"
+      >
+        <polyline points="3 2 7 5 3 8" />
+      </svg>
+      <span style={{ flexShrink: 0, display: "flex", alignItems: "center" }}>
+        <FolderIcon size={14} open={open} />
+      </span>
+      <span
+        style={{
+          fontSize: 12,
+          color: "var(--text)",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+          flex: 1,
+        }}
+      >
+        {node.name}
+      </span>
+    </div>
+  );
+}
+
+function ChangesTreeRows({
+  nodes,
+  depth,
+  cwd,
+  statusByPath,
+  collapsedPaths,
+  onToggleExpanded,
+  onOpenFile,
+  onAtMention,
+  t,
+}: {
+  nodes: SearchTreeNode[];
+  depth: number;
+  cwd: string;
+  statusByPath: Map<string, GitFileStatus>;
+  collapsedPaths: Set<string>;
+  onToggleExpanded: (path: string, open: boolean) => void;
+  onOpenFile: OpenFileHandler;
+  onAtMention?: (relativePath: string, isDir: boolean) => void;
+  t: Translate;
+}) {
+  return (
+    <>
+      {nodes.map((node) => {
+        if (node.isDir) {
+          const open = !collapsedPaths.has(node.path);
+          return (
+            <div key={`dir:${node.path}`}>
+              <ChangesFolderRow
+                node={node}
+                depth={depth}
+                open={open}
+                onToggle={onToggleExpanded}
+              />
+              {open && (
+                <ChangesTreeRows
+                  nodes={node.children}
+                  depth={depth + 1}
+                  cwd={cwd}
+                  statusByPath={statusByPath}
+                  collapsedPaths={collapsedPaths}
+                  onToggleExpanded={onToggleExpanded}
+                  onOpenFile={onOpenFile}
+                  onAtMention={onAtMention}
+                  t={t}
+                />
+              )}
+            </div>
+          );
+        }
+        const status = statusByPath.get(node.path);
+        if (!status) return null;
+        return (
+          <ChangeRow
+            key={status.filePath}
+            status={status}
+            cwd={cwd}
+            onOpenFile={onOpenFile}
+            onAtMention={onAtMention}
+            t={t}
+            depth={depth}
+            treeMode
+          />
+        );
+      })}
+    </>
+  );
+}
+
+function ChangesViewToggleIcon({ mode }: { mode: ChangesViewMode }) {
+  if (mode === "tree") {
+    // List icon: switching back to the flat list
+    return (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <path d="M8 6h13" /><path d="M8 12h13" /><path d="M8 18h13" />
+        <path d="M3 6h.01" /><path d="M3 12h.01" /><path d="M3 18h.01" />
+      </svg>
+    );
+  }
+  // Tree icon: switching to the folder tree
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M6 3v12" /><path d="M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" />
+      <path d="M6 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" />
+      <path d="M18 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6z" />
+      <path d="M9 12h6" /><path d="M12 12v3" />
+    </svg>
   );
 }
 
@@ -716,6 +904,9 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
   const [highlightedPaths, setHighlightedPaths] = useState<Set<string>>(new Set());
   const [gitFiles, setGitFiles] = useState<GitFileStatus[]>([]);
   const [gitLineStats, setGitLineStats] = useState({ additions: 0, deletions: 0 });
+  const [changesViewMode, setChangesViewMode] = useState<ChangesViewMode>("list");
+  // Folders stay open unless collapsed here, so a refresh or a newly changed folder never folds them.
+  const [collapsedChangeDirs, setCollapsedChangeDirs] = useState<Set<string>>(() => new Set());
   const [uploadPhase, setUploadPhase] = useState<UploadPhase>("idle");
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadError, setUploadError] = useState<string | null>(null);
@@ -727,6 +918,9 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
   const [searchError, setSearchError] = useState(false);
   const [searchExpanded, setSearchExpanded] = useState<Set<string>>(new Set());
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const [fileDragActive, setFileDragActive] = useState(false);
+  const [dropTargetPath, setDropTargetPath] = useState<string | null>(null);
+  const fileDragDepthRef = useRef(0);
   const prevCwdRef = useRef<string | null>(null);
   const expandedPathsRef = useRef(expandedPaths);
   const uploadInputRef = useRef<HTMLInputElement>(null);
@@ -822,6 +1016,12 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
     return directories;
   }, [cwd, gitFiles]);
 
+  const changesByRelativePath = useMemo(() => new Map(gitFiles.map((status) => [
+    normalizeFilePathSlashes(getRelativeFilePath(status.filePath, cwd)).replace(/^\/+/, ""),
+    status,
+  ])), [cwd, gitFiles]);
+  const changesTree = useMemo(() => buildSearchTree([...changesByRelativePath.keys()]), [changesByRelativePath]);
+
   const handleToggleExpanded = useCallback((fullPath: string, open: boolean) => {
     setExpandedPaths((prev) => {
       const next = new Set(prev);
@@ -830,21 +1030,22 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
     });
   }, []);
 
-  const applyUploadResult = useCallback((data: UploadResponse) => {
+  const applyUploadResult = useCallback((data: UploadResponse, directory: string) => {
     const uploaded = data.uploaded ?? [];
     const skipped = data.skipped ?? [];
     const errors = data.errors ?? [];
-    setUploadSummary({ uploaded, skipped, errors });
+    setUploadSummary({ directory, uploaded, skipped, errors });
 
     if (uploaded.length > 0) {
-      setHighlightedPaths(new Set(uploaded.map((name) => joinFilePath(cwd, name))));
+      setHighlightedPaths(new Set(uploaded.map((name) => joinFilePath(directory, name))));
       setTreeRefreshKey((key) => key + 1);
     }
-  }, [cwd]);
+  }, []);
 
   const performUpload = useCallback(async (
     files: File[],
     strategy: UploadConflictStrategy,
+    directory: string,
   ) => {
     setPendingConflict(null);
     setUploadError(null);
@@ -852,9 +1053,10 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
     setUploadPhase("uploading");
 
     try {
-      const { status, data } = await uploadFiles(cwd, files, strategy, setUploadProgress);
+      const { status, data } = await uploadFiles(directory, files, strategy, setUploadProgress);
       if (status === 409 && data.conflicts?.length) {
         setPendingConflict({
+          directory,
           files,
           conflicts: data.conflicts,
           nonReplaceable: data.nonReplaceable ?? [],
@@ -865,15 +1067,15 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
         throw new Error(data.error ?? `Upload failed (HTTP ${status})`);
       }
       setUploadProgress(100);
-      applyUploadResult(data);
+      applyUploadResult(data, directory);
     } catch (uploadFailure) {
       setUploadError(uploadFailure instanceof Error ? uploadFailure.message : String(uploadFailure));
     } finally {
       setUploadPhase("idle");
     }
-  }, [applyUploadResult, cwd]);
+  }, [applyUploadResult]);
 
-  const prepareUpload = useCallback(async (files: File[]) => {
+  const prepareUpload = useCallback(async (files: File[], directory: string) => {
     if (files.length === 0 || uploadBusy) return;
     setUploadSummary(null);
     setHighlightedPaths(new Set());
@@ -884,7 +1086,7 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
 
     try {
       const res = await fetch(
-        `/api/files/${encodeFilePathForApi(cwd)}?type=upload-check`,
+        `/api/files/${encodeFilePathForApi(directory)}?type=upload-check`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -896,6 +1098,7 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
 
       if (data.conflicts?.length) {
         setPendingConflict({
+          directory,
           files,
           conflicts: data.conflicts,
           nonReplaceable: data.nonReplaceable ?? [],
@@ -903,25 +1106,82 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
         return;
       }
 
-      await performUpload(files, "error");
+      await performUpload(files, "error", directory);
     } catch (uploadFailure) {
       setUploadError(uploadFailure instanceof Error ? uploadFailure.message : String(uploadFailure));
     } finally {
       setUploadPhase("idle");
     }
-  }, [cwd, performUpload, uploadBusy]);
+  }, [performUpload, uploadBusy]);
 
   const handleUploadInput = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(event.target.files ?? []);
     event.target.value = "";
-    void prepareUpload(files);
-  }, [prepareUpload]);
+    void prepareUpload(files, cwd);
+  }, [cwd, prepareUpload]);
 
   useImperativeHandle(ref, () => ({
     openUploadPicker() {
       if (!uploadBusy) uploadInputRef.current?.click();
     },
   }), [uploadBusy]);
+
+  const resetFileDrag = useCallback(() => {
+    fileDragDepthRef.current = 0;
+    setFileDragActive(false);
+    setDropTargetPath(null);
+  }, []);
+
+  const handleExplorerDragEnter = useCallback((event: React.DragEvent) => {
+    if (!event.dataTransfer.types.includes("Files")) return;
+    event.preventDefault();
+    fileDragDepthRef.current += 1;
+    setFileDragActive(true);
+  }, []);
+
+  const handleExplorerDragOver = useCallback((event: React.DragEvent) => {
+    if (!event.dataTransfer.types.includes("Files")) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+    // Directory rows stop dragover propagation, so this handler only runs
+    // while hovering the panel background: those uploads target the cwd.
+    setDropTargetPath((prev) => (prev === null ? prev : null));
+  }, []);
+
+  const handleExplorerDragLeave = useCallback(() => {
+    if (fileDragDepthRef.current <= 0) return;
+    fileDragDepthRef.current -= 1;
+    if (fileDragDepthRef.current === 0) {
+      fileDragDepthRef.current = 0;
+      setFileDragActive(false);
+      setDropTargetPath(null);
+    }
+  }, []);
+
+  const handleDropFiles = useCallback((directory: string, items: DroppedItem[]) => {
+    resetFileDrag();
+    // The endpoint writes files only: a dropped folder would fail the whole
+    // upload, so folders are left out with the chat drop's notice.
+    const files = items.flatMap((item) => (item.kind === "file" ? [item.file] : []));
+    const folders = items.flatMap((item) => (item.kind === "folder" ? [item.name] : []));
+    void prepareUpload(files, directory).then(() => {
+      if (folders.length === 0) return;
+      const notice = t("chat.dropFoldersUnsupported", { names: folders.join(", ") });
+      // An error from this upload says why its files did not land: keep it.
+      setUploadError((error) => (error && files.length > 0 ? error : notice));
+    });
+  }, [prepareUpload, resetFileDrag, t]);
+
+  const handleExplorerDrop = useCallback((event: React.DragEvent) => {
+    if (!event.dataTransfer.types.includes("Files")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    handleDropFiles(dropTargetPath ?? cwd, droppedItems(event.dataTransfer));
+  }, [cwd, dropTargetPath, handleDropFiles]);
+
+  const handleDropTargetChange = useCallback((path: string | null) => {
+    setDropTargetPath((prev) => (prev === path ? prev : path));
+  }, []);
 
   useEffect(() => {
     onUploadBusyChange?.(uploadBusy);
@@ -1000,17 +1260,43 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
     onChangesCountChange?.(gitFiles.length);
   }, [gitFiles, onChangesCountChange]);
 
+  useEffect(() => {
+    setChangesViewMode(loadChangesViewMode());
+  }, []);
+
+  const handleToggleChangesExpanded = useCallback((path: string, open: boolean) => {
+    setCollapsedChangeDirs((prev) => {
+      const next = new Set(prev);
+      if (open) next.delete(path); else next.add(path);
+      return next;
+    });
+  }, []);
+
+  const handleChangesViewModeToggle = useCallback(() => {
+    setChangesViewMode((prev) => {
+      const next: ChangesViewMode = prev === "list" ? "tree" : "list";
+      saveChangesViewMode(next);
+      return next;
+    });
+  }, []);
+
   const showUploadFeedback = uploadBusy || pendingConflict !== null || uploadError !== null || uploadSummary !== null;
 
   const addUploadedFilesToChat = useCallback(() => {
     if (!uploadSummary || uploadSummary.uploaded.length === 0) return;
     onAtMentions?.(
-      uploadSummary.uploaded.map((name) => getRelativeFilePath(joinFilePath(cwd, name), cwd)),
+      uploadSummary.uploaded.map((name) => getRelativeFilePath(joinFilePath(uploadSummary.directory, name), cwd)),
     );
   }, [cwd, onAtMentions, uploadSummary]);
 
   return (
-    <div style={{ minHeight: "100%" }}>
+    <div
+      style={{ minHeight: "100%" }}
+      onDragEnter={handleExplorerDragEnter}
+      onDragOver={handleExplorerDragOver}
+      onDragLeave={handleExplorerDragLeave}
+      onDrop={handleExplorerDrop}
+    >
       <input ref={uploadInputRef} type="file" multiple hidden onChange={handleUploadInput} />
       {showUploadFeedback && (
         <div style={{ padding: "6px 8px", borderBottom: "1px solid var(--border)" }}>
@@ -1049,10 +1335,10 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
               </div>
             )}
             <div style={{ display: "flex", gap: 5, marginTop: 7 }}>
-              <button type="button" onClick={() => void performUpload(pendingConflict.files, "overwrite")} style={{ height: 22, padding: "0 7px", border: "1px solid #ef4444", borderRadius: 4, background: "transparent", color: "#ef4444", cursor: "pointer", fontSize: 10 }}>
+              <button type="button" onClick={() => void performUpload(pendingConflict.files, "overwrite", pendingConflict.directory)} style={{ height: 22, padding: "0 7px", border: "1px solid #ef4444", borderRadius: 4, background: "transparent", color: "#ef4444", cursor: "pointer", fontSize: 10 }}>
                 {t("files.replace")}
               </button>
-              <button type="button" onClick={() => void performUpload(pendingConflict.files, "skip")} style={{ height: 22, padding: "0 7px", border: "1px solid var(--border)", borderRadius: 4, background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", fontSize: 10 }}>
+              <button type="button" onClick={() => void performUpload(pendingConflict.files, "skip", pendingConflict.directory)} style={{ height: 22, padding: "0 7px", border: "1px solid var(--border)", borderRadius: 4, background: "var(--bg-panel)", color: "var(--text)", cursor: "pointer", fontSize: 10 }}>
                 {t("files.skipExisting")}
               </button>
               <button type="button" onClick={() => setPendingConflict(null)} style={{ height: 22, padding: "0 7px", border: "none", borderRadius: 4, background: "transparent", color: "var(--text-muted)", cursor: "pointer", fontSize: 10 }}>
@@ -1074,7 +1360,7 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
             <div style={{ display: "flex", alignItems: "center", gap: 8, minHeight: 22, fontSize: 11 }}>
               <div style={{ minWidth: 0, flex: 1, display: "flex", alignItems: "center", gap: 8 }}>
                 {uploadSummary.uploaded.length > 0 && (
-                  <span title={`${uploadSummary.uploaded.length} uploaded`} aria-label={`${uploadSummary.uploaded.length} uploaded`} style={{ display: "flex", alignItems: "center", gap: 3, color: "#22c55e" }}>
+                  <span title={t("files.uploadedCount", { count: uploadSummary.uploaded.length })} aria-label={t("files.uploadedCount", { count: uploadSummary.uploaded.length })} style={{ display: "flex", alignItems: "center", gap: 3, color: "#22c55e" }}>
                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                       <path d="m5 12 4 4L19 6" />
                     </svg>
@@ -1082,7 +1368,7 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
                   </span>
                 )}
                 {uploadSummary.skipped.length > 0 && (
-                  <span title={`${uploadSummary.skipped.length} skipped`} aria-label={`${uploadSummary.skipped.length} skipped`} style={{ display: "flex", alignItems: "center", gap: 3, color: "var(--text-dim)" }}>
+                  <span title={t("files.skippedCount", { count: uploadSummary.skipped.length })} aria-label={t("files.skippedCount", { count: uploadSummary.skipped.length })} style={{ display: "flex", alignItems: "center", gap: 3, color: "var(--text-dim)" }}>
                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
                       <circle cx="12" cy="12" r="9" />
                       <path d="M8 12h8" />
@@ -1091,7 +1377,7 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
                   </span>
                 )}
                 {uploadSummary.errors.length > 0 && (
-                  <span title={`${uploadSummary.errors.length} failed`} aria-label={`${uploadSummary.errors.length} failed`} style={{ display: "flex", alignItems: "center", gap: 3, color: "#f87171" }}>
+                  <span title={t("files.failedCount", { count: uploadSummary.errors.length })} aria-label={t("files.failedCount", { count: uploadSummary.errors.length })} style={{ display: "flex", alignItems: "center", gap: 3, color: "#f87171" }}>
                     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                       <path d="M12 3 2.5 20h19L12 3Z" />
                       <path d="M12 9v4" />
@@ -1141,7 +1427,12 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
             id="file-search-input"
             value={searchQuery}
             onChange={(event) => setSearchQuery(event.target.value)}
-            onKeyDown={(event) => { if (event.key === "Escape") onFileSearchOpenChange?.(false); }}
+            onKeyDown={(event) => {
+              if (event.key !== "Escape") return;
+              // Handled here: the debug panel and other document listeners leave this Escape alone.
+              event.preventDefault();
+              onFileSearchOpenChange?.(false);
+            }}
             placeholder={t("sidebar.searchFilesPlaceholder")}
             aria-label={t("sidebar.searchFiles")}
             style={{ width: "100%", boxSizing: "border-box", padding: "6px 24px", border: "1px solid var(--border)", borderRadius: 8, outline: "none", background: "var(--bg)", color: "var(--text)", fontFamily: "var(--font-mono)", fontSize: 11 }}
@@ -1188,6 +1479,9 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
                     highlightedPaths={highlightedPaths}
                     gitStatusByPath={gitStatusByPath}
                     changedDirectoryPaths={changedDirectoryPaths}
+                    dropTargetPath={dropTargetPath}
+                    onDropFiles={handleDropFiles}
+                    onDropTargetChange={handleDropTargetChange}
                     t={t}
                   />
                 ))}
@@ -1206,31 +1500,71 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
               additions: gitLineStats.additions,
               deletions: gitLineStats.deletions,
             })}
-            style={{ display: "flex", alignItems: "center", gap: 6, height: 24, padding: "0 10px", fontSize: 12 }}
+            style={{ display: "flex", alignItems: "center", gap: 6, height: 24, padding: "0 6px 0 10px", fontSize: 12 }}
           >
             <span style={{ color: "var(--text-dim)" }}>
               {t("files.changedCount", { count: gitFiles.length })}
             </span>
             <span style={{ color: GIT_STATUS_COLORS.added, fontFamily: "var(--font-mono)" }}>+{gitLineStats.additions}</span>
             <span style={{ color: GIT_STATUS_COLORS.deleted, fontFamily: "var(--font-mono)" }}>-{gitLineStats.deletions}</span>
+            <span style={{ flex: 1 }} />
+            <button
+              type="button"
+              onClick={handleChangesViewModeToggle}
+              title={changesViewMode === "list" ? t("files.viewAsTree") : t("files.viewAsList")}
+              aria-label={changesViewMode === "list" ? t("files.viewAsTree") : t("files.viewAsList")}
+              aria-pressed={changesViewMode === "tree"}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                width: 22,
+                height: 22,
+                padding: 0,
+                border: "none",
+                borderRadius: 4,
+                background: "transparent",
+                color: "var(--text-dim)",
+                cursor: "pointer",
+                flexShrink: 0,
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = "var(--bg-hover)"; e.currentTarget.style.color = "var(--text)"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = "var(--text-dim)"; }}
+            >
+              <ChangesViewToggleIcon mode={changesViewMode} />
+            </button>
           </div>
-          {gitFiles.map((status) => (
-            <ChangeRow
-              key={status.filePath}
-              status={status}
+          {changesViewMode === "tree" ? (
+            <ChangesTreeRows
+              nodes={changesTree}
+              depth={0}
               cwd={cwd}
+              statusByPath={changesByRelativePath}
+              collapsedPaths={collapsedChangeDirs}
+              onToggleExpanded={handleToggleChangesExpanded}
               onOpenFile={onOpenFile}
               onAtMention={onAtMention}
               t={t}
             />
-          ))}
+          ) : (
+            gitFiles.map((status) => (
+              <ChangeRow
+                key={status.filePath}
+                status={status}
+                cwd={cwd}
+                onOpenFile={onOpenFile}
+                onAtMention={onAtMention}
+                t={t}
+              />
+            ))
+          )}
         </div>
       )}
 
       {(changesCollapsed || gitFiles.length === 0) && (!fileSearchOpen || !hasSearchQuery) && (
         <div style={{ padding: "2px 4px" }}>
           {loading ? (
-            <div style={{ padding: "8px 12px", fontSize: 11, color: "var(--text-dim)" }}>Loading files...</div>
+            <div style={{ padding: "8px 12px", fontSize: 11, color: "var(--text-dim)" }}>{t("files.loading")}</div>
           ) : error ? (
             <div style={{ padding: "8px 12px", fontSize: 11, color: "#f87171" }}>{error}</div>
           ) : (
@@ -1249,6 +1583,9 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
                 gitStatusByPath={gitStatusByPath}
                 changedDirectoryPaths={changedDirectoryPaths}
                 showHidden={showHidden}
+                dropTargetPath={dropTargetPath}
+                onDropFiles={handleDropFiles}
+                onDropTargetChange={handleDropTargetChange}
                 t={t}
               />
             ))
@@ -1258,6 +1595,41 @@ export const FileExplorer = forwardRef<FileExplorerHandle, Props>(function FileE
               {t("files.noFiles")}
             </div>
           )}
+        </div>
+      )}
+      {/* Last, pinned to the bottom: at the top it pushed every row down as
+          a drag came in, so the row under the pointer changed. Drags pass
+          through it to the row it covers. */}
+      {fileDragActive && (
+        <div
+          role="status"
+          aria-live="polite"
+          style={{
+            position: "sticky",
+            bottom: 0,
+            zIndex: 1,
+            display: "flex",
+            alignItems: "center",
+            gap: 6,
+            padding: "6px 8px",
+            borderTop: "1px solid var(--border)",
+            background: "var(--bg-panel)",
+            fontSize: 11,
+            color: "var(--accent)",
+            userSelect: "none",
+            pointerEvents: "none",
+          }}
+        >
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" style={{ flexShrink: 0 }}>
+            <path d="M12 16V4" />
+            <path d="m7 9 5-5 5 5" />
+            <path d="M5 20h14" />
+          </svg>
+          {t("files.dropToUpload", {
+            directory: dropTargetPath
+              ? (getRelativeFilePath(dropTargetPath, cwd) || dropTargetPath)
+              : (getFileName(cwd) || cwd),
+          })}
         </div>
       )}
     </div>

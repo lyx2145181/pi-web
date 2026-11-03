@@ -11,10 +11,12 @@ const jiti = createJiti(import.meta.url, {
 });
 const React = await jiti.import("react");
 const { renderToStaticMarkup } = await jiti.import("react-dom/server");
-const { ChatInput, ModelErrorBanner, ModelScopeWarningBanner, RUN_END_CLICK_GUARD_MS, canClearBuiltinCommandInput, canRestoreUserMessage, canRunBuiltinSlashCommandWhileStreaming, compressImageFile, cycleListIndex, filterModelOptions, getUpwardMenuMaxHeight, getUserMessageText, getUserMessageDraftImages, isExactSlashCommand, isRunEndStrayClick, modelSupportsImageInput, offersBuiltinSlashCommandWhileStreaming, replaceLinksWithMarkdown, replaceTextareaRange, shouldCompressImageFile, submitsSlashCommandOnEnter } = await jiti.import("./ChatInput.tsx");
-const { isBareMcpCommand } = await jiti.import("@/lib/mcp-command.ts");
+const { ChatInput, ModelErrorBanner, ModelScopeWarningBanner, RUN_END_CLICK_GUARD_MS, autoGrowTextarea, canClearBuiltinCommandInput, canRestoreUserMessage, canRunBuiltinSlashCommandWhileStreaming, cycleListIndex, filterModelOptions, getUpwardMenuMaxHeight, getUserMessageText, getUserMessageDraftImages, isExactSlashCommand, isRunEndStrayClick, modelSupportsImageInput, offersBuiltinSlashCommandWhileStreaming, replaceLinksWithMarkdown, readImageFile, replaceTextareaRange, stacksComposerLayout, submitsSlashCommandOnEnter } = await jiti.import("./ChatInput.tsx");
+const { isBareMcpCommand } = await jiti.import("@/lib/mcp-command");
 const { ModelSelector } = await jiti.import("./ModelSelector.tsx");
-const { clearDraft, getDraft, mergeRestoredSubmissionDraft, mergeRestoredSubmissionText, rekeyDraft, setDraft } = await jiti.import("@/lib/draft-store.ts");
+// As ChatInput.tsx imports it: on Windows jiti loads "@/lib/draft-store.ts"
+// as a second copy, and ChatInput would never see the drafts set here (#1211).
+const { clearDraft, getDraft, mergeRestoredSubmissionDraft, mergeRestoredSubmissionText, rekeyDraft, setDraft } = await jiti.import("@/lib/draft-store");
 const { I18nProvider } = await jiti.import("@/hooks/useI18n");
 
 test("preserves pasted HTML links as Markdown without changing plain text layout", () => {
@@ -36,6 +38,19 @@ test("preserves pasted HTML links as Markdown without changing plain text layout
     "Engineer and [Engineer](https://example.com/job)",
   );
   assert.equal(replaceLinksWithMarkdown("plain text", [link("missing", "https://example.com")]), null);
+});
+
+test("a phone stacks the streaming buttons under the draft instead of beside it", () => {
+  // Two buttons in the draft's row leave the placeholder about 150px on a 360px
+  // phone. Only a streaming run has those buttons; idle keeps the icon-only send
+  // button in the row, and a desktop has width for the row either way.
+  assert.equal(stacksComposerLayout(false, false, false), false);
+  assert.equal(stacksComposerLayout(false, false, true), false);
+  assert.equal(stacksComposerLayout(false, true, false), false);
+  assert.equal(stacksComposerLayout(false, true, true), true);
+  // Quote mode always stacks: it is a short excerpt, whichever platform shows it.
+  assert.equal(stacksComposerLayout(true, false, false), true);
+  assert.equal(stacksComposerLayout(true, true, false), true);
 });
 
 test("follow-up shortcuts preserve newline, IME, mobile and completion behavior", () => {
@@ -274,6 +289,31 @@ test("shows the follow-up shortcut in the button tooltip", () => {
   assert.match(html, /aria-keyshortcuts="Alt\+Enter"/);
 });
 
+test("scrolls a long queue inside its own box, under the count and Recall (#1428)", () => {
+  const html = renderToStaticMarkup(
+    React.createElement(I18nProvider, null, React.createElement(ChatInput, {
+      onSend() {}, onAbort() {}, onSteer() {}, onFollowUp() {}, onRecallQueue() {}, isStreaming: true,
+      queuedMessages: { steering: Array.from({ length: 19 }, (_, i) => `steer-${i}`), followUp: ["follow-up-0"] },
+    })),
+  );
+  const rows = html.match(/<div style="max-height:min\(180px[^"]*overflow-y:auto[^"]*">(.*)$/s);
+  assert.ok(rows, "queued rows sit in a capped scroll box");
+  assert.match(html.slice(0, rows.index), /Queued · 20<\/span>.*Recall to input<\/button>/s);
+  assert.deepEqual([...rows[1].matchAll(/<div title="([^"]+)"/g)].map((match) => match[1]),
+    [...Array.from({ length: 19 }, (_, i) => `steer-${i}`), "follow-up-0"]);
+});
+
+test("the composer stays editable while compacting and says messages queue", () => {
+  const html = renderToStaticMarkup(
+    React.createElement(I18nProvider, null, React.createElement(ChatInput, {
+      onSend() {}, isCompacting: true,
+    })),
+  );
+
+  assert.doesNotMatch(html, /<textarea[^>]*\bdisabled\b/);
+  assert.match(html, /placeholder="Compacting… messages queue until it finishes"/);
+});
+
 test("ignores a pointer click that reaches Stop's slot just as the run ends", () => {
   assert.equal(isRunEndStrayClick(1, 0), true);
   assert.equal(isRunEndStrayClick(2, RUN_END_CLICK_GUARD_MS - 1), true);
@@ -469,17 +509,50 @@ test("shows and locks the optimistic model while a switch is pending", () => {
   assert.match(html, /animation:spin 0\.8s linear infinite/);
 });
 
-test("filters model options by name and id", () => {
+test("the live model selector can reapply its current model without changing draft-field selection behavior", () => {
+  const source = ts.createSourceFile("ModelSelector.tsx", readFileSync(new URL("./ModelSelector.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  function findChoose(node) {
+    if (ts.isVariableDeclaration(node) && node.name.getText(source) === "choose") return node.initializer;
+    return ts.forEachChild(node, findChoose);
+  }
+  const script = new Script(ts.transpileModule(findChoose(source).getText(source), {
+    compilerOptions: { target: ts.ScriptTarget.ES2020 },
+  }).outputText);
+  const option = { provider: "fixture", modelId: "same-id", name: "Fixture" };
+  for (const [active, automatic, live, expected] of [
+    [true, false, true, "reselect"],
+    [true, false, false, null],
+    [true, true, true, "change"],
+    [false, false, true, "change"],
+  ]) {
+    const calls = [];
+    const choose = script.runInNewContext({
+      value: active ? option : null, isAutoSelection: automatic,
+      setOpen: (value) => calls.push(["open", value]),
+      setFilter: (value) => calls.push(["filter", value]),
+      onChange: (provider, id) => calls.push(["change", provider, id]),
+      onReselect: live ? (provider, id) => calls.push(["reselect", provider, id]) : undefined,
+    });
+    choose(option);
+    assert.deepEqual(calls, [["open", false], ["filter", ""], ...(expected ? [[expected, option.provider, option.modelId]] : [])]);
+  }
+  assert.match(readFileSync(new URL("./ChatInput.tsx", import.meta.url), "utf8"), /onReselect=\{onModelChange\}/);
+});
+
+test("filters model options by name, id, provider and provider/id", () => {
   const options = [
     { provider: "ollama", modelId: "qwen3:latest", name: "Qwen 3" },
     { provider: "anthropic", modelId: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
     { provider: "openai", modelId: "gpt-5.4", name: "GPT-5.4" },
+    { provider: "relay-a", modelId: "gpt-5.4", name: "GPT-5.4" },
   ];
 
   assert.deepEqual(filterModelOptions(options, "QWEN"), [options[0]]);
   assert.deepEqual(filterModelOptions(options, "claude-sonnet"), [options[1]]);
-  assert.equal(filterModelOptions(options, "OpenAI").length, 0);
-  assert.equal(filterModelOptions(options, "anthropic/claude").length, 0);
+  assert.deepEqual(filterModelOptions(options, "OpenAI"), [options[2]]);
+  assert.deepEqual(filterModelOptions(options, " anthropic/claude "), [options[1]]);
+  assert.deepEqual(filterModelOptions(options, "Relay-A/GPT"), [options[3]]);
+  assert.deepEqual(filterModelOptions(options, "gpt-5.4"), [options[2], options[3]]);
   assert.equal(filterModelOptions(options, "missing").length, 0);
   assert.equal(filterModelOptions(options, "  "), options);
 });
@@ -517,25 +590,12 @@ test("caps an upward menu to the visible space above its anchor", () => {
   assert.ok(getUpwardMenuMaxHeight(200, 36) < 400);
 });
 
-test("compresses large images while preserving small images and GIFs", async () => {
-  assert.equal(shouldCompressImageFile({ size: 1024 * 1024, type: "image/png" }), false);
-  assert.equal(shouldCompressImageFile({ size: 1024 * 1024 + 1, type: "image/png" }), true);
-  assert.equal(shouldCompressImageFile({ size: 2 * 1024 * 1024, type: "image/gif" }), false);
-
+test("reads attached images unchanged, leaving resizing to pi", async () => {
   const originals = {
     FileReader: globalThis.FileReader,
     createImageBitmap: globalThis.createImageBitmap,
-    document: globalThis.document,
   };
   let bitmapCalls = 0;
-  let closed = false;
-  const canvas = {
-    width: 0,
-    height: 0,
-    getContext: () => ({ fillStyle: "", fillRect() {}, drawImage() {} }),
-    toDataURL: () => "data:image/jpeg;base64,COMPRESSED",
-  };
-
   globalThis.FileReader = class {
     readAsDataURL() {
       this.result = "data:image/png;base64,ORIGINAL";
@@ -544,27 +604,18 @@ test("compresses large images while preserving small images and GIFs", async () 
   };
   globalThis.createImageBitmap = async () => {
     bitmapCalls += 1;
-    return { width: 2048, height: 1024, close() { closed = true; } };
+    return { width: 6000, height: 4000, close() {} };
   };
-  globalThis.document = { createElement: () => canvas };
 
   try {
-    assert.deepEqual(await compressImageFile({ size: 1024, type: "image/png" }), {
+    assert.deepEqual(await readImageFile({ size: 8 * 1024 * 1024, type: "image/png" }, "image/png"), {
       data: "ORIGINAL",
       mimeType: "image/png",
     });
-    assert.deepEqual(await compressImageFile({ size: 2 * 1024 * 1024, type: "image/png" }), {
-      data: "COMPRESSED",
-      mimeType: "image/jpeg",
-    });
-    assert.equal(bitmapCalls, 1);
-    assert.equal(canvas.width, 1024);
-    assert.equal(canvas.height, 512);
-    assert.equal(closed, true);
+    assert.equal(bitmapCalls, 0);
   } finally {
     globalThis.FileReader = originals.FileReader;
     globalThis.createImageBitmap = originals.createImageBitmap;
-    globalThis.document = originals.document;
   }
 });
 
@@ -618,6 +669,10 @@ test("locks built-in command submission until it settles", async () => {
 test("keeps only read-only built-ins available while a run is active", () => {
   assert.equal(canRunBuiltinSlashCommandWhileStreaming("/copy"), true);
   assert.equal(canRunBuiltinSlashCommandWhileStreaming("/session"), true);
+  // /side forks the session at file level, so a side question during a long
+  // parent run is the primary use case (ADR 0007).
+  assert.equal(canRunBuiltinSlashCommandWhileStreaming("/side"), true);
+  assert.equal(canRunBuiltinSlashCommandWhileStreaming("/side why did the test fail?"), true);
   assert.equal(canRunBuiltinSlashCommandWhileStreaming("/compact"), false);
   assert.equal(canRunBuiltinSlashCommandWhileStreaming("/auto-compact"), false);
   assert.equal(canRunBuiltinSlashCommandWhileStreaming("/reload"), false);
@@ -981,4 +1036,28 @@ test("selector rows keep the default star and the floating save button in one gu
   const active = row({ active: true });
   assert.match(active, /aria-selected="true"/);
   assert.doesNotMatch(active, /border-left/);
+});
+
+test("grows the composer to its text and hides the scrollbar until the text is taller than the box", () => {
+  const fake = (value, scrollHeight, clientHeight) => ({
+    value,
+    style: { height: "", overflowY: "" },
+    get scrollHeight() { return scrollHeight; },
+    clientHeight,
+  });
+
+  const empty = fake("", 48, 24);
+  autoGrowTextarea(empty);
+  assert.equal(empty.style.height, "24px", "an empty box keeps the height CSS gives it, not its placeholder's lines");
+  assert.equal(empty.style.overflowY, "hidden", "a wrapped placeholder never scrolls an empty composer");
+
+  const oneLine = fake("hi", 24, 24);
+  autoGrowTextarea(oneLine);
+  assert.equal(oneLine.style.height, "24px");
+  assert.equal(oneLine.style.overflowY, "hidden");
+
+  const tall = fake("lots", 320, 24);
+  autoGrowTextarea(tall);
+  assert.equal(tall.style.height, "200px", "the box caps at 200 px");
+  assert.equal(tall.style.overflowY, "auto", "capped text scrolls");
 });
