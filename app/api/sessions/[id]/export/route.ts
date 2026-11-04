@@ -79,8 +79,9 @@ async function getPiCliPath(): Promise<string | null> {
 }
 
 /**
- * Patch the exported HTML to fix recursive functions that overflow
- * the call stack on deep linear session trees (e.g., 5000+ entries).
+ * Patch legacy exported HTML whose recursive tree helpers overflow on
+ * deep linear sessions. Pi 1.5 already uses iterative helpers; recognize
+ * that implementation and leave it unchanged instead of reapplying the patch.
  *
  * ## Root Cause
  * pi-coding-agent's template.js uses recursive helpers to render and
@@ -126,6 +127,19 @@ function patchExportHtml(html: string): string {
   // Without this, the replace() below would fail on Windows.
   const n = (s: string) => s.replace(/\r\n/g, "\n");
   html = n(html);
+
+  // Pi 1.5 fixed all three traversals upstream. Require positive evidence of
+  // each iterative helper; missing/partial legacy templates must still fail.
+  const iterativeHelpers = [
+    "for (const node of nodeMap.values()) {",
+    "const stack = [...buildTree()];",
+    "const pending = [...roots];",
+    "for (let i = postOrder.length - 1; i >= 0; i--) {",
+  ];
+  if (iterativeHelpers.every((helper) => html.includes(helper))
+    && !/\bfunction\s+(?:sortChildren|mapNodes|markActive)\s*\(/.test(html)) {
+    return html;
+  }
 
   const replaceRequired = (source: string, name: string, search: string, replacement: string) => {
     const normalizedSearch = n(search);

@@ -248,7 +248,7 @@ Files: `lib/markdown.ts` (`markdownClobberPrefix`, `rehypeMatchClobberedIds`, `j
 - Expanding a finished block still lays out all of it once, as before (about 500 ms for that text at 4x). `content-visibility: auto` on the pieces would skip the ones off screen (70 ms to the first frame), but its placeholder heights, about half the real ones in the bench, change the scroll height as pieces come into view; it is not used.
 
 ## Exported session HTML
-- `/api/sessions/[id]/export` delegates to pi's export helper, then makes the generated HTML's recursive tree helpers iterative, so very deep linear sessions do not overflow the browser call stack.
+- `/api/sessions/[id]/export` delegates to pi's export helper. Pi 1.5 already uses iterative tree sorting, indexing and active-path traversal; `patchExportHtml()` recognizes all three implementations and leaves that HTML unchanged. Legacy recursive templates still receive the iterative replacements, with exactly-one-match checks retained for missing or duplicate helpers. `app/api/sessions/export-route.test.mjs` exercises the installed SDK, deep traversal and the real inline/download handlers without modifying input sessions.
 
 ## Deleting the selected session outlives the delete click (`components/AppShell.tsx`)
 - `SessionItem.performDelete` captures `onDeleted` at the delete click, and `handleSessionDeleted` is a `useCallback` whose `selectedSession` closure is from that same render. The DELETE request can complete **after** the user has switched sessions, so the captured selection still names the session being deleted.
