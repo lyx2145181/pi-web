@@ -8,6 +8,7 @@ import { profileResourceSelection, resourceSelectionEnabled, sameResourceSelecti
 import { parseNpmSource } from "./npm-source";
 import { writePrivateFileAtomicSync } from "./atomic-file";
 import { isExistingPathWithinRoots } from "./path-security";
+import { getProjectTrustStatus } from "./project-trust";
 import { disabledBuiltInSubagents } from "./subagent-settings";
 import { PRESET_READ_ONLY } from "./tool-presets";
 import type { SessionEntry, SubagentSessionStatus } from "./types";
@@ -159,8 +160,8 @@ export interface SubagentRunInfo {
 }
 
 const DEFAULT_TOOLS = SUBAGENT_BUILTIN_TOOL_NAMES.filter((name) => name !== "powershell");
-// Preserve the original profile/v1 shell vocabulary; v2 freezes resolved shell names.
-const BUILTIN_TOOLS = new Set<string>(DEFAULT_TOOLS);
+// Profiles may explicitly select either shell; defaults remain portable, and snapshots stay exact.
+const BUILTIN_TOOLS = SUBAGENT_BUILTIN_TOOLS;
 const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
 /**
@@ -425,9 +426,14 @@ export function listSubagentProfileSources(cwd: string): SubagentProfile[] {
 }
 
 export function listSubagentProfiles(cwd: string): SubagentProfile[] {
+  // A project or workspace profile is the project's own system prompt and tool
+  // grant for a child, so it loads only in a trusted folder, as pi loads
+  // `.pi/SYSTEM.md`, skills and prompts.
+  const projectTrusted = getProjectTrustStatus(cwd, getAgentDir()).trusted;
   // A same-name file replaces the built-in outright, its own `enabled` included.
   const byName = new Map(builtInProfiles().map((profile) => [profile.name.toLowerCase(), profile]));
   for (const [dir, scope] of profileDirectories(cwd)) {
+    if (scope !== "global" && !projectTrusted) continue;
     for (const profile of readProfileDirectory(dir, scope, cwd)) byName.set(profile.name.toLowerCase(), profile);
   }
   return [...byName.values()].sort((a, b) => a.displayName.localeCompare(b.displayName));
