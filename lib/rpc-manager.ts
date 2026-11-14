@@ -1,14 +1,16 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { createAgentSessionFromServices, createAgentSessionServices, getAgentDir, initTheme, SessionManager, SettingsManager, Theme, type ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { createAgentSessionFromServices, createAgentSessionServices, getAgentDir, initTheme, SessionManager, SettingsManager, Theme, type AgentSession, type ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { KeybindingsManager as TuiKeybindingsManager, TUI_KEYBINDINGS } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
 import { existsSync, realpathSync, writeFileSync } from "fs";
 import { resolve } from "path";
 import { isDeepStrictEqual } from "util";
 import { validateAgentImages } from "./image-attachments";
+import { EXTENSION_REPORTED_CODE } from "./agent-client";
 import { cwdMissingError } from "./missing-cwd";
 import { invalidateModelsCache } from "./models-cache";
 import { invalidateModelRuntimeWithExtensions } from "./model-runtime";
+import { llamaCppExtension } from "./pi-sdk-internals";
 import { resolveVisibleModels, selectInitialModelScope } from "./model-scope";
 import { findDeferredModel, findDeferredStartupModel, rememberProviderModels } from "./deferred-provider-models";
 import { isBlockingExtensionUiRequest } from "./extension-ui-queue";
@@ -17,9 +19,11 @@ import {
   createProjectCommandBashOperations,
   preferUserBashExtension,
 } from "./project-command-env";
-import { cacheSessionPath, catalogFirstMessage, getLatestModelChange, invalidateSessionListCache, readLatestSessionEntryId, resolveSessionPath } from "./session-reader";
+import { cacheSessionPath, catalogFirstMessage, getLatestModelChange, invalidateSessionListCache, invalidateSessionManagerCache, invalidateSessionPathCache, readLatestSessionEntryId, resolveSessionPath } from "./session-reader";
 import { computeLiveSessionTotalActiveMs } from "./session-timing";
 import { getProjectTrustStatus, projectTrustReloadOptions } from "./project-trust";
+import { createSubagentSessionServices, subagentHostToolAdmission } from "./subagent-resources";
+import { reconcileSubagentActiveTools, subagentToolExclusions } from "./subagent-tool-policy";
 import { notifySessionComplete } from "./web-push";
 import { hasActiveSessionLivenessProvider } from "./session-liveness";
 import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
@@ -41,13 +45,12 @@ import {
 } from "./subagent-extension";
 import {
   listSubagentProfiles,
-  hasSubagentResourceSnapshot,
   readSubagentRun,
   readSubagentSessionResources,
   settleOrphanedSubagentStatus,
-  subagentExtensionLoaderOptions,
-  subagentToolOptions,
   SUBAGENT_CONTROL_TOOL_NAMES,
+  SUBAGENT_META_TYPE,
+  type SubagentSessionResources,
 } from "./subagents";
 import {
   hasSideMetadata,
@@ -55,18 +58,18 @@ import {
   sideToolNames,
 } from "./side-session";
 import { SIDE_SESSION_NAME, sideChatNameFrom } from "./session-family";
-import { createSubagentController, getLiveSubagentStatus, hasUnsettledSubagentRun } from "./subagent-runtime";
+import { createSubagentController, requestSubagentRunAbort, getLiveSubagentStatus, hasUnsettledSubagentRun, SUBAGENT_CLOSED_BEFORE_RUN } from "./subagent-runtime";
 import { isBuiltInSubagentsEnabled } from "./subagent-settings";
 import { resolveShellTools } from "./powershell-settings";
 import { CHAT_ONLY_RESOURCE_LOADER_OPTIONS, contextFilesSystemPrompt } from "./chat-only";
 import { createExactSystemPromptExtension } from "./exact-system-prompt";
-import { createPiWebBuiltinExtensions, createSubagentCodemodeExtension, createSubagentMcpExtensions } from "./builtin-extensions";
+import { createPiWebBuiltinExtensions } from "./builtin-extensions";
 import type { McpHost } from "./mcp-host";
 import type { DebugMcpHost, DebugSessionLifecycle, DebugWrapperSnapshot } from "./debug-types";
 import { mcpPromptPreparation, type McpCommandCandidate } from "./mcp-command";
-import { createReadOnlyMcpPolicyExtension, createSubagentMcpPolicyExtension } from "./mcp-read-only-policy";
-import { createSubagentSkillsBinding } from "./subagent-skills";
+import { createReadOnlyMcpPolicyExtension } from "./mcp-read-only-policy";
 import { isNestedToolExecutionEvent } from "./agent-event-wire";
+import { collectStartupIssues, extensionErrorMessage, limitStartupNotices, type StartupIssue } from "./startup-issues";
 import { collectLiveAssistantNotices, readShowCacheMissNotices, withSessionPrices } from "./transcript-notices-server";
 import {
   appendClearedSessionToolSelection,
@@ -163,21 +166,31 @@ type ExtensionCommandContextActionsLike = {
 };
 
 // `debugSnapshot` is optional: a host built before a hot reload lacks it.
-type WrapperMcpHost = Pick<McpHost, "prepareForPrompt" | "dispose"> & Partial<Pick<McpHost, "debugSnapshot">>;
+type WrapperMcpHost = Pick<McpHost, "prepareForPrompt" | "dispose"> & Partial<Pick<McpHost, "debugSnapshot" | "admitsTool">>;
 
 type AgentSessionWrapperOptions = {
   exactSystemPrompt?: () => string;
   chatOnly?: boolean;
   onAgentRunComplete?: AgentRunCompleteListener;
   suppressCompletionNotifications?: boolean;
+  /** Validated frozen creation resources, never the current role. */
+  subagentResources?: SubagentSessionResources | null;
   /** A subagent's wrapper: a run ended and nothing is left to do. */
-  onDirectTurnSettled?: (aborted: boolean) => void;
+  onDirectTurnSettled?: (aborted: boolean, fromIndex: number) => void;
   /** Connects the session's MCP servers before a prompt starts a run, and lets go of them when it closes (lib/mcp-host.ts). */
   mcpHost?: WrapperMcpHost;
   /** Chat only: the extension-provided model the session wanted, named when a prompt finds no model. */
   chatOnlyExtensionModel?: { provider: string; id: string };
   sideChat?: boolean;
+  /**
+   * The notices of what went wrong as the session started (lib/startup-issues.ts), told to every
+   * stream it opens. Left out (a subagent, a side chat), the wrapper keeps none: its parent's page said them.
+   */
+  startupIssues?: readonly StartupIssue[];
 };
+
+/** Startup notices kept for later streams: the loader's (capped), the model, then session_start errors. */
+const STARTUP_NOTICE_LIMIT = 20;
 
 /**
  * Chat only loads no extensions, so a provider one registers is missing from its runtime (#804).
@@ -190,6 +203,10 @@ function chatOnlyExtensionModelError(provider: string, modelId: string): Error {
 }
 
 export const MCP_WAIT_STOPPED_MESSAGE = "Stopped while MCP servers were connecting; the message was not sent.";
+
+/** A running `!` command's output tail sent to the page (UTF-16 units), and how often (createBashOutputSnapshots). */
+const BASH_OUTPUT_TAIL_CHARS = 16 * 1024;
+const BASH_OUTPUT_INTERVAL_MS = 150;
 
 const IDLE_RESET_EVENT_TYPES = new Set([
   "agent_end",
@@ -327,12 +344,19 @@ function isCompactionInProgressError(error: unknown): boolean {
 // Wraps AgentSession with the same interface the rest of the app expects
 // ============================================================================
 
+/** A running top-level tool call's start, when this process saw it, and its latest update. */
+interface ActiveToolEvents {
+  start: AgentEvent;
+  startedAt: number;
+  update?: AgentEvent;
+}
+
 export class AgentSessionWrapper {
   // A Set, not an array: an SSE stream unsubscribes from inside emit() when it
   // closes on session_shutdown, and splicing an array mid-iteration made the
   // next stream miss that same event.
   private listeners = new Set<EventListener>();
-  private activeToolEvents = new Map<string, AgentEvent>();
+  private activeToolEvents = new Map<string, ActiveToolEvents>();
   private pendingUiResponses = new Map<string, PendingUiResponse>();
   private pendingUiRequests = new Map<string, AgentEvent>();
   private activeCustomUis = new Map<string, ActiveCustomUi>();
@@ -343,6 +367,8 @@ export class AgentSessionWrapper {
   private extensionWidgetGenerations = new Map<string, number>();
   private extensionWidgetsResetting = false;
   private pendingPromptCount = 0;
+  /** Prompts that reached send() and wait on the extensions or their admission, not counted yet. */
+  private arrivingPromptCount = 0;
   // Prompts waiting for the running compaction to finish (ParkedPrompt above).
   private parkedDuringCompaction: ParkedPrompt[] = [];
   private activeMutatingCommands = 0;
@@ -351,14 +377,18 @@ export class AgentSessionWrapper {
   // Whether the last run ended because it was stopped (pi 1.1's `agent_settled.aborted`), not finished.
   private lastRunAborted = false;
   private promptAdmissionTail: Promise<void> = Promise.resolve();
+  private promptAdmissionGeneration = 0;
+  private promptStopGeneration = 0;
   private extensionsBound = false;
   private extensionBindingPromise: Promise<void> | null = null;
   private extensionBindingError: unknown = null;
   private readonly exactSystemPrompt?: () => string;
   private readonly chatOnly: boolean;
   private readonly onAgentRunComplete?: AgentRunCompleteListener;
-  private readonly onDirectTurnSettled?: (aborted: boolean) => void;
+  private readonly onDirectTurnSettled?: (aborted: boolean, fromIndex: number) => void;
+  private directTurnStart = 0;
   private readonly suppressCompletionNotifications: boolean;
+  private readonly subagentResources?: SubagentSessionResources;
   private readonly mcpHost?: WrapperMcpHost;
   private readonly chatOnlyExtensionModel?: { provider: string; id: string };
   private readonly sideChat: boolean;
@@ -370,7 +400,16 @@ export class AgentSessionWrapper {
   private onDestroyCallback: (() => void) | null = null;
   private shutdownPromise: Promise<void> | null = null;
   private sessionShutdownEmitted = false;
+  private extensionShutdownRequested = false;
+  private extensionShutdownComplete = false;
   private forceShutdownOnIdle = false;
+  /** Stop's forced shutdown waits out a `!` command too (`abort_bash`); a run's Stop, only the run. */
+  private forceShutdownCoversShell = false;
+  // What went wrong as the session started, told to each stream under the same ids (the page
+  // shows each once); null on a subagent's or side chat's wrapper.
+  private readonly startupNotices: AgentEvent[] | null;
+  /** A `!` command waiting on its `user_bash` handlers, before pi counts it as running. */
+  private userBashPending = false;
   // The armed idle timer is the forced cleanup Stop scheduled.
   private forcedIdleTimerArmed = false;
   private _alive = true;
@@ -401,9 +440,12 @@ export class AgentSessionWrapper {
     this.onAgentRunComplete = options.onAgentRunComplete;
     this.onDirectTurnSettled = options.onDirectTurnSettled;
     this.suppressCompletionNotifications = options.suppressCompletionNotifications ?? false;
+    this.subagentResources = options.subagentResources ? structuredClone(options.subagentResources) : undefined;
     this.mcpHost = options.mcpHost;
     this.chatOnlyExtensionModel = options.chatOnlyExtensionModel;
     this.sideChat = options.sideChat === true;
+    this.startupNotices = options.startupIssues ? [] : null;
+    for (const issue of options.startupIssues ?? []) this.notifyIssue(issue);
   }
 
   get sessionId(): string {
@@ -435,8 +477,45 @@ export class AgentSessionWrapper {
     return this._alive && !this.closing;
   }
 
+  /** Explicit exit keeps its stream through cleanup, even when it starts during binding. */
+  isExtensionShutdownRequested(): boolean {
+    return this.extensionShutdownRequested;
+  }
+
+  /**
+   * A running `!` command's output for the page, as pi's TUI draws it while it runs:
+   * the tail (`BASH_OUTPUT_TAIL_CHARS`) at most every `BASH_OUTPUT_INTERVAL_MS`, as
+   * `bash_output` snapshots a later one replaces, never pi's per-chunk deltas, which a
+   * command printing megabytes would pile up in a slow stream.
+   */
+  private createBashOutputSnapshots(command: string): { onChunk: (chunk: string) => void; stop: () => void } {
+    let tail = "";
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    return {
+      onChunk: (chunk) => {
+        tail = (tail + chunk).slice(-BASH_OUTPUT_TAIL_CHARS);
+        // A cut through a surrogate pair would start the tail with half a character.
+        if (/^[\uDC00-\uDFFF]/.test(tail)) tail = tail.slice(1);
+        if (timer) return;
+        timer = setTimeout(() => {
+          timer = null;
+          this.emit({ type: "bash_output", command, output: tail } as unknown as AgentEvent);
+        }, BASH_OUTPUT_INTERVAL_MS);
+      },
+      stop: () => {
+        if (timer) clearTimeout(timer);
+        timer = null;
+      },
+    };
+  }
+
+  /** A `!` command is under way: its `user_bash` handlers, or pi running it. */
+  private get shellRunning(): boolean {
+    return this.inner.isBashRunning || this.userBashPending;
+  }
+
   isRunning(): boolean {
-    return this._alive && (this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning);
+    return this._alive && (this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting || this.shellRunning);
   }
 
   /**
@@ -556,6 +635,7 @@ export class AgentSessionWrapper {
       this.lastEventType = typeof event.type === "string" ? event.type : null;
       this.lastEventAt = Date.now();
       if (event.type === "agent_start") {
+        this.directTurnStart = this.inner.sessionManager.getEntries?.().length ?? 0;
         this.agentRunNeedsCompletion = true;
         this.lastRunAborted = false;
       }
@@ -581,6 +661,7 @@ export class AgentSessionWrapper {
             : event,
       );
       if (event.type === "agent_settled") this.notifyAgentRunCompleteIfIdle();
+      this.checkExtensionShutdown();
     });
     this.resetIdleTimer();
   }
@@ -611,8 +692,8 @@ export class AgentSessionWrapper {
   }
 
   /**
-   * Keep the latest start or update of each running tool call for onEvent() to
-   * replay. Calls a tool makes itself (a codemode script's, which carry
+   * Keep the start and the latest update of each running tool call for onEvent()
+   * to replay. Calls a tool makes itself (a codemode script's, which carry
    * `parentToolCallId`) are left out: a reconnecting client would show each as a
    * top-level tool, and the parent's own update already reports them. A nested
    * end can still arrive after its parent's, and is ignored like the rest.
@@ -620,8 +701,11 @@ export class AgentSessionWrapper {
   private trackActiveToolEvent(event: AgentEvent): void {
     const toolCallId = event.toolCallId;
     if (typeof toolCallId !== "string" || isNestedToolExecutionEvent(event)) return;
-    if (event.type === "tool_execution_start" || event.type === "tool_execution_update") {
-      this.activeToolEvents.set(toolCallId, event);
+    if (event.type === "tool_execution_start") {
+      this.activeToolEvents.set(toolCallId, { start: event, startedAt: performance.now() });
+    } else if (event.type === "tool_execution_update") {
+      const active = this.activeToolEvents.get(toolCallId);
+      if (active) active.update = event;
     } else if (event.type === "tool_execution_end") {
       this.activeToolEvents.delete(toolCallId);
       const nestedPrefix = `${toolCallId}/`;
@@ -635,7 +719,7 @@ export class AgentSessionWrapper {
     if (!this.agentRunNeedsCompletion || this.isRunning()) return;
     this.agentRunNeedsCompletion = false;
     try {
-      this.onDirectTurnSettled?.(this.lastRunAborted);
+      this.onDirectTurnSettled?.(this.lastRunAborted, this.directTurnStart);
     } catch (error) {
       console.error("[pi-web] could not settle the subagent turn:", error instanceof Error ? error.message : error);
     }
@@ -727,6 +811,8 @@ export class AgentSessionWrapper {
   }
 
   private async deliverParkedPrompt(entry: ParkedPrompt): Promise<void> {
+    // Parked inputs already have a recallable queue identity; use the membership check below
+    // rather than rejecting a background delivery on the public-input generation boundary.
     const releaseAdmission = await this.acquirePromptAdmission();
     entry.delivering = false;
     const index = this.parkedDuringCompaction.indexOf(entry);
@@ -736,6 +822,7 @@ export class AgentSessionWrapper {
       return;
     }
     this.parkedDuringCompaction.splice(index, 1);
+    const stopGeneration = this.promptStopGeneration;
     this.emitQueueUpdate();
     let released = false;
     const release = () => {
@@ -751,6 +838,7 @@ export class AgentSessionWrapper {
         source: "rpc",
         streamingBehavior: entry.streamingBehavior ?? "steer",
         preflightResult: (result) => {
+          this.guardPromptPreflight(result, stopGeneration);
           disposition = result;
           release();
         },
@@ -841,13 +929,10 @@ export class AgentSessionWrapper {
           uiContext,
           mode: "rpc",
           commandContextActions: this.createExtensionCommandContextActions(),
-          shutdownHandler: () => this.emit({
-            type: "extension_ui_request",
-            id: randomUUID(),
-            method: "notify",
-            notifyType: "warning",
-            message: "Extension requested shutdown, but shutdown is not supported in Pi Web.",
-          } as ExtensionUiRequest as AgentEvent),
+          shutdownHandler: () => {
+            this.extensionShutdownRequested = true;
+            this.checkExtensionShutdown();
+          },
           onError: (error) => this.emit({
             type: "extension_error",
             extensionPath: error.extensionPath,
@@ -858,14 +943,115 @@ export class AgentSessionWrapper {
       } else {
         this.inner.extensionRunner.setUIContext?.(uiContext, "rpc");
       }
+      // bindExtensions also awaits resources_discover, which runs AFTER session_start.
+      this.reconcileSubagentToolPolicy();
       this.extensionsBound = true;
       console.log(`[pi-web] session_start dispatched to extensions for session ${this.inner.sessionId}`);
     })().catch((err) => {
       this.extensionBindingError = err;
       throw err;
-    });
+    }).finally(() => this.checkExtensionShutdown());
 
     return this.extensionBindingPromise;
+  }
+
+  /** Complete delegated run, not the send() preflight acknowledgement. One bind only. */
+  async promptDelegated(message: string, signal?: AbortSignal): Promise<void> {
+    const admissionGeneration = this.promptAdmissionGeneration;
+    const stopGeneration = this.promptStopGeneration;
+    await this.waitUntilReady();
+    // The current run's Stop controller, captured only after `renewExtensionUiStop()` below;
+    // a previous run's signal must never cancel this one.
+    let uiAbort: AbortController | undefined;
+    const check = () => {
+      // A wrapper closed after the caller checked it (a trust rebuild, disposal) must fail as
+      // closed, not as cancelled: the run itself never started on this session.
+      if (!this.isAlive()) throw new Error(SUBAGENT_CLOSED_BEFORE_RUN);
+      if (signal?.aborted || uiAbort?.signal.aborted) throw new Error("Subagent cancelled before prompting");
+    };
+    check();
+    const releaseAdmission = await this.acquirePromptAdmission(admissionGeneration);
+    try {
+      check();
+      if (this.isRunning()) throw new Error("Subagent is already running");
+      this.renewExtensionUiStop();
+      uiAbort = this.extensionUiAbortController;
+      const cancel = () => {
+        this.mcpPromptWait?.controller.abort();
+        if (this.inner.isStreaming) void this.inner.abort();
+      };
+      signal?.addEventListener("abort", cancel, { once: true });
+      try {
+        // The increment is inside the finally-protected span: every exit below, a readiness or
+        // pre-prompt Stop included, resets it to zero.
+        this.pendingPromptCount += 1;
+        check();
+        await this.prepareMcpPrompt(message);
+        check();
+        this.reconcileSubagentToolPolicy();
+        // Only agent_start creates completion debt; a handled command starts no run.
+        this.lastRunAborted = false;
+        await this.inner.prompt(message, {
+          source: "rpc",
+          // Let the child's live chat steer/queue after SDK acceptance, not after the whole
+          // delegated run ends. The delegated caller still awaits full completion here.
+          preflightResult: (disposition) => {
+            this.guardPromptPreflight(disposition, stopGeneration);
+            releaseAdmission();
+          },
+        });
+      } finally {
+        signal?.removeEventListener("abort", cancel);
+        this.pendingPromptCount = Math.max(0, this.pendingPromptCount - 1);
+        this.resetIdleTimer();
+        this.notifyAgentRunCompleteIfIdle();
+      }
+    } finally { releaseAdmission(); }
+  }
+
+  async abortDelegated(): Promise<void> { await this.send({ type: "abort" }); }
+
+  private async prepareMcpPrompt(message: string): Promise<void> {
+    if (this.subagentResources?.version === 3 && this.subagentResources.loadMcp
+      && typeof this.mcpHost?.prepareForPrompt !== "function") throw new Error("Subagent MCP requires a prepared session host");
+    const preparation = this.mcpHost && !this.inner.isStreaming
+      ? mcpPromptPreparation(message, this.extensionCommandCandidates()) : "none";
+    if (!this.mcpHost || preparation === "none") return;
+    const controller = new AbortController();
+    const waited = this.mcpHost.prepareForPrompt(controller.signal, { wait: preparation === "wait" })
+      .catch((error: unknown) => {
+        if (this.subagentResources?.version === 3) throw error;
+        console.error("[pi-web] MCP servers could not be prepared:", error instanceof Error ? error.message : error);
+      }).then(() => {
+        if (controller.signal.aborted) throw new DOMException(MCP_WAIT_STOPPED_MESSAGE, "AbortError");
+      });
+    const wait = { controller, done: waited.then(() => undefined, () => undefined) };
+    this.mcpPromptWait = wait;
+    try { await waited; }
+    finally { if (this.mcpPromptWait === wait) this.mcpPromptWait = null; }
+  }
+
+  private reconcileSubagentToolPolicy(): void {
+    const resources = this.subagentResources;
+    if (resources?.version !== 2 && resources?.version !== 3) return; // Normal sessions and v1 retain their existing loadout rules.
+    const sdk = this.inner as unknown as Pick<AgentSession, "getAllTools" | "getActiveToolNames" | "setActiveToolsByName" | "resourceLoader">;
+    reconcileSubagentActiveTools({
+      getActiveTools: () => sdk.getActiveToolNames(),
+      getAllTools: () => sdk.getAllTools(),
+      setActiveTools: (names) => sdk.setActiveToolsByName(names),
+    }, resources.builtinTools, resources.toolPolicy, () => sdk.resourceLoader.getExtensions().extensions,
+      resources.version === 3 ? subagentHostToolAdmission(resources, this.mcpHost?.admitsTool ? { admitsTool: this.mcpHost.admitsTool.bind(this.mcpHost) } : undefined) : undefined);
+  }
+
+  /** Defer out of the extension callback, including session_start, before awaiting binding. */
+  private checkExtensionShutdown(): void {
+    if (!this.extensionShutdownRequested) return;
+    queueMicrotask(() => {
+      if (!this.isAlive() || this.isRunning() || this.activeMutatingCommands > 0) return;
+      void this.shutdown().catch((error) => {
+        console.error("[pi-web] extension-requested shutdown failed:", error);
+      });
+    });
   }
 
   private async waitForExtensionsBound(): Promise<void> {
@@ -899,6 +1085,7 @@ export class AgentSessionWrapper {
       || type === "steer"
       || type === "follow_up"
       || type === "get_commands"
+      || type === "get_tools"
       || type === "get_state";
   }
 
@@ -962,6 +1149,14 @@ export class AgentSessionWrapper {
   }
 
   private emit(event: AgentEvent): void {
+    // A session_start handler that throws as the session starts is one of its startup issues, as
+    // pi's TUI shows it then: every stream the page opens hears it, not only one open at that moment.
+    if (event.type === "extension_error" && event.event === "session_start" && this.startupNotices && !this.extensionsBound) {
+      const message = extensionErrorMessage(event.extensionPath, String(event.error));
+      console.warn(`[pi-web] session ${this.sessionId}: ${message}`);
+      this.notifyIssue({ type: "error", message });
+      return;
+    }
     for (const listener of this.listeners) {
       try {
         listener(event);
@@ -974,14 +1169,41 @@ export class AgentSessionWrapper {
     }
   }
 
-  private async acquirePromptAdmission(): Promise<() => void> {
+  private guardPromptPreflight(disposition: "handled" | "queued" | "started", stopGeneration: number): void {
+    if (disposition === "handled" || stopGeneration === this.promptStopGeneration) return;
+    // SDK input handlers can outlive Stop before a run/abort signal exists. At preflight a
+    // started run can finally be aborted; do not throw here, which would strand SDK startup.
+    if (disposition === "queued") this.inner.clearQueue();
+    void this.inner.abort().catch((error) => {
+      console.error("[pi-web] failed to stop a recalled prompt:", error instanceof Error ? error.message : error);
+    });
+  }
+
+  private async acquirePromptAdmission(generation?: number): Promise<() => void> {
     const previous = this.promptAdmissionTail;
     let release!: () => void;
     this.promptAdmissionTail = new Promise<void>((resolve) => {
       release = resolve;
     });
     await previous;
+    if (generation !== undefined && generation !== this.promptAdmissionGeneration) {
+      release();
+      throw new Error("Message recalled before admission; it was not sent.");
+    }
     return release;
+  }
+
+  /**
+   * Stop's forced shutdown is for what it stopped: the run (a pending prompt, streaming,
+   * compacting), with `abort_bash` the `!` command too. Once that is idle, a healthy command
+   * beside it keeps the normal idle timer, which leases move.
+   */
+  private releaseForcedShutdownOnceStopped(): void {
+    const stoppedWorkRunning = this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting
+      || (this.forceShutdownCoversShell && this.shellRunning);
+    if (this._alive && stoppedWorkRunning) return;
+    this.forceShutdownOnIdle = false;
+    this.forceShutdownCoversShell = false;
   }
 
   private resetIdleTimer(): void {
@@ -990,7 +1212,7 @@ export class AgentSessionWrapper {
       this.idleDeadlineAt = null;
       return;
     }
-    if (!this.isRunning()) this.forceShutdownOnIdle = false;
+    this.releaseForcedShutdownOnceStopped();
     // A stuck user reloads, reopens the session or presses Stop again, and
     // each of those commands lands here. Moving the forced deadline for them
     // would keep a run that Stop cannot unwind alive indefinitely.
@@ -1010,7 +1232,9 @@ export class AgentSessionWrapper {
     this.idleDeadlineAt = this.idleLastResetAt + timeoutMs;
     this.idleTimer = setTimeout(() => {
       this.idleDeadlineAt = null;
-      if (!this.forceShutdownOnIdle && (this.isRunning() || hasActiveSessionLivenessProvider({
+      // A subagent run that waits for a slot (or its MCP servers) holds this SDK session and will
+      // prompt it: disposing it now would leave that run on a dead session that records nothing (#1590).
+      if (!this.forceShutdownOnIdle && (this.isRunning() || getLiveSubagentStatus(this.sessionId) !== undefined || hasActiveSessionLivenessProvider({
         sessionId: this.sessionId,
         sessionFile: this.sessionFile || undefined,
       }))) {
@@ -1044,9 +1268,20 @@ export class AgentSessionWrapper {
   }
 
   onEvent(listener: EventListener): () => void {
+    if (this.extensionShutdownComplete) {
+      listener({ type: "session_ended", sessionId: this.sessionId });
+      return () => {};
+    }
     this.listeners.add(listener);
     for (const event of this.pendingUiRequests.values()) listener(event);
-    for (const event of this.activeToolEvents.values()) listener(event);
+    // A replayed start says how long the call has run (`elapsedMs`, this process's clock): the
+    // page's live elapsed time on its card counts from the start it saw, which a reload missed.
+    const now = performance.now();
+    for (const { start, startedAt, update } of this.activeToolEvents.values()) {
+      listener({ ...start, elapsedMs: Math.max(0, Math.round(now - startedAt)) });
+      if (update) listener(update);
+    }
+    for (const event of this.startupNotices ?? []) listener(event);
     return () => {
       this.listeners.delete(listener);
     };
@@ -1083,7 +1318,7 @@ export class AgentSessionWrapper {
   }
 
   private isSessionRunningForReplacement(): boolean {
-    return this.inner.isBashRunning
+    return this.shellRunning
       || this.inner.isStreaming
       || this.inner.isCompacting
       || this.pendingPromptCount > 0;
@@ -1102,6 +1337,12 @@ export class AgentSessionWrapper {
 
   async send(command: Record<string, unknown>): Promise<unknown> {
     const type = command.type as string;
+    // Stop/Recall also invalidate inputs waiting for readiness/admission, not just the SDK's
+    // already accepted queue. Their callers receive a refusal and keep the unsent draft.
+    if (type === "abort" || type === "clear_queue") this.promptAdmissionGeneration += 1;
+    if (type === "abort") this.promptStopGeneration += 1;
+    const admissionGeneration = this.promptAdmissionGeneration;
+    const stopGeneration = this.promptStopGeneration;
     // A status read (the chat's reconciliation, every few seconds while it runs) would hide the
     // last command that did something; it never resets the idle timer either.
     if (type !== "get_state") {
@@ -1118,6 +1359,15 @@ export class AgentSessionWrapper {
 
     const tracksMutation = !allowedDuringReplacement;
     if (tracksMutation) this.activeMutatingCommands += 1;
+    // A prompt counts from its arrival: a `!` sent right after it must not start
+    // while it waits on the extensions or its admission, and then refuse it.
+    let arrivingPrompt = type === "prompt";
+    if (arrivingPrompt) this.arrivingPromptCount += 1;
+    const promptCounted = () => {
+      if (!arrivingPrompt) return;
+      arrivingPrompt = false;
+      this.arrivingPromptCount -= 1;
+    };
 
     try {
       // Status reconciliation must not postpone forced cleanup after Stop.
@@ -1140,14 +1390,20 @@ export class AgentSessionWrapper {
         throw cwdMissingError(this.cwd);
       }
 
+      if ((type === "prompt" || type === "steer" || type === "follow_up")
+        && admissionGeneration !== this.promptAdmissionGeneration) {
+        throw new Error("Message recalled before admission; it was not sent.");
+      }
       switch (type) {
       case "prompt": {
         // Serialize only admission. Once the preceding prompt has either
         // passed or failed preflight, the SDK can atomically decide whether
         // this submission starts a run or joins its streaming queue.
-        const releaseAdmission = await this.acquirePromptAdmission();
+        const releaseAdmission = await this.acquirePromptAdmission(admissionGeneration);
         try {
-          if (this.inner.isBashRunning) {
+          // A steer or follow-up joins the run beside a `!` command, as pi's TUI
+          // queues it; only a prompt that would start a run waits for the command.
+          if (this.shellRunning && !(command.streamingBehavior && this.inner.isStreaming)) {
             throw new Error("Cannot send a prompt while a shell command is running");
           }
           if (this.sideChat) this.nameSideChat(command.message);
@@ -1155,9 +1411,7 @@ export class AgentSessionWrapper {
           if (this.chatOnlyExtensionModel && !(model && this.inner.modelRuntime.getModel(model.provider, model.id))) {
             throw chatOnlyExtensionModelError(this.chatOnlyExtensionModel.provider, this.chatOnlyExtensionModel.id);
           }
-          if (this.extensionUiAbortController.signal.aborted) {
-            this.extensionUiAbortController = new AbortController();
-          }
+          this.renewExtensionUiStop();
           const promptImages = command.images as Array<{ type: "image"; data: string; mimeType: string }> | undefined;
           const streamingBehavior = command.streamingBehavior as "steer" | "followUp" | undefined;
           let preflightAccepted = false;
@@ -1190,9 +1444,11 @@ export class AgentSessionWrapper {
             this.pendingPromptCount = Math.max(0, this.pendingPromptCount - 1);
             this.resetIdleTimer();
             this.notifyAgentRunCompleteIfIdle();
+            this.checkExtensionShutdown();
           };
 
           this.pendingPromptCount += 1;
+          promptCounted();
           // A prompt that may start a run first connects the session's MCP servers and
           // waits for the ones still connecting. The SDK runs before_agent_start before a
           // run has an abort signal, so Stop is honoured here: it ends the wait, and the
@@ -1200,28 +1456,8 @@ export class AgentSessionWrapper {
           // extension command before anything else and starts no run for it: another
           // extension's command skips this, and the built-in `/mcp`, which acts on the
           // registered servers, registers them without waiting (`mcpPromptPreparation()`).
-          const mcpPreparation = this.mcpHost && !this.inner.isStreaming
-            ? mcpPromptPreparation(typeof command.message === "string" ? command.message : "", this.extensionCommandCandidates())
-            : "none";
-          if (this.mcpHost && mcpPreparation !== "none") {
-            const controller = new AbortController();
-            const waited = this.mcpHost.prepareForPrompt(controller.signal, { wait: mcpPreparation === "wait" })
-              .catch((error: unknown) => {
-                console.error("[pi-web] MCP servers could not be prepared:", error instanceof Error ? error.message : error);
-              })
-              .then(() => {
-                if (!controller.signal.aborted) return;
-                finishPrompt();
-                throw new Error(MCP_WAIT_STOPPED_MESSAGE);
-              });
-            const wait = { controller, done: waited.then(() => undefined, () => undefined) };
-            this.mcpPromptWait = wait;
-            try {
-              await waited;
-            } finally {
-              if (this.mcpPromptWait === wait) this.mcpPromptWait = null;
-            }
-          }
+          try { await this.prepareMcpPrompt(typeof command.message === "string" ? command.message : ""); }
+          catch (error) { finishPrompt(); throw error; }
           // A new prompt, not one queued into a run: what an earlier run's Stop said is over.
           // Not at acceptance: pi accepts a command that awaits a run of its own after that
           // run settled, and the run's Stop must still keep its push and chime away.
@@ -1236,7 +1472,10 @@ export class AgentSessionWrapper {
               // validation and extension preflight have accepted the submission.
               // Every disposition (handled, queued, started) is an acceptance; a
               // rejected prompt never calls this and rejects `prompt` instead.
-              preflightResult: () => acceptPreflight(),
+              preflightResult: (disposition) => {
+                this.guardPromptPreflight(disposition, stopGeneration);
+                acceptPreflight();
+              },
             });
           } catch (error) {
             finishPrompt();
@@ -1297,6 +1536,9 @@ export class AgentSessionWrapper {
 
       case "abort": {
         this.forceShutdownOnIdle = true;
+        // A Stop cancels the subagent runtime's current stored run (its queued slot or its
+        // per-run controller) before the SDK path; an idle Stop touches no later run.
+        requestSubagentRunAbort(this.sessionId);
         // Arm the forced cleanup now: the reset above ran before this flag,
         // and the final reset only runs once the SDK run has unwound.
         this.resetIdleTimer();
@@ -1308,19 +1550,26 @@ export class AgentSessionWrapper {
           wait.controller.abort();
           await wait.done;
         }
-        // Stop ends the compaction, whose end would send the parked prompts:
-        // they go back to the composer instead, as the TUI's abort restores
-        // queued messages to the editor.
+        // pi's TUI clears every queue before it aborts (Esc, `restoreQueuedMessagesToEditor`)
+        // and puts the texts in the editor: left queued, a steer the stopped run would
+        // take at its next turn boundary was still sent, and the rest went out with the
+        // next prompt. Prompts parked behind a compaction come back too: Stop ends the
+        // compaction, whose end would send them.
+        const cleared = this.inner.clearQueue();
         const recalled = this.recallParkedPrompts();
         try {
           await this.withFinalIdleReset(() => this.inner.abort());
-          return recalled.steering.length || recalled.followUp.length ? recalled : null;
+          const steering = [...cleared.steering, ...recalled.steering];
+          const followUp = [...cleared.followUp, ...recalled.followUp];
+          if (!steering.length && !followUp.length) return null;
+          return { steering, followUp, ...(recalled.images ? { images: recalled.images } : {}) };
         } finally {
-          if (!this.isRunning()) this.forceShutdownOnIdle = false;
+          this.releaseForcedShutdownOnceStopped();
         }
       }
 
       case "get_state": {
+        this.reconcileSubagentToolPolicy();
         const model = this.inner.model;
         const contextUsage = this.inner.getContextUsage();
         return {
@@ -1328,7 +1577,7 @@ export class AgentSessionWrapper {
           sessionFile: this.inner.sessionFile ?? "",
           isStreaming: this.inner.isStreaming,
           isPromptRunning: this.pendingPromptCount > 0,
-          isBashRunning: this.inner.isBashRunning,
+          isBashRunning: this.shellRunning,
           isCompacting: this.inner.isCompacting,
           autoCompactionEnabled: this.inner.autoCompactionEnabled,
           autoRetryEnabled: this.inner.autoRetryEnabled,
@@ -1353,6 +1602,7 @@ export class AgentSessionWrapper {
           // per-run changes again once the run ends.
           systemPrompt: this.exactSystemPrompt?.() ?? (this.inner.agent.state?.systemPrompt || this.inner.systemPrompt || ""),
           thinkingLevel: this.inner.agent.state?.thinkingLevel ?? "off",
+          activeToolNames: this.inner.getActiveToolNames(),
           extensionStatuses: this.getExtensionStatuses(),
           extensionWidgets: this.getExtensionWidgets(),
         };
@@ -1388,16 +1638,26 @@ export class AgentSessionWrapper {
       }
 
       case "fork": {
-        if (this.inner.isBashRunning) {
+        if (this.shellRunning) {
           throw new Error("Cannot fork while a shell command is running");
         }
         this.refuseForkOfSideChat();
+        const entryId = command.entryId as string;
+        // pi's fork asks `session_before_fork` handlers first: one may cancel it, or
+        // ask (a dialog in the page) whether to restore the code to that point. Not
+        // under the copy's lock below: a dialog waits on the user, and Stop or a steer
+        // for a running source must still go through meanwhile.
+        if (this.inner.sessionManager.getEntry(entryId) && await this.forkCancelledByExtension(entryId, "before")) {
+          return { cancelled: true };
+        }
+        if (this.shellRunning) {
+          throw new Error("Cannot fork while a shell command is running");
+        }
         // Forking copies finished entries from disk into a new file and never
         // touches this AgentSession, so a running source keeps its run. Only an
         // idle source is shut down, because the browser moves to the child.
         const keepSource = this.isSessionRunningForReplacement();
         return this.withSessionReplacement("fork", async () => {
-          const entryId = command.entryId as string;
           const sessionManager = this.inner.sessionManager;
           const currentSessionFile = this.inner.sessionFile;
 
@@ -1444,7 +1704,7 @@ export class AgentSessionWrapper {
       }
 
       case "fork_branch": {
-        if (this.inner.isBashRunning) {
+        if (this.shellRunning) {
           throw new Error("Cannot fork while a shell command is running");
         }
         this.refuseForkOfSideChat();
@@ -1482,6 +1742,14 @@ export class AgentSessionWrapper {
         if (!sessionManager.isPersisted() || !leafId || !branchHasAssistant) return { cancelled: true };
         if (!currentSessionFile || !existsSync(currentSessionFile)) return { cancelled: true };
 
+        // pi's /clone asks the fork's handlers too, at the leaf (`position: "at"`), and
+        // likewise outside the copy's lock. `byExtension` tells the composer this refusal
+        // from the one above, which it reports as an empty or unsaved session.
+        if (await this.forkCancelledByExtension(leafId, "at")) return { cancelled: true, byExtension: true };
+        if (this.isSessionRunningForReplacement()) {
+          throw new Error("Cannot clone while the session is running");
+        }
+
         return this.withSessionReplacement("clone", async () => {
           const sessionDir = sessionManager.getSessionDir();
           const sourceManager = SessionManager.open(currentSessionFile, sessionDir);
@@ -1497,9 +1765,14 @@ export class AgentSessionWrapper {
       }
 
       case "navigate_tree": {
-        if (this.inner.isBashRunning) {
+        if (this.shellRunning) {
           throw new Error("Cannot navigate while a shell command is running");
         }
+        // pi's navigateTree() asks `session_before_tree` handlers first: an earlier Stop
+        // must not close their dialog before it shows. A Stop while it waits still lets the
+        // move through (pi moves inside navigateTree() right after the hook); the page shows
+        // Stop then only when a prompt was sent while the dialog waited.
+        this.renewExtensionUiStop();
         return this.navigateTreeKeepingToolSelection(command.targetId as string, {});
       }
 
@@ -1517,6 +1790,8 @@ export class AgentSessionWrapper {
       }
 
       case "compact": {
+        // `session_before_compact` handlers may ask too: an earlier Stop must not close their dialog.
+        this.renewExtensionUiStop();
         try {
           return await this.withFinalIdleReset(() =>
             this.inner.compact(command.customInstructions as string | undefined)
@@ -1577,6 +1852,7 @@ export class AgentSessionWrapper {
       }
 
       case "get_tools": {
+        this.reconcileSubagentToolPolicy();
         // A hidden tool is withdrawn: pi ignores it when setting the active tools.
         const all: ToolInfo[] = this.inner.getAllTools().filter((t) => t.exposure !== "hidden");
         const active = new Set<string>(this.inner.getActiveToolNames());
@@ -1636,21 +1912,21 @@ export class AgentSessionWrapper {
         if (this.isSessionRunningForReplacement()) {
           throw new Error("Wait for the current response to finish before reloading.");
         }
-        if (this.extensionUiAbortController.signal.aborted) {
-          this.extensionUiAbortController = new AbortController();
-        }
+        this.renewExtensionUiStop();
         const activeToolNames = this.inner.getActiveToolNames();
         await this.waitForExtensionsBound();
         this.extensionStatuses.clear();
         this.resetExtensionWidgetsForReload();
         this.syncProjectTrust();
         await this.inner.reload();
+        this.reportReloadIssues();
         // pi rebuilds from the tools active before, then extensions adjust them as they start
         // again; carry that result so a tool one switched off during reload stays off.
         this.setActiveToolSelection(activeToolNames);
         if (typeof this.inner.bindExtensions !== "function") {
           this.inner.extensionRunner.setUIContext?.(this.createExtensionUiContext(), "rpc");
         }
+        this.reconcileSubagentToolPolicy();
         invalidateModelsCache();
         // /reload is how an edited extension is picked up; the provider lists' runtime follows.
         invalidateModelRuntimeWithExtensions();
@@ -1678,24 +1954,53 @@ export class AgentSessionWrapper {
       }
 
       case "bash": {
-        if (this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning) {
+        // Beside a run it may go, as in pi's TUI: pi holds its result until the run
+        // ends (recordBashResult), so a tool call never loses its result's place.
+        // A prompt on its way to a run (arrived, admitted, not streaming yet), or a
+        // compaction, still refuses it.
+        if ((this.pendingPromptCount + this.arrivingPromptCount > 0 && !this.inner.isStreaming) || this.inner.isCompacting || this.shellRunning) {
           throw new Error("Cannot run a shell command while the session is busy");
         }
-        const execution = this.inner.executeBash(
-          command.command as string,
-          undefined,
-          {
-            excludeFromContext: command.excludeFromContext as boolean | undefined,
-            operations: createProjectCommandBashOperations({
-              shellPath: this.inner.settingsManager.getShellPath(),
-            }),
-          },
-        );
+        const bashCommand = command.command as string;
+        const excludeFromContext = command.excludeFromContext === true;
+        // pi counts a command as running only once executeBash starts; the hook comes first.
+        this.userBashPending = true;
+        const liveOutput = this.createBashOutputSnapshots(bashCommand);
         try {
-          const result = await execution;
+          // pi's TUI and RPC mode ask `user_bash` handlers first: one may run the
+          // command itself (a sandbox, a remote host) or hand over how to. A handler
+          // that throws has been reported by the runner and runs nothing, as there.
+          const hooked = await this.inner.extensionRunner.emitUserBash?.({
+            type: "user_bash",
+            command: bashCommand,
+            excludeFromContext,
+            cwd: this.inner.sessionManager.getCwd(),
+          }).catch((error: unknown) => {
+            // The runner's extension_error is the notice, as pi's TUI shows it once.
+            throw Object.assign(new Error(error instanceof Error ? error.message : String(error)), { code: EXTENSION_REPORTED_CODE });
+          });
+          let result;
+          if (hooked?.result) {
+            this.inner.recordBashResult?.(bashCommand, hooked.result, { excludeFromContext });
+            result = hooked.result;
+          } else {
+            result = await this.inner.executeBash(bashCommand, liveOutput.onChunk, {
+              excludeFromContext,
+              // An extension's operations get what pi gives them: no `env` (its
+              // executor's own, a sandbox's). Wrapping them would hand the host's
+              // environment and agent bin directory into that sandbox.
+              operations: hooked?.operations ?? createProjectCommandBashOperations({
+                shellPath: this.inner.settingsManager.getShellPath(),
+              }),
+            });
+          }
           this.persistBashOnlySession();
           return result;
         } finally {
+          this.userBashPending = false;
+          liveOutput.stop();
+          // A run that ended while the command went on reports its end now (isRunning() held it).
+          this.notifyAgentRunCompleteIfIdle();
           this.resetIdleTimer();
           invalidateSessionListCache();
         }
@@ -1703,6 +2008,7 @@ export class AgentSessionWrapper {
 
       case "abort_bash": {
         this.forceShutdownOnIdle = true;
+        this.forceShutdownCoversShell = true;
         this.resetIdleTimer();
         this.inner.abortBash();
         return null;
@@ -1712,7 +2018,9 @@ export class AgentSessionWrapper {
           throw new Error(`Unsupported command: ${type}`);
       }
     } finally {
+      promptCounted();
       if (tracksMutation) this.activeMutatingCommands = Math.max(0, this.activeMutatingCommands - 1);
+      this.checkExtensionShutdown();
     }
   }
 
@@ -1738,7 +2046,7 @@ export class AgentSessionWrapper {
     this.disposeMcpHost();
     // Tell attached SSE listeners to drop this instance so the browser
     // EventSource errors and reconnects instead of staying OPEN on a dead wrapper.
-    this.emit({ type: "session_shutdown" });
+    if (!this.extensionShutdownRequested) this.emit({ type: "session_shutdown" });
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.idleDeadlineAt = null;
     if (this.inner.isBashRunning) this.inner.abortBash();
@@ -1757,6 +2065,13 @@ export class AgentSessionWrapper {
         this.onDestroyCallback?.();
         // Here rather than in the registry's onDestroy callback, which a replacement swaps out.
         recordSessionClosed(this);
+        if (this.extensionShutdownRequested) {
+          invalidateSessionPathCache(this.sessionId);
+          if (this.sessionFile) invalidateSessionManagerCache(this.sessionFile);
+          invalidateSessionListCache();
+          this.extensionShutdownComplete = true;
+          this.emit({ type: "session_ended", sessionId: this.sessionId });
+        }
         this.resolveDisposed();
       }
     };
@@ -2351,13 +2666,10 @@ export class AgentSessionWrapper {
         } as ExtensionUiRequest as AgentEvent);
       },
       custom: <T = unknown>(factory: unknown, options?: unknown) => this.requestExtensionCustomUi<T>(factory, options),
+      // pi's RPC mode has no paste and sends set_editor_text; its TUI inserts at the
+      // caret. The page is the TUI's editor here, so it gets an event of its own.
       pasteToEditor: (text) => {
-        this.emit({
-          type: "extension_ui_request",
-          id: randomUUID(),
-          method: "set_editor_text",
-          text,
-        } as ExtensionUiRequest as AgentEvent);
+        this.emit({ type: "editor_paste", text });
       },
       setEditorText: (text) => {
         this.emit({
@@ -2417,10 +2729,80 @@ export class AgentSessionWrapper {
             this.inner.extensionRunner.setUIContext?.(this.createExtensionUiContext(), "rpc");
           },
         });
+        this.reconcileSubagentToolPolicy();
+        this.reportReloadIssues();
         // As the `reload` command: the provider lists' runtime follows.
         invalidateModelRuntimeWithExtensions();
       },
     };
+  }
+
+  /** A startup issue found once the wrapper exists (the model it could not restore); none for a subagent or side chat. */
+  addStartupIssue(issue: StartupIssue): void {
+    if (this.startupNotices) this.notifyIssue(issue);
+  }
+
+  /** Tells the streams open now; a session's own wrapper keeps the notice for the ones opened later. */
+  private notifyIssue(issue: StartupIssue): void {
+    const notice = {
+      type: "extension_ui_request",
+      id: randomUUID(),
+      method: "notify",
+      notifyType: issue.type,
+      message: issue.message,
+    } as ExtensionUiRequest as AgentEvent;
+    if (this.startupNotices && this.startupNotices.length < STARTUP_NOTICE_LIMIT) this.startupNotices.push(notice);
+    this.emit(notice);
+  }
+
+  /**
+   * pi's TUI lists `[Extension issues]` again after `/reload`: an edited extension that broke says
+   * so to every stream on the session, and they replace the startup notices later streams get.
+   */
+  private reportReloadIssues(): void {
+    let issues: StartupIssue[];
+    try {
+      issues = collectStartupIssues({ extensions: this.inner.resourceLoader?.getExtensions?.() });
+    } catch {
+      return; // The reload itself went through; its report is best effort.
+    }
+    for (const issue of issues) console.warn(`[pi-web] session ${this.sessionId} reload: ${issue.message}`);
+    if (this.startupNotices) this.startupNotices.length = 0;
+    for (const issue of limitStartupNotices(issues)) this.notifyIssue(issue);
+  }
+
+  /**
+   * The Stop signal extension dialogs answer to, renewed when an earlier Stop left it aborted
+   * (Stop rejects every dialog shown under it). A `session_before_*` hook needs it renewed too:
+   * pi's runner logs a handler that throws and goes on as if it had not answered, so a guard's
+   * "Fork anyway?" would never show and the fork would go through.
+   */
+  private renewExtensionUiStop(): AbortSignal {
+    if (this.extensionUiAbortController.signal.aborted) {
+      this.extensionUiAbortController = new AbortController();
+    }
+    return this.extensionUiAbortController.signal;
+  }
+
+  /**
+   * As AgentSessionRuntime.emitBeforeFork(): only when a handler listens, and true on `{ cancel: true }`.
+   * A Stop while it runs counts as a cancel: it closes the handler's dialog, which pi's TUI answers
+   * with `undefined` and a guard reads as no.
+   */
+  private async forkCancelledByExtension(entryId: string, position: "before" | "at"): Promise<boolean> {
+    const stopSignal = this.renewExtensionUiStop();
+    // Bound first, as pi forks only a bound session: before that a handler sees no UI
+    // (`ctx.hasUI` false) and takes its non-interactive branch. A binding that failed
+    // leaves no handler to ask; the copy goes on.
+    try {
+      await this.waitForExtensionsBound();
+    } catch {
+      return false;
+    }
+    const runner = this.inner.extensionRunner;
+    if (!runner.emit || !runner.hasHandlers?.("session_before_fork")) return false;
+    const result = await runner.emit({ type: "session_before_fork", entryId, position });
+    return (result as { cancel?: unknown } | undefined)?.cancel === true || stopSignal.aborted;
   }
 
   private syncProjectTrust(): void {
@@ -2534,15 +2916,16 @@ const SUBAGENT_CONTROLLER = createSubagentController({
   registerSession: (inner, options) => {
     const wrapper = new AgentSessionWrapper(inner, {
       ...(options?.exactSystemPrompt !== undefined
-        ? { exactSystemPrompt: options.exactSystemPrompt }
+        ? { exactSystemPrompt: () => options.exactSystemPrompt! }
         : {}),
       chatOnly: options?.chatOnly,
+      mcpHost: options?.mcpHost,
+      subagentResources: readSubagentSessionResources(inner.sessionManager.getEntries() as unknown as SessionEntry[]),
       suppressCompletionNotifications: true,
-      onDirectTurnSettled: (aborted) => SUBAGENT_CONTROLLER.settleDirectTurn(inner.sessionId, aborted),
-      ...(options?.mcpHost ? { mcpHost: options.mcpHost } : {}),
+      onDirectTurnSettled: (aborted, fromIndex) => SUBAGENT_CONTROLLER.settleDirectTurn(inner.sessionId, aborted, fromIndex),
     });
     registerRpcWrapper(wrapper);
-    return wrapper;
+    return wrapper.waitUntilReady();
   },
   reopenSession: async (sessionId, sessionFile) =>
     (await startRpcSession(sessionId, sessionFile, undefined)).session,
@@ -2704,6 +3087,11 @@ export async function setRpcSessionTools(
     if (pending) {
       await pending.catch(() => undefined);
       return setRpcSessionTools(sessionId, sessionFile, requestedToolNames);
+    }
+    if (!existsSync(sessionFile)) {
+      invalidateSessionPathCache(sessionId);
+      invalidateSessionListCache();
+      throw Object.assign(new Error("Session not found"), { status: 404 });
     }
     const manager = SessionManager.open(sessionFile, undefined);
     if (readSubagentSessionResources(manager.getEntries() as unknown as SessionEntry[])) {
@@ -3073,6 +3461,13 @@ export async function startRpcSession(
 
   let sessionManager: SessionManager;
   if (sessionFile) {
+    // A shutdown hook can delete the file while this start waits for disposal.
+    // SDK open() creates a fresh session for a missing path, so check after that wait.
+    if (!existsSync(sessionFile)) {
+      invalidateSessionPathCache(sessionId);
+      invalidateSessionListCache();
+      throw Object.assign(new Error("Session not found"), { status: 404 });
+    }
     sessionManager = SessionManager.open(sessionFile, undefined);
   } else {
     if (!cwd) throw new Error("cwd is required for a new session");
@@ -3080,12 +3475,11 @@ export async function startRpcSession(
   }
   const sessionCwd = sessionManager.getCwd();
   const sessionEntries = sessionManager.getEntries() as unknown as SessionEntry[];
-  const hasPersistedSubagentSnapshot = sessionFile && hasSubagentResourceSnapshot(sessionEntries);
   const subagentResources = sessionFile
     ? readSubagentSessionResources(sessionEntries)
     : null;
-  if (hasPersistedSubagentSnapshot && !subagentResources) {
-    throw new Error("Invalid subagent resource snapshot");
+  if (sessionFile && !subagentResources && sessionManager.getEntries().some((entry) => entry.type === "custom" && entry.customType === SUBAGENT_META_TYPE)) {
+    throw new Error("Cannot restore subagent: missing or invalid resource snapshot");
   }
   const persistedToolNames = subagentResources
     ? undefined
@@ -3095,7 +3489,7 @@ export async function startRpcSession(
     appendSessionToolSelection(sessionManager, requestedToolNames);
   }
   const subagentLoadsResources = Boolean(
-    subagentResources?.loadExtensions || subagentResources?.loadSkills || subagentResources?.codemode || subagentResources?.mcp,
+    subagentResources?.loadExtensions || subagentResources?.loadSkills || (subagentResources?.version === 3 && (subagentResources.codeMode || subagentResources.loadMcp)),
   );
   const chatOnly = pinnedToolNames?.length === 0 && !subagentLoadsResources;
   // A side chat (ADR 0007) starts as a normal session, or as Chat only, with fewer tools.
@@ -3115,8 +3509,7 @@ export async function startRpcSession(
 
     // Determine which tools to pass based on requested toolNames.
     // Since v0.68.0, session creation expects string[] tool names instead of Tool[] instances.
-    // A subagent's tools come from its snapshot (subagentToolOptions() below).
-    let toolsOption: string[] | undefined;
+    let toolsOption: string[] | undefined = subagentResources?.toolPolicy ? undefined : subagentResources?.tools;
     if (!subagentResources && selectedToolNames !== undefined) {
       // toolNames === [] -> "all off" (an empty allow-list disables every tool).
       // Otherwise DO NOT pass a builtin-only allow-list: passing CODING_TOOL_NAMES
@@ -3139,7 +3532,12 @@ export async function startRpcSession(
       : chatOnly
         ? undefined
         : projectTrustReloadOptions(sessionCwd, agentDir);
-    const settingsManager = SettingsManager.create(sessionCwd, agentDir);
+    // Trusted only by the folder's decision, as `syncProjectTrust()` reads it: created trusted
+    // by default, a session that resolves no trust on load (a subagent that loads no
+    // resources, Chat only) read the project settings of a folder never trusted.
+    const settingsManager = SettingsManager.create(sessionCwd, agentDir, {
+      projectTrusted: getProjectTrustStatus(sessionCwd, agentDir).trusted,
+    });
     // Here the allow-list is the point: extensions stay loaded, their tools and what
     // the parent did not have stay out of the registry.
     if (sideChatTools) toolsOption = resolveShellTools(selectedToolNames ?? [], settingsManager.getDefaultTools());
@@ -3154,43 +3552,17 @@ export async function startRpcSession(
     const builtins = subagentResources || chatOnly || sideChatTools
       ? undefined
       : await createPiWebBuiltinExtensions({ agentDir });
-    const subagentCodemode = subagentResources?.codemode
-      ? await createSubagentCodemodeExtension({
-          agentDir,
-          cwd: sessionCwd,
-          projectTrusted: () => settingsManager.isProjectTrusted(),
-        })
-      : undefined;
-    const subagentMcp = subagentResources?.mcp
-      ? await createSubagentMcpExtensions({
-          agentDir,
-          cwd: sessionCwd,
-          projectTrusted: () => settingsManager.isProjectTrusted(),
-          codemode: subagentResources.codemode === true,
-        })
-      : undefined;
-    const skillsBinding = subagentResources ? createSubagentSkillsBinding({
-      loadSkills: subagentResources.loadSkills,
-      skills: subagentResources.skills,
-      exactSystemPrompt: subagentResources.exactSystemPrompt
-        ?? (chatOnly ? subagentResources.appendSystemPrompt[0] ?? "" : undefined),
-    }) : undefined;
-    const subagentExtensionFactories = [
-      ...(subagentCodemode ? [subagentCodemode] : []),
-      ...(subagentMcp && subagentResources
-        ? [...subagentMcp.extensions, createSubagentMcpPolicyExtension(() => subagentResources)]
-        : []),
-      ...(skillsBinding?.loaderOptions.extensionFactories ?? []),
-    ];
-    const services = await createAgentSessionServices({
+    const createServices = subagentResources
+      ? (options: Parameters<typeof createSubagentSessionServices>[0]) => createSubagentSessionServices(options, subagentResources)
+      : createAgentSessionServices;
+    const services = await createServices({
       cwd: sessionCwd,
       agentDir,
       settingsManager,
       resourceLoaderOptions: subagentResources
         ? {
-            ...subagentExtensionLoaderOptions(subagentResources),
-            ...skillsBinding!.loaderOptions,
-            ...(subagentExtensionFactories.length > 0 ? { extensionFactories: subagentExtensionFactories } : {}),
+            noExtensions: !subagentResources.loadExtensions,
+            noSkills: !subagentResources.loadSkills,
             noPromptTemplates: true,
             noThemes: true,
             noContextFiles: true,
@@ -3201,11 +3573,13 @@ export async function startRpcSession(
                 }
               : {}),
             appendSystemPrompt: subagentResources.appendSystemPrompt,
+            ...(chatOnly || subagentResources.exactSystemPrompt !== undefined ? { extensionFactories: [exactSystemPromptExtension] } : {}),
           }
         : chatOnly
           ? { ...CHAT_ONLY_RESOURCE_LOADER_OPTIONS, extensionFactories: [exactSystemPromptExtension] }
         : {
             extensionFactories: [
+              llamaCppExtension,
               ...(builtins?.extensions ?? []),
               createReadOnlyMcpPolicyExtension(),
               createProjectCommandBashExtension({
@@ -3222,10 +3596,6 @@ export async function startRpcSession(
           },
       ...(trustReloadOptions ? { resourceLoaderReloadOptions: trustReloadOptions } : {}),
     });
-    if (subagentResources?.codemode
-      && !services.resourceLoader.getExtensions().extensions.some((extension) => extension.tools.has("codemode"))) {
-      throw new Error("Code mode is unavailable: builtin:codemode was not registered");
-    }
     const enabledModels = services.settingsManager.getEnabledModels();
     const scope = await resolveVisibleModels(services.modelRuntime, enabledModels);
     // A provider an extension registers only at session_start (lib/deferred-provider-models.ts)
@@ -3253,13 +3623,31 @@ export async function startRpcSession(
     const branch = sessionManager.getBranch();
     // System messages carry the prompt and tool loadout, not a conversation.
     const hasExistingMessages = branch.some((entry) => entry.type === "message" && entry.message.role !== "system");
-    const savedModel = hasExistingMessages
+    // Child setup already records its selected model, even before its first conversation.
+    const savedModel = hasExistingMessages || subagentResources
       ? getLatestModelChange(branch as unknown as SessionEntry[])
       : null;
     const restoredModel = savedModel
       ? services.modelRuntime.getModel(savedModel.provider, savedModel.modelId)
       : undefined;
-    const initial = hasExistingMessages ? null : selectInitialModelScope(scope, {
+    // A snapshot with no recorded model is corrupt: fail closed before the SDK appends a default
+    // `model_change`, which would silently rewrite the child onto the runtime's default model.
+    if (subagentResources && !savedModel) {
+      throw new Error("Cannot restore subagent: no recorded model");
+    }
+    // A child must restore its recorded model from this runtime before the SDK ever touches the
+    // session file. For a new / setup-only child session the SDK appends a default `model_change`
+    // during construction, so waiting for a post-bind switch would rewrite the record first. A
+    // remembered deferred catalog entry is therefore not enough; an unavailable model (including
+    // a session_start-only provider) fails closed here without touching the file.
+    if (subagentResources && savedModel
+      && (!restoredModel || !services.modelRuntime.hasConfiguredAuth(restoredModel.provider))) {
+      throw new Error(`Cannot restore subagent model ${savedModel.provider}/${savedModel.modelId}: model or authentication is unavailable`);
+    }
+    const deferredSavedModel = savedModel && !restoredModel
+      ? findDeferredModel(services.modelRuntime, savedModel.provider, savedModel.modelId)
+      : undefined;
+    const initial = hasExistingMessages || (subagentResources && savedModel) ? null : selectInitialModelScope(scope, {
         ...(effectiveInitialModel ? { requestedModel: effectiveInitialModel } : {}),
         ...(defaultModel ? { defaultModel } : {}),
         ...(thinkingLevel ? { thinkingLevel } : {}),
@@ -3268,6 +3656,11 @@ export async function startRpcSession(
     const startupModel = restoredModel && services.modelRuntime.hasConfiguredAuth(restoredModel.provider)
       ? restoredModel
       : initial?.model;
+    // Pi only replays historical thinking when conversation messages exist. A frozen
+    // setup-only child must not adopt today's defaults during cold restoration.
+    const startupThinkingLevel = (subagentResources
+      ? branch.findLast((entry) => entry.type === "thinking_level_change")?.thinkingLevel as ThinkingLevel | undefined
+      : undefined) ?? initial?.thinkingLevel;
     // A registered default the session starts on is in scope with deferred models counted too
     // (globs and exact entries only gain matches), unless the scope fell back to every model.
     const startsOnDefault = Boolean(initial?.model && defaultModel
@@ -3276,15 +3669,13 @@ export async function startRpcSession(
     // pi's pick with deferred providers counted in, as /api/models shows it (#1240): a deferred
     // model asked for gets its enabledModels pin; with no usable model asked for, the browser shows
     // that pick and sends none, so a deferred pick is switched to as well.
-    const deferredStartup = !hasExistingMessages && !chatOnly && (deferredInitialModel || (!effectiveInitialModel && !startsOnDefault))
+    const deferredStartup = !subagentResources && !hasExistingMessages && !chatOnly && (deferredInitialModel || (!effectiveInitialModel && !startsOnDefault))
       ? await findDeferredStartupModel(services.modelRuntime, enabledModels, deferredInitialModel
         ? { requestedModel: { provider: deferredInitialModel.provider, modelId: deferredInitialModel.id } }
         : defaultModel ? { defaultModel } : {})
       : undefined;
-    const deferredModel = hasExistingMessages
-      ? savedModel && !restoredModel
-        ? findDeferredModel(services.modelRuntime, savedModel.provider, savedModel.modelId)
-        : undefined
+    const deferredModel = subagentResources ? undefined : hasExistingMessages
+      ? deferredSavedModel
       : deferredInitialModel ?? deferredStartup?.model;
     // set_model applies the model's modelThinkingLevels entry, else defaultThinkingLevel, else keeps
     // the current level: the stand-in model's (clamped, or its own pin). Apply what pi's
@@ -3309,16 +3700,21 @@ export async function startRpcSession(
         ? findDeferredModel(services.modelRuntime, defaultProvider, defaultModelId)
         : undefined)
       : undefined;
-    const { session: inner } = await createAgentSessionFromServices({
+    const { session: inner, modelFallbackMessage } = await createAgentSessionFromServices({
       services,
       sessionManager,
       ...(startupModel ? { model: startupModel } : {}),
-      ...(initial?.thinkingLevel ? { thinkingLevel: initial.thinkingLevel } : {}),
+      ...(startupThinkingLevel ? { thinkingLevel: startupThinkingLevel } : {}),
       ...(scope.scopedModels.length > 0 ? { scopedModels: [...scope.scopedModels] } : {}),
-      ...(subagentResources
-        ? subagentToolOptions(subagentResources)
-        : toolsOption !== undefined ? { tools: toolsOption } : {}),
+      ...(toolsOption !== undefined ? { tools: toolsOption } : {}),
+      ...(subagentResources?.toolPolicy
+        ? { noTools: "builtin", excludeTools: subagentToolExclusions(subagentResources.builtinTools) }
+        : subagentResources ? { excludeTools: [...SUBAGENT_CONTROL_TOOL_NAMES] } : {}),
     });
+
+    if (subagentResources?.toolPolicy) {
+      inner.setActiveToolsByName([...new Set([...subagentResources.builtinTools, ...inner.getActiveToolNames()])]);
+    }
 
     // A pinned selection replaces only the coding tools of the SDK's initial loadout, which
     // already holds the extension tools pi activates on registration and whatever
@@ -3331,14 +3727,25 @@ export async function startRpcSession(
       );
     }
 
-    skillsBinding?.setActiveToolsGetter(() => inner.getActiveToolNames());
-    const exactSystemPrompt = subagentResources
-      ? skillsBinding!.getExactSystemPrompt
+    const exactSystemPrompt = subagentResources?.exactSystemPrompt !== undefined
+      ? () => subagentResources.exactSystemPrompt!
       : chatOnly
-        ? () => contextFilesSystemPrompt(inner.resourceLoader.getAgentsFiles().agentsFiles)
+        ? subagentResources
+          ? () => subagentResources.appendSystemPrompt[0] ?? ""
+          : () => contextFilesSystemPrompt(inner.resourceLoader.getAgentsFiles().agentsFiles)
         : undefined;
     exactSystemPromptRef.current = exactSystemPrompt;
-    const mcpHost = builtins?.mcpHost ?? subagentMcp?.mcpHost;
+    const startupIssues = collectStartupIssues({
+      diagnostics: services.diagnostics,
+      extensions: services.resourceLoader.getExtensions(),
+    });
+    for (const issue of startupIssues) console.warn(`[pi-web] session ${inner.sessionId}: ${issue.message}`);
+    // pi's "Could not restore model X. Using Y" holds unless the deferred switch below reaches X.
+    // Without any model (pi's placeholder) its text sends to /login, a TUI command, and the model
+    // picker already says "No models".
+    const builtOnModel = inner.model && services.modelRuntime.getModel(inner.model.provider, inner.model.id);
+    const restoreFallback = builtOnModel ? modelFallbackMessage : undefined;
+    let restoredDeferredModel = false;
     const wrapper = new AgentSessionWrapper(inner, {
       exactSystemPrompt,
       chatOnly,
@@ -3348,12 +3755,15 @@ export async function startRpcSession(
         });
       },
       suppressCompletionNotifications: Boolean(subagentResources) || isSideChat,
+      subagentResources,
+      ...(subagentResources && "mcpHost" in services && services.mcpHost ? { mcpHost: services.mcpHost as McpHost } : builtins?.mcpHost ? { mcpHost: builtins.mcpHost } : {}),
       ...(subagentResources
-        ? { onDirectTurnSettled: (aborted: boolean) => SUBAGENT_CONTROLLER.settleDirectTurn(inner.sessionId, aborted) }
+        ? { onDirectTurnSettled: (aborted: boolean, fromIndex: number) => SUBAGENT_CONTROLLER.settleDirectTurn(inner.sessionId, aborted, fromIndex) }
         : {}),
-      ...(mcpHost ? { mcpHost } : {}),
       ...(chatOnlyExtensionModel ? { chatOnlyExtensionModel } : {}),
       sideChat: isSideChat,
+      // A subagent's or side chat's tab would say again what its parent's page said.
+      ...(subagentResources || isSideChat ? {} : { startupIssues: limitStartupNotices(startupIssues) }),
     });
     const realSessionId = inner.sessionId as string;
     registerRpcWrapper(wrapper);
@@ -3364,6 +3774,7 @@ export async function startRpcSession(
         try {
           await wrapper.waitUntilReady();
           await wrapper.send({ type: "set_model", provider: deferredModel.provider, modelId: deferredModel.id });
+          restoredDeferredModel = true;
           if (deferredThinkingLevel) await wrapper.send({ type: "set_thinking_level", level: deferredThinkingLevel });
         } catch (error) {
           console.error(`[pi-web] could not switch to ${deferredModel.provider}/${deferredModel.id}:`, error instanceof Error ? error.message : error);
@@ -3373,6 +3784,10 @@ export async function startRpcSession(
       void wrapper.waitUntilReady()
         .then(() => rememberProviderModels(inner.modelRuntime as ModelRuntime))
         .catch(() => undefined);
+    }
+    if (restoreFallback && !restoredDeferredModel) {
+      console.warn(`[pi-web] session ${realSessionId}: ${restoreFallback}`);
+      wrapper.addStartupIssue({ type: "warning", message: restoreFallback });
     }
 
     return { session: wrapper, realSessionId };

@@ -46,16 +46,19 @@ export async function PUT(req: Request) {
       cwd?: unknown;
       scope?: unknown;
       profile?: Omit<SubagentProfile, "scope" | "filePath">;
+      cloneFrom?: { scope?: unknown; name?: unknown };
     };
     const cwd = await validateCwd(body.cwd);
     const scope = validateScope(body.scope);
     if (!body.profile || typeof body.profile.name !== "string") {
       return NextResponse.json({ error: "profile required" }, { status: 400 });
     }
-    return NextResponse.json({ profile: saveSubagentProfile(cwd, scope, body.profile) });
+    const cloneFrom = body.cloneFrom ? listSubagentProfileSources(cwd).find((source) => source.scope === body.cloneFrom?.scope && source.name === body.cloneFrom?.name) : undefined;
+    if (body.cloneFrom && !cloneFrom) throw new Error("Clone source not found");
+    return NextResponse.json({ profile: saveSubagentProfile(cwd, scope, body.profile, cloneFrom) });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    return NextResponse.json({ error: message }, { status: message === "Access denied" ? 403 : 400 });
+    return NextResponse.json({ error: message }, { status: message === "Access denied" ? 403 : message === "Cannot clone over an existing profile" ? 409 : 400 });
   }
 }
 
@@ -75,32 +78,10 @@ export async function PATCH(req: Request) {
       writeDisabledBuiltInSubagent(source.name, !body.enabled);
       return NextResponse.json({ profile: { ...source, enabled: body.enabled } });
     }
-    const profile: Omit<SubagentProfile, "scope" | "filePath"> = {
-      name: source.name,
-      displayName: source.displayName,
-      description: source.description,
-      systemPrompt: source.systemPrompt,
-      tools: source.tools,
-      ...(source.extensionTools !== undefined ? { extensionTools: [...source.extensionTools] } : {}),
-      ...(source.disallowedExtensionTools !== undefined ? { disallowedExtensionTools: [...source.disallowedExtensionTools] } : {}),
-      loadSkills: source.loadSkills,
-      ...(source.skills !== undefined ? { skills: [...source.skills] } : {}),
-      loadExtensions: source.loadExtensions,
-      ...(source.extensions !== undefined ? { extensions: [...source.extensions] } : {}),
-      codemode: source.codemode,
-      mcp: source.mcp,
-      promptMode: source.promptMode,
-      model: source.model,
-      thinking: source.thinking,
-      maxTurns: source.maxTurns,
-      inheritContext: source.inheritContext,
-      runInBackground: source.runInBackground,
-      color: source.color,
-      isolation: source.isolation,
-      persistSession: source.persistSession,
-      enabled: source.enabled,
-    };
-    return NextResponse.json({ profile: saveSubagentProfile(cwd, scope, { ...profile, enabled: body.enabled }) });
+    // The writer derives its target from cwd/scope/name, never from source.filePath.
+    // `source` already carries the local role capabilities (codeMode/loadMcp/mcpServers/
+    // skills/extensions/allowParentModelOverride), so a partial PATCH must not drop them.
+    return NextResponse.json({ profile: saveSubagentProfile(cwd, scope, { ...source, enabled: body.enabled }) });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return NextResponse.json({ error: message }, { status: message === "Access denied" ? 403 : 400 });

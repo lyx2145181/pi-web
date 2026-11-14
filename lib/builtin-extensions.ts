@@ -14,6 +14,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { McpHost, type McpHostOptions } from "./mcp-host";
+import { CODEMODE_EXTENSION_PATH } from "./mcp-command";
 import { createPiWebMcpTransportFactory } from "./mcp-transport";
 import { loadPiSdkInternals, type PiSdkInternals, type PiSdkInternalsResult } from "./pi-sdk-internals";
 import { mayReadProjectConfigNow } from "./project-trust";
@@ -23,9 +24,11 @@ import { PROJECT_SETTINGS_MAX_BYTES, readRegularFileText } from "./regular-file"
 // export (ADR 0006, "Loading"). Normal sessions load them under the CLI's
 // names, so `-builtin:<name>`, project overrides, `noExtensions`, and
 // replacement by a third-party extension that registers `/mcp`, `codemode`, or
-// `tool_search` behave as in the CLI. `llama.cpp` is not among them: it serves
-// a local model server, not a feature of the session. Chat-only sessions load
-// none of them; a subagent only what its profile turns on.
+// `tool_search` behave as in the CLI. `llama.cpp` is not among them: only its provider
+// registers, through `llamaCppExtension` (lib/pi-sdk-internals.ts) in the runtimes that list
+// models and in a session that loads extensions, and it grants no tool, MCP or Code mode
+// surface. Chat-only sessions load none of them; a subagent loads only the built-ins its
+// frozen resource selection permits.
 
 export const MCP_DISABLE_VARIABLE = "PI_WEB_DISABLE_MCP";
 
@@ -52,6 +55,10 @@ function errorMessage(error: unknown): string {
 const SELF_TEST_SCRIPT = "return 6 * 7";
 const SELF_TEST_OUTPUT = "42";
 const SELF_TEST_TIMEOUT_MS = 10_000;
+/** How often the self-test's deadline counts time. */
+const SELF_TEST_TICK_MS = 100;
+/** A failed self-test is run again by a session starting this long after it failed. */
+const SELF_TEST_RETRY_MS = 60_000;
 
 export interface CodemodeSelfTestOptions {
   timeoutMs?: number;
@@ -94,11 +101,25 @@ export async function runCodemodeSelfTest(options: CodemodeSelfTestOptions = {})
   const timeoutMs = options.timeoutMs ?? SELF_TEST_TIMEOUT_MS;
   const controller = new AbortController();
   let timer: NodeJS.Timeout | undefined;
+  // The deadline counts only time the event loop was free to deliver the sandbox's answer. The
+  // first session runs the self-test while the server does its heaviest work, and a synchronous
+  // stall there fires a plain timer before the poll phase hands over a reply the worker already
+  // sent (#1615); a late tick therefore counts as at most two ticks. A loop that keeps stalling
+  // still gives up after three times the limit.
+  const tickMs = Math.min(SELF_TEST_TICK_MS, timeoutMs);
+  const startedAt = Date.now();
   const timedOut = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
+    let counted = 0;
+    let last = startedAt;
+    timer = setInterval(() => {
+      const now = Date.now();
+      counted += Math.min(Math.max(now - last, 0), 2 * tickMs);
+      last = now;
+      if (counted < timeoutMs && now - startedAt < 3 * timeoutMs) return;
+      clearInterval(timer);
       controller.abort();
       reject(new Error(`the sandbox did not answer within ${timeoutMs} ms`));
-    }, timeoutMs);
+    }, tickMs);
     timer.unref?.();
   });
   try {
@@ -121,20 +142,49 @@ export async function runCodemodeSelfTest(options: CodemodeSelfTestOptions = {})
   } catch (error) {
     return { available: false, reason: errorMessage(error) };
   } finally {
-    clearTimeout(timer);
+    clearInterval(timer);
   }
 }
 
 // Hot reload re-evaluates this module; globalThis keeps one self-test per process.
-const CODEMODE_SANDBOX_KEY: symbol = Symbol.for("pi-web.codemodeSandbox");
+const CODEMODE_SANDBOX_KEY: symbol = Symbol.for("pi-web.codemodeSandboxCheck");
 
-/** The sandbox self-test, run once per server process on the first normal session. */
-export function checkCodemodeSandbox(): Promise<BuiltinFeatureStatus> {
-  const store = globalThis as Record<symbol, Promise<BuiltinFeatureStatus> | undefined>;
-  return store[CODEMODE_SANDBOX_KEY] ??= runCodemodeSelfTest().then((status) => {
-    if (!status.available) console.warn(`[pi-web] Code mode is off: ${status.reason}`);
-    return status;
-  });
+interface CodemodeSandboxCheck {
+  result: Promise<BuiltinFeatureStatus>;
+  /** Set once the test failed: a session starting from then on runs it again. */
+  retryAt?: number;
+  /** The failure this run retries, which Settings keeps showing until it settles. */
+  previous?: BuiltinFeatureStatus;
+  failure?: BuiltinFeatureStatus;
+}
+
+function sandboxStore(): Record<symbol, CodemodeSandboxCheck | undefined> {
+  return globalThis as Record<symbol, CodemodeSandboxCheck | undefined>;
+}
+
+/**
+ * The sandbox self-test, run on the first normal session of a server process. A pass is kept for
+ * the process; a failure only for `SELF_TEST_RETRY_MS`, so one bad moment never switches Code mode
+ * off until a restart, and a sandbox that keeps failing costs a session start at most once a minute.
+ */
+export function checkCodemodeSandbox(options: { now?: number; selfTest?: () => Promise<BuiltinFeatureStatus> } = {}): Promise<BuiltinFeatureStatus> {
+  const store = sandboxStore();
+  const current = store[CODEMODE_SANDBOX_KEY];
+  const now = options.now ?? Date.now();
+  if (current && (current.retryAt === undefined || now < current.retryAt)) return current.result;
+  const check: CodemodeSandboxCheck = {
+    previous: current?.failure,
+    result: (options.selfTest ?? runCodemodeSelfTest)().then((status) => {
+      if (!status.available) {
+        console.warn(`[pi-web] Code mode is off: ${status.reason}`);
+        check.failure = status;
+        check.retryAt = Date.now() + SELF_TEST_RETRY_MS;
+      }
+      return status;
+    }),
+  };
+  store[CODEMODE_SANDBOX_KEY] = check;
+  return check.result;
 }
 
 export type CodemodeSandboxPeek = { checked: false } | ({ checked: true } & BuiltinFeatureStatus);
@@ -145,15 +195,15 @@ const NOT_SETTLED: unique symbol = Symbol("not settled");
  * The self-test's result once it has settled, without ever starting it: the
  * first normal session runs it, and Settings only reports what it found. A
  * test still running, or not started since the server did, is `checked:
- * false`. A promise that has already settled wins the race against one
+ * false`, unless it retries a failure, which stays reported until it settles. A promise that has already settled wins the race against one
  * resolved now, because their reactions run in the order they were attached.
  */
 export async function peekCodemodeSandbox(): Promise<CodemodeSandboxPeek> {
-  const store = globalThis as Record<symbol, Promise<BuiltinFeatureStatus> | undefined>;
-  const pending = store[CODEMODE_SANDBOX_KEY];
-  if (!pending) return { checked: false };
-  const settled = await Promise.race([pending, Promise.resolve(NOT_SETTLED)]);
-  return settled === NOT_SETTLED ? { checked: false } : { checked: true, ...settled };
+  const check = sandboxStore()[CODEMODE_SANDBOX_KEY];
+  if (!check) return { checked: false };
+  const settled = await Promise.race([check.result, Promise.resolve(NOT_SETTLED)]);
+  if (settled !== NOT_SETTLED) return { checked: true, ...settled };
+  return check.previous ? { checked: true, ...check.previous } : { checked: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -263,11 +313,12 @@ function readSettingsExtensions(path: string, maxBytes?: number): string[] | und
 
 type SettingsScope = "global" | "project";
 
-async function resolveBuiltinSwitches(
+async function resolveBuiltinSwitches<Name extends string>(
   options: { agentDir: string; cwd: string; projectTrusted: boolean },
   lists: Partial<Record<SettingsScope, string[]>>,
   paths: Record<SettingsScope, string>,
-): Promise<Record<BuiltinExtensionName, BuiltinExtensionSwitch>> {
+  names: readonly Name[],
+): Promise<Record<Name, BuiltinExtensionSwitch>> {
   const { agentDir, cwd, projectTrusted } = options;
   const storage: Parameters<typeof SettingsManager.fromStorage>[0] = {
     withLock: (scope, fn) => {
@@ -279,12 +330,12 @@ async function resolveBuiltinSwitches(
     cwd,
     agentDir,
     settingsManager: SettingsManager.fromStorage(storage, { projectTrusted }),
-    builtinExtensions: [...BUILTIN_EXTENSION_NAMES],
+    builtinExtensions: [...names],
   });
   // Nothing is missing without packages; skip rather than install if that ever changes.
   const resolved = await packageManager.resolve(async () => "skip");
-  const switches = {} as Record<BuiltinExtensionName, BuiltinExtensionSwitch>;
-  for (const name of BUILTIN_EXTENSION_NAMES) {
+  const switches = {} as Record<Name, BuiltinExtensionSwitch>;
+  for (const name of names) {
     const resource = resolved.extensions.find((extension) => extension.path === `builtin:${name}`);
     const enabled = resource?.enabled ?? true;
     switches[name] = enabled
@@ -322,9 +373,9 @@ export async function readBuiltinExtensionSwitches(options: {
   const global = readSettingsExtensions(paths.global);
   // The project file is the repository's, read by a GET: capped, and never a FIFO.
   const project = projectTrusted ? readSettingsExtensions(paths.project, PROJECT_SETTINGS_MAX_BYTES) : undefined;
-  const switches = await resolveBuiltinSwitches({ agentDir, cwd, projectTrusted }, { global, project }, paths);
+  const switches = await resolveBuiltinSwitches({ agentDir, cwd, projectTrusted }, { global, project }, paths, BUILTIN_EXTENSION_NAMES);
   if (project === undefined) return switches;
-  const globalSwitches = await resolveBuiltinSwitches({ agentDir, cwd, projectTrusted: false }, { global }, paths);
+  const globalSwitches = await resolveBuiltinSwitches({ agentDir, cwd, projectTrusted: false }, { global }, paths, BUILTIN_EXTENSION_NAMES);
   for (const name of BUILTIN_EXTENSION_NAMES) switches[name].global = globalSwitches[name];
   return switches;
 }
@@ -343,112 +394,27 @@ function builtin(name: BuiltinExtensionName, factory: ExtensionFactory): InlineE
   return { name, factory, replaceable: true, builtin: true };
 }
 
-/**
- * `tool-search`, `mcp`, and the host that decides which servers `mcp` connects, in the CLI's
- * order. Servers whose tools only scripts reach register as `deferred` while
- * `codemodeAvailable()` is false. `gate` wraps each built-in's factory.
- */
-function createMcpBuiltins(
-  mcp: McpRuntimeResult,
-  options: {
-    agentDir: string;
-    codemodeAvailable: () => boolean;
-    mcpHost?: Pick<McpHostOptions, "idleMs" | "promptWaitMs">;
-    gate?: (name: BuiltinExtensionName, factory: ExtensionFactory) => ExtensionFactory;
-  },
-): PiWebBuiltinExtensions {
-  const gate = options.gate ?? ((_name, factory) => factory);
-  const mcpHost = mcp.available
-    ? new McpHost({
-        ...options.mcpHost,
-        agentDir: options.agentDir,
-        internals: mcp.internals,
-        codemodeAvailable: options.codemodeAvailable,
-      })
-    : undefined;
-  const extensions = [
-    builtin("tool-search", gate("tool-search", createToolSearchExtension())),
-    builtin("mcp", gate(
-      "mcp",
-      mcp.available && mcpHost
-        ? createMcpExtension({
-            loadConfig: createMcpExtensionConfigLoader(mcp.internals, options.agentDir),
-            createTransport: mcpHost.wrapTransportFactory(createPiWebMcpTransportFactory(mcp.internals)),
-            // The host already waited, and Stop ends its wait. The extension's own wait for
-            // servers with `direct` tools, at a session's first prompt, ignores Stop.
-            startupWaitMs: 0,
-            // `/mcp login` already shows the address in the chat; a browser
-            // opened on the server host is one a remote user never sees.
-            openUrl: () => {},
-          })
-        : unavailableExtension,
-    )),
-  ];
-  if (mcpHost) extensions.push(mcpHost.extension());
-  return { extensions, mcpHost };
+export interface PiWebBuiltinCapability {
+  codeMode: boolean;
+  loadMcp: boolean;
+  mcpServers: import("./subagents").SubagentMcpServerRef[];
+  cwd: string;
+  /** Read real scoped source settings, before restricted resource clearing. */
+  builtinEnabled(name: BuiltinExtensionName): Promise<boolean>;
+  /** Presentation/discovery only; execution still passes the separate tool_call guard. */
+  allowedTools?(tools: ReturnType<ExtensionAPI["getAllTools"]>): Set<string>;
 }
 
-/**
- * Code mode for a subagent whose profile turns it on. A plain inline extension, not
- * `builtin:codemode`: a child that loads no extensions runs with `noExtensions`, which drops
- * named built-ins too. Its factory reads the `-builtin:codemode` switch on every load instead,
- * so the settings that switch Code mode off for normal sessions switch it off here as well.
- */
-export async function createSubagentCodemodeExtension(options: {
-  agentDir: string;
-  cwd: string;
-  projectTrusted: () => boolean;
-}): Promise<InlineExtension> {
-  const sandbox = await checkCodemodeSandbox();
-  if (!sandbox.available) throw new Error(`Code mode is unavailable: ${sandbox.reason}`);
-  const codemode = createCodemodeExtension();
-  return {
-    name: "codemode",
-    replaceable: true,
-    factory: async (pi) => {
-      const switches = await readBuiltinExtensionSwitches({
-        agentDir: options.agentDir,
-        cwd: options.cwd,
-        projectTrusted: options.projectTrusted(),
-      });
-      if (switches.codemode.enabled) await codemode(pi);
-    },
-  };
-}
-
-/**
- * MCP for a subagent whose profile turns it on (`mcp: on`): `builtin:tool-search` and
- * `builtin:mcp` with a host of the child's own, as a normal session loads them. The child names
- * both in `additionalExtensionPaths` (`SUBAGENT_MCP_EXTENSION_PATHS`), which loads a built-in
- * under `noExtensions` as well, but also past a `-builtin:` setting, so each factory reads its
- * switch on every load, as the child's Code mode does. `codemode` servers are reachable from
- * scripts only when the child has Code mode; otherwise they register as `deferred`.
- */
-export async function createSubagentMcpExtensions(options: {
-  agentDir: string;
-  cwd: string;
-  projectTrusted: () => boolean;
-  codemode: boolean;
-  /** Timing overrides for tests. */
-  mcpHost?: Pick<McpHostOptions, "idleMs" | "promptWaitMs">;
-}): Promise<PiWebBuiltinExtensions> {
-  return createMcpBuiltins(await loadMcpRuntime(), {
-    agentDir: options.agentDir,
-    codemodeAvailable: () => options.codemode,
-    ...(options.mcpHost ? { mcpHost: options.mcpHost } : {}),
-    gate: (name, factory) => async (pi) => {
-      const switches = await readBuiltinExtensionSwitches({
-        agentDir: options.agentDir,
-        cwd: options.cwd,
-        projectTrusted: options.projectTrusted(),
-      });
-      if (switches[name].enabled) await factory(pi);
-    },
-  });
+export async function scopedBuiltinExtensionSwitches(source: SettingsManager, cwd: string, agentDir: string, names: readonly string[] = BUILTIN_EXTENSION_NAMES) {
+  return resolveBuiltinSwitches({ cwd, agentDir, projectTrusted: source.isProjectTrusted() }, {
+    global: source.getGlobalSettings().extensions,
+    project: source.getProjectSettings().extensions,
+  }, { global: join(agentDir, "settings.json"), project: join(cwd, CONFIG_DIR_NAME, "settings.json") }, names);
 }
 
 export interface PiWebBuiltinExtensionsOptions {
   agentDir: string;
+  capability?: PiWebBuiltinCapability;
   /** Timing overrides for tests. */
   mcpHost?: Pick<McpHostOptions, "idleMs" | "promptWaitMs">;
 }
@@ -464,14 +430,96 @@ export interface PiWebBuiltinExtensions {
 export async function createPiWebBuiltinExtensions(
   options: PiWebBuiltinExtensionsOptions,
 ): Promise<PiWebBuiltinExtensions> {
-  const [sandbox, mcp] = await Promise.all([checkCodemodeSandbox(), loadMcpRuntime()]);
-  const { extensions, mcpHost } = createMcpBuiltins(mcp, {
-    agentDir: options.agentDir,
-    codemodeAvailable: () => sandbox.available,
-    ...(options.mcpHost ? { mcpHost: options.mcpHost } : {}),
-  });
-  return {
-    extensions: [builtin("codemode", sandbox.available ? createCodemodeExtension() : unavailableExtension), ...extensions],
-    mcpHost,
-  };
+  const cap = options.capability ? { ...options.capability, mcpServers: structuredClone(options.capability.mcpServers) } : undefined;
+  const codeEnabled = !cap || (cap.codeMode && await cap.builtinEnabled("codemode"));
+  const mcpEnabled = !cap || cap.loadMcp;
+  const [sandbox, mcp] = await Promise.all([
+    codeEnabled ? checkCodemodeSandbox() : Promise.resolve<BuiltinFeatureStatus>({ available: false, reason: "Role Code mode is off" }),
+    mcpEnabled ? loadMcpRuntime() : Promise.resolve<McpRuntimeResult>({ available: false, reason: "Role MCP is off" }),
+  ]);
+  let codemodeAvailable = sandbox.available;
+  const mcpHost = mcp.available
+    ? new McpHost({
+        ...options.mcpHost,
+        agentDir: options.agentDir,
+        internals: mcp.internals,
+        codemodeAvailable: () => codemodeAvailable,
+        ...(cap ? { selection: { cwd: cap.cwd, servers: structuredClone(cap.mcpServers) } } : {}),
+      })
+    : undefined;
+  const extensions = [
+    builtin("codemode", sandbox.available ? createCodemodeExtension(cap ? { models: false } : undefined) : unavailableExtension),
+    builtin("tool-search", createToolSearchExtension()),
+    builtin(
+      "mcp",
+      mcp.available && mcpHost
+        ? (pi) => {
+          const createTransport = mcpHost.wrapTransportFactory(createPiWebMcpTransportFactory(mcp.internals), Boolean(cap));
+          const observeRegistry = cap ? mcpHost.registrationObserverForLoad() : undefined;
+          // SDK consumes this roster synchronously when rebuilding its server/resource
+          // catalog, before awaiting close/connect. A preceding extension handler may
+          // delay that read after the registry changes; aggregates stay blocked then.
+          const api: ExtensionAPI = observeRegistry ? { ...pi, getMcpServers: () => {
+            const servers = pi.getMcpServers(); observeRegistry(servers); return servers;
+          } } : pi;
+          return createMcpExtension({
+            loadConfig: createMcpExtensionConfigLoader(mcp.internals, options.agentDir),
+            createTransport,
+            // The host already waited, and Stop ends its wait. The extension's own wait for
+            // servers with `direct` tools, at a session's first prompt, ignores Stop.
+            startupWaitMs: 0,
+            // `/mcp login` already shows the address in the chat; a browser
+            // opened on the server host is one a remote user never sees.
+            openUrl: () => {},
+          })(api);
+        }
+        : unavailableExtension,
+    ),
+  ];
+  if (cap) {
+    for (const extension of extensions) {
+      if (typeof extension === "function") continue;
+      const name = extension.name as BuiltinExtensionName;
+      const factory = extension.factory;
+      extension.factory = async (pi) => {
+        if (!(name === "codemode" ? cap.codeMode : cap.loadMcp) || !await cap.builtinEnabled(name)) return;
+        let selectedFactory = factory;
+        if (name === "codemode") {
+          const currentSandbox = await checkCodemodeSandbox();
+          codemodeAvailable = currentSandbox.available;
+          selectedFactory = currentSandbox.available ? createCodemodeExtension({ models: false }) : unavailableExtension;
+        }
+        const allowed = () => cap.allowedTools?.(pi.getAllTools());
+        const api: ExtensionAPI = cap.allowedTools ? {
+          ...pi,
+          getAllTools: () => { const names = allowed(); return pi.getAllTools().filter((tool) => names?.has(tool.name)); },
+          registerTool: (definition) => pi.registerTool({
+            ...definition,
+            ...(definition.prepareLoadout ? { prepareLoadout: (loadout) => {
+              const names = allowed();
+              return definition.prepareLoadout!({ ...loadout, declared: loadout.declared.filter((tool) => names?.has(tool.name)), callable: loadout.callable.filter((tool) => names?.has(tool.name)) });
+            } } : {}),
+            execute: (id, params, signal, update, ctx) => {
+              const names = allowed();
+              // ExtensionToolContext has prototype methods (executeTool) and getters.
+              // Preserve them; only narrow the public discovery view for this builtin.
+              const context = new Proxy({} as typeof ctx, { get(_target, property) {
+                if (property === "tools") return ctx.tools.filter((tool) => names?.has(tool.name));
+                const value = Reflect.get(ctx, property, ctx);
+                return typeof value === "function" ? value.bind(ctx) : value;
+              } });
+              return definition.execute(id, params, signal, update, context);
+            },
+          }),
+        } : pi;
+        await selectedFactory(api);
+        if (name === "codemode" && codemodeAvailable) pi.on("session_start", () => {
+          const tool = pi.getAllTools().find((tool) => tool.name === "codemode");
+          if (tool?.sourceInfo.path === CODEMODE_EXTENSION_PATH && tool.sourceInfo.source === "builtin") pi.setActiveTools([...new Set([...pi.getActiveTools(), "codemode"])]);
+        });
+      };
+    }
+  }
+  if (mcpHost) extensions.push(mcpHost.extension());
+  return { extensions, mcpHost };
 }

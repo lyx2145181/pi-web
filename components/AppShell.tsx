@@ -387,11 +387,13 @@ export function AppShell() {
   const [copiedSessionField, setCopiedSessionField] = useState<SessionCopyField | null>(null);
   const sessionCopyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const handleCopySessionField = useCallback((field: SessionCopyField, value: string) => {
+    // A refused copy is silent: no "Copied", and the rejection is handled
+    // so it never surfaces as an unhandled one (lib/clipboard.ts).
     void copyText(value).then(() => {
       if (sessionCopyTimerRef.current) clearTimeout(sessionCopyTimerRef.current);
       setCopiedSessionField(field);
       sessionCopyTimerRef.current = setTimeout(() => setCopiedSessionField(null), 1400);
-    });
+    }, () => {});
   }, []);
 
   useEffect(() => {
@@ -572,6 +574,15 @@ export function AppShell() {
   const [terminalsRestored, setTerminalsRestored] = useState(false);
   // Subagent tabs remain open within a project; side tabs follow their main session.
   const [agentTabs, setAgentTabs] = useState<{ sessionId: string; label: string; side?: boolean }[]>([]);
+  // Closing a tab can arrive after awaited work (deleting a side chat), so it
+  // reads the tabs of that moment: a closed-over list would put another main
+  // session's tabs back and save them into its sessionStorage.
+  const fileTabsRef = useRef(fileTabs);
+  const terminalTabsRef = useRef(terminalTabs);
+  const agentTabsRef = useRef(agentTabs);
+  fileTabsRef.current = fileTabs;
+  terminalTabsRef.current = terminalTabs;
+  agentTabsRef.current = agentTabs;
   const sideTabOwnerRef = useRef<string | null>(null);
   const sideTabsReadyRef = useRef(false);
   const sideTabsSavedOnWorkspaceSwitchRef = useRef(false);
@@ -1391,31 +1402,38 @@ export function AppShell() {
   };
 
   const handleCloseFileTab = useCallback((tabId: string) => {
-    if (terminalTabs.some((tab) => tab.id === tabId)) {
+    if (terminalTabsRef.current.some((tab) => tab.id === tabId)) {
       setTerminalTabs((tabs) => tabs.map((tab) => tab.id === tabId && !tab.closing ? { ...tab, closing: "close" } : tab));
       return;
     }
     if (tabId.startsWith("agent:")) {
-      const remainingAgents = agentTabs.filter((tab) => `agent:${tab.sessionId}` !== tabId);
-      setAgentTabs(remainingAgents);
+      const remainingAgents = agentTabsRef.current.filter((tab) => `agent:${tab.sessionId}` !== tabId);
+      setAgentTabs((tabs) => tabs.filter((tab) => `agent:${tab.sessionId}` !== tabId));
       setActiveFileTabId((cur) => {
         if (cur !== tabId) return cur;
-        return fileTabs.at(-1)?.id ?? terminalTabs.at(-1)?.id ?? lastAgentTabId(remainingAgents);
+        return fileTabsRef.current.at(-1)?.id ?? terminalTabsRef.current.at(-1)?.id ?? lastAgentTabId(remainingAgents);
       });
-      if (fileTabs.length === 0 && terminalTabs.length === 0 && remainingAgents.length === 0) setRightPanelOpen(false);
+      if (fileTabsRef.current.length === 0 && terminalTabsRef.current.length === 0 && remainingAgents.length === 0) setRightPanelOpen(false);
       return;
     }
     setFileTabs((prev) => {
       const next = prev.filter((t) => t.id !== tabId);
-      if (next.length === 0 && terminalTabs.length === 0 && agentTabs.length === 0) setRightPanelOpen(false);
+      if (next.length === 0 && terminalTabsRef.current.length === 0 && agentTabsRef.current.length === 0) setRightPanelOpen(false);
       return next;
     });
     setActiveFileTabId((cur) => {
       if (cur !== tabId) return cur;
-      const remaining = fileTabs.filter((t) => t.id !== tabId);
-      return remaining.at(-1)?.id ?? terminalTabs.at(-1)?.id ?? lastAgentTabId(agentTabs);
+      const remaining = fileTabsRef.current.filter((t) => t.id !== tabId);
+      return remaining.at(-1)?.id ?? terminalTabsRef.current.at(-1)?.id ?? lastAgentTabId(agentTabsRef.current);
     });
-  }, [fileTabs, terminalTabs, agentTabs]);
+  }, []);
+
+  // An extension's ctx.shutdown() ended the session's runtime, as pi quits: leave it the
+  // way a deleted session is left (the refreshed list shows whether its file remains).
+  const handleSessionEnded = useCallback((sessionId: string) => {
+    handleSessionDeleted(sessionId);
+    handleCloseFileTab(`agent:${sessionId}`);
+  }, [handleSessionDeleted, handleCloseFileTab]);
 
   // The Agents switcher's Delete on a side chat: its tab goes with it, and the
   // main chat showing it goes back to the parent, as the Main agent row does
@@ -2827,6 +2845,7 @@ export function AppShell() {
               initialNewSessionChoices={selectedSession === null ? carriedNewSessionChoices : null}
               onNewSessionChoicesChange={handleNewSessionChoicesChange}
               onAgentEnd={handleAgentEnd}
+              onSessionEnded={handleSessionEnded}
               onToolEnd={handleToolEnd}
               onAttentionNeeded={handleAttentionNeeded}
               onSessionCreated={handleSessionCreated}
@@ -3029,6 +3048,7 @@ export function AppShell() {
             <SessionChatPanel
               key={activeAgentTab.sessionId}
               sessionId={activeAgentTab.sessionId}
+              onSessionEnded={handleSessionEnded}
               running={runningSessionIds.has(activeAgentTab.sessionId)}
               initialPrompt={sideChatPrompts[activeAgentTab.sessionId]}
               onInitialPromptConsumed={() => setSideChatPrompts((prev) => {
@@ -3039,7 +3059,11 @@ export function AppShell() {
               })}
               modelsRefreshKey={modelsRefreshKey}
               quoteSelectionEnabled={quoteSelectionEnabled}
-              onOpenFile={handleOpenLinkedFile}
+              onOpenFile={(filePath, page) => handleOpenFile(
+                filePath,
+                getFileName(filePath),
+                { sourceSessionId: activeAgentTab.sessionId, page },
+              )}
               onOpenSubagent={handleOpenSubagentTab}
               onSessionForked={(newSessionId) => {
                 if (isMobile) setRightPanelOpen(false);

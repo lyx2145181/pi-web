@@ -46,6 +46,8 @@ type FailReason = NonNullable<DebugEventConnectionSnapshot["lastError"]>["reason
 export interface AgentEventConnectionOptions {
   createSource(sessionId: string): AgentEventSourceLike;
   onEvent(event: AgentEventLike): void;
+  /** An idle view has no explicit send awaiting readiness to display a terminal startup refusal. */
+  onStartupError?(sessionId: string, error: AgentEventConnectionError): void;
   shouldMaintain(sessionId: string): boolean;
   readinessTimeoutMs: number;
   reconnectDelayMs: number;
@@ -64,6 +66,7 @@ export class AgentEventConnection {
   private current: Connection | null = null;
   private retry: { sessionId: string; timer: ReturnType<typeof setTimeout>; dueAt: number } | null = null;
   private retryGeneration = 0;
+  private endedSessionId: string | null = null;
   // Bookkeeping for snapshot() only: nothing here decides what the connection does.
   private opens = 0;
   private retries = 0;
@@ -107,13 +110,18 @@ export class AgentEventConnection {
   }
 
   maintain(sessionId: string): void {
-    if (!this.options.shouldMaintain(sessionId)) return;
+    if (this.endedSessionId === sessionId || !this.options.shouldMaintain(sessionId)) return;
     const retryGeneration = this.retryGeneration;
     void this.ensureConnected(sessionId).catch((error) => {
+      // fail() already stopped retries (and advanced retryGeneration) for this terminal error.
+      // Still surface it for the current idle view; never publish an old session's refusal.
+      if (error instanceof AgentEventConnectionError && error.status === "startup_error") {
+        if (this.options.shouldMaintain(sessionId)) this.options.onStartupError?.(sessionId, error);
+        return;
+      }
       if (retryGeneration !== this.retryGeneration) return;
       if (error instanceof AgentEventConnectionError) {
-        if (error.status === "startup_error") this.stopRetrying();
-        else this.scheduleRetry(sessionId);
+        this.scheduleRetry(sessionId);
       } else {
         this.options.onUnexpectedError?.(error);
       }
@@ -121,6 +129,7 @@ export class AgentEventConnection {
   }
 
   async ensureConnected(sessionId: string): Promise<void> {
+    if (this.endedSessionId === sessionId) throw new AgentEventConnectionError("closed");
     while (true) {
       let connection = this.current;
       if (!connection || connection.sessionId !== sessionId) {
@@ -211,6 +220,12 @@ export class AgentEventConnection {
         return;
       }
 
+      if (event.type === "session_ended" && event.sessionId === sessionId) {
+        this.endedSessionId = sessionId;
+        this.close();
+        this.options.onEvent(event);
+        return;
+      }
       if (event.type === "heartbeat") {
         connection.lastHeartbeatAt = connection.lastSeenAt;
         return;
